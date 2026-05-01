@@ -1,0 +1,36 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Python venv + caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+
+# Editor / tooling local state
+.claude/
+.railway/
+.vscode/
+.idea/
+
+# Large/derived data — kept locally only, regenerated as needed
+historical data/
+~/.acme/
+logs/
+*.parquet
+
+# Note: uv.lock IS committed (it pins exact dep versions for reproducibility).

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.acme-futures.runner</string>
+
+    <!-- caffeinate keeps the Mac awake; uv runs the bot in dry-run.
+         To switch to live trading, change "--dry-run" to nothing
+         (or remove the corresponding string element entirely). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-dimsu</string>
+        <string>/Users/ryanmurphy/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>acme.runner</string>
+        <string>--dry-run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/ryanmurphy/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/ryanmurphy</string>
+    </dict>
+
+    <!-- Start automatically when you log in. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the process crashes. ThrottleInterval prevents
+         a fast crash loop from spinning the CPU; minimum 60 seconds between restarts. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Logs — tail these to see what the runner is doing. -->
+    <key>StandardOutPath</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures/logs/runner.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures/logs/runner.err.log</string>
+
+    <!-- Run as the logged-in user (not root). LaunchAgents do this by default
+         since they live in ~/Library/LaunchAgents, but being explicit. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
