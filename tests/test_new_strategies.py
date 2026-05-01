@@ -14,6 +14,9 @@ from acme.strategies.anti import AntiStrategy
 from acme.strategies.bb_mr import BollingerMeanReversionStrategy
 from acme.strategies.donchian import DonchianBreakoutStrategy
 from acme.strategies.orb import OpeningRangeBreakoutStrategy
+from acme.strategies.supertrend import SupertrendStrategy
+from acme.strategies.turtle_soup import TurtleSoupStrategy
+from acme.strategies.turtles_system2 import TurtlesSystem2Strategy
 
 
 def _state():
@@ -244,11 +247,164 @@ def test_bb_mr_daily_cap():
         assert sig is None or sig.size == 0
 
 
+# ---------- TurtleSoup ----------
+
+def test_turtle_soup_warmup_emits_no_signal():
+    s = TurtleSoupStrategy()
+    state = _state()
+    bars = _bars_from_closes([100.0] * 30, tf_min=5)
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        assert sig is None or sig.size == 0
+
+
+def test_turtle_soup_failed_upside_breakout_fires_short():
+    """Build 25 flat bars at 100, then a bar that pokes high to 102.5 and closes
+    back at 99.5 (failed upside breakout) — should fade short."""
+    s = TurtleSoupStrategy()
+    state = _state()
+    t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    bars = _bars_from_closes([100.0] * 25, tf_min=5, t_start=t0)
+    # The poke-and-fail bar — high above prior 20-bar high (~100.25), close inside
+    poke_bar = _bar(t0 + timedelta(minutes=125), 100.0, 102.5, 99.0, 99.5, 100)
+    bars.append(poke_bar)
+
+    saw_signal = False
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        if sig is not None and sig.size > 0:
+            saw_signal = True
+            assert sig.side == "sell"
+            assert "turtle_soup" in sig.reason
+            break
+    assert saw_signal
+
+
+def test_turtle_soup_only_first_per_day():
+    s = TurtleSoupStrategy()
+    state = _state()
+    t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    bars = _bars_from_closes([100.0] * 25, tf_min=5, t_start=t0)
+    # Two consecutive failed-upside bars — only first should fire
+    bars.append(_bar(t0 + timedelta(minutes=125), 100.0, 102.5, 99.0, 99.5, 100))
+    bars.append(_bar(t0 + timedelta(minutes=130), 99.5, 103.0, 99.0, 99.0, 100))
+    fire_count = 0
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        if sig is not None and sig.size > 0:
+            fire_count += 1
+    assert fire_count == 1
+
+
+def test_turtle_soup_no_signal_when_already_in_position():
+    s = TurtleSoupStrategy()
+    state = _state()
+    t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    bars = _bars_from_closes([100.0] * 25, tf_min=5, t_start=t0)
+    bars.append(_bar(t0 + timedelta(minutes=125), 100.0, 102.5, 99.0, 99.5, 100))
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=1, current_balance_unrealized=50_000)
+        assert sig is None or sig.size == 0
+
+
+# ---------- Supertrend ----------
+
+def test_supertrend_warmup_emits_no_signal():
+    s = SupertrendStrategy()
+    state = _state()
+    bars = _bars_from_closes([100.0] * 5, tf_min=5)
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        assert sig is None
+
+
+def test_supertrend_flips_long_after_downtrend_then_up_ramp():
+    """Bear into bull: ramp closes down 100 → 95, then sharp ramp up 95 → 110.
+    The trend should flip from -1 to +1 somewhere in the up-ramp."""
+    s = SupertrendStrategy()
+    state = _state()
+    down = [100.0 - i * 0.2 for i in range(30)]    # 100 → 94.2
+    up = [94.2 + i * 0.5 for i in range(20)]       # 94.2 → 103.7
+    bars = _bars_from_closes(down + up, tf_min=5)
+    saw_signal = False
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        if sig is not None and sig.size > 0:
+            saw_signal = True
+            assert sig.side == "buy"
+            assert "supertrend" in sig.reason
+            break
+    assert saw_signal
+
+
+def test_supertrend_no_signal_when_already_in_position():
+    s = SupertrendStrategy()
+    state = _state()
+    down = [100.0 - i * 0.2 for i in range(30)]
+    up = [94.2 + i * 0.5 for i in range(20)]
+    bars = _bars_from_closes(down + up, tf_min=5)
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=1, current_balance_unrealized=50_000)
+        assert sig is None or sig.size == 0
+
+
+# ---------- Turtles System 2 ----------
+
+def test_turtles_system2_warmup():
+    s = TurtlesSystem2Strategy()
+    state = _state()
+    # Need 55 bars for high/low channel, plus ATR(20) warmup
+    bars = _bars_from_closes([100.0] * 70, tf_min=5)
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        assert sig is None
+
+
+def test_turtles_system2_first_breakout_fires():
+    s = TurtlesSystem2Strategy()
+    state = _state()
+    flat_closes = [100.0] * 60
+    breakout_closes = [102.0]
+    bars = _bars_from_closes(flat_closes + breakout_closes, tf_min=5)
+    saw_signal = False
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        if sig is not None and sig.size > 0:
+            saw_signal = True
+            assert sig.side == "buy"
+            assert "turtles_s2" in sig.reason
+            break
+    assert saw_signal
+
+
+def test_turtles_system2_only_first_per_day():
+    s = TurtlesSystem2Strategy()
+    state = _state()
+    bars = _bars_from_closes([100.0] * 60 + [102.0, 103.0, 104.0, 105.0], tf_min=5)
+    fire_count = 0
+    for b in bars:
+        sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                       current_position=0, current_balance_unrealized=50_000)
+        if sig is not None and sig.size > 0:
+            fire_count += 1
+    assert fire_count == 1
+
+
 # ---------- Cross-cutting: all strategies have valid metadata ----------
 
 @pytest.mark.parametrize("cls", [
     AntiStrategy, OpeningRangeBreakoutStrategy,
     DonchianBreakoutStrategy, BollingerMeanReversionStrategy,
+    TurtleSoupStrategy, SupertrendStrategy, TurtlesSystem2Strategy,
 ])
 def test_strategy_metadata_is_present_and_valid(cls):
     s = cls()
