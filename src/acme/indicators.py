@@ -326,3 +326,104 @@ class ADX:
     @property
     def is_warm(self) -> bool:
         return self.s.adx is not None
+
+
+# ---------- supertrend ----------
+
+@dataclass
+class SupertrendOutput:
+    line: float                # current Supertrend line (acts as trailing stop)
+    trend: int                 # +1 (up) or -1 (down)
+    flipped: bool              # True only on the bar where trend changed
+
+
+class Supertrend:
+    """Supertrend trend-flip indicator (HL2 ± multiplier × ATR with band-locking).
+
+    Update sequence each bar:
+      hl2          = (high + low) / 2
+      basic_upper  = hl2 + multiplier * atr
+      basic_lower  = hl2 - multiplier * atr
+      final_upper  = basic_upper if (basic_upper < prev_final_upper or prev_close > prev_final_upper) else prev_final_upper
+      final_lower  = basic_lower if (basic_lower > prev_final_lower or prev_close < prev_final_lower) else prev_final_lower
+      trend        = +1 if close > prev_final_upper
+                     -1 if close < prev_final_lower
+                     else prev_trend (carry)
+
+    Warmup: ATR must be warm AND we need one prior bar's final bands. Returns None
+    until both conditions are met.
+    """
+
+    def __init__(self, period: int = 10, multiplier: float = 3.0) -> None:
+        if period < 1:
+            raise ValueError("period must be >= 1")
+        if multiplier <= 0:
+            raise ValueError("multiplier must be > 0")
+        self.period = period
+        self.multiplier = multiplier
+        self._atr = ATR(period)
+        self._prev_close: float | None = None
+        self._prev_final_upper: float | None = None
+        self._prev_final_lower: float | None = None
+        self._trend: int | None = None
+        self._last: SupertrendOutput | None = None
+
+    def update(self, bar: Bar) -> SupertrendOutput | None:
+        atr_val = self._atr.update(bar)
+        if atr_val is None:
+            self._prev_close = bar.c
+            return None
+
+        hl2 = (bar.h + bar.l) / 2.0
+        basic_upper = hl2 + self.multiplier * atr_val
+        basic_lower = hl2 - self.multiplier * atr_val
+
+        if self._prev_final_upper is None or self._prev_final_lower is None:
+            final_upper = basic_upper
+            final_lower = basic_lower
+            self._prev_final_upper = final_upper
+            self._prev_final_lower = final_lower
+            self._prev_close = bar.c
+            return None
+
+        prev_close = self._prev_close if self._prev_close is not None else bar.c
+
+        if basic_upper < self._prev_final_upper or prev_close > self._prev_final_upper:
+            final_upper = basic_upper
+        else:
+            final_upper = self._prev_final_upper
+
+        if basic_lower > self._prev_final_lower or prev_close < self._prev_final_lower:
+            final_lower = basic_lower
+        else:
+            final_lower = self._prev_final_lower
+
+        prev_trend = self._trend
+        if bar.c > self._prev_final_upper:
+            new_trend: int | None = 1
+        elif bar.c < self._prev_final_lower:
+            new_trend = -1
+        else:
+            new_trend = prev_trend  # carry — may still be None during early bars
+
+        self._prev_final_upper = final_upper
+        self._prev_final_lower = final_lower
+        self._prev_close = bar.c
+
+        if new_trend is None:
+            return None  # haven't crossed either band yet — trend undetermined
+
+        flipped = prev_trend is not None and new_trend != prev_trend
+        self._trend = new_trend
+        line = final_lower if new_trend == 1 else final_upper
+
+        self._last = SupertrendOutput(line=line, trend=new_trend, flipped=flipped)
+        return self._last
+
+    @property
+    def value(self) -> SupertrendOutput | None:
+        return self._last
+
+    @property
+    def is_warm(self) -> bool:
+        return self._last is not None

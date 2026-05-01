@@ -24,16 +24,22 @@ from acme.strategies.bb_mr import BollingerMeanReversionStrategy
 from acme.strategies.donchian import DonchianBreakoutStrategy
 from acme.strategies.ema_cross import EmaCrossStrategy
 from acme.strategies.orb import OpeningRangeBreakoutStrategy
+from acme.strategies.supertrend import SupertrendStrategy
+from acme.strategies.turtle_soup import TurtleSoupStrategy
+from acme.strategies.turtles_system2 import TurtlesSystem2Strategy
 
 log = structlog.get_logger(__name__)
 
 
 SEED_FLEET = {
-    "ema_cross": lambda: EmaCrossStrategy(contract=MES),
-    "anti":      lambda: AntiStrategy(contract=MES),
-    "orb":       lambda: OpeningRangeBreakoutStrategy(contract=MES),
-    "donchian":  lambda: DonchianBreakoutStrategy(contract=MES),
-    "bb_mr":     lambda: BollingerMeanReversionStrategy(contract=MES),
+    "ema_cross":       lambda: EmaCrossStrategy(contract=MES),
+    "anti":            lambda: AntiStrategy(contract=MES),
+    "orb":             lambda: OpeningRangeBreakoutStrategy(contract=MES),
+    "donchian":        lambda: DonchianBreakoutStrategy(contract=MES),
+    "bb_mr":           lambda: BollingerMeanReversionStrategy(contract=MES),
+    "turtle_soup":     lambda: TurtleSoupStrategy(contract=MES),
+    "supertrend":      lambda: SupertrendStrategy(contract=MES),
+    "turtles_system2": lambda: TurtlesSystem2Strategy(contract=MES),
 }
 
 

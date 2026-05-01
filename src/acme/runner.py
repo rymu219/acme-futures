@@ -26,6 +26,9 @@ from acme.strategies.bb_mr import BollingerMeanReversionStrategy
 from acme.strategies.donchian import DonchianBreakoutStrategy
 from acme.strategies.ema_cross import EmaCrossStrategy
 from acme.strategies.orb import OpeningRangeBreakoutStrategy
+from acme.strategies.supertrend import SupertrendStrategy
+from acme.strategies.turtle_soup import TurtleSoupStrategy
+from acme.strategies.turtles_system2 import TurtlesSystem2Strategy
 
 log = structlog.get_logger(__name__)
 
@@ -39,6 +42,9 @@ def _build_registry(db: Db) -> StrategyRegistry:
       - orb         (SHADOW) — Opening Range Breakout
       - donchian    (SHADOW) — Turtles System 1 first-of-day
       - bb_mr       (SHADOW) — Bollinger mean-reversion (range regime contrarian)
+      - turtle_soup    (SHADOW) — Raschke fade of failed Donchian breakouts
+      - supertrend     (SHADOW) — ATR-based trend follower
+      - turtles_system2 (SHADOW) — slower 55-bar Donchian variant
     """
     registry = StrategyRegistry(db=db)
     try:
@@ -63,6 +69,18 @@ def _build_registry(db: Db) -> StrategyRegistry:
         ("bb_mr", "SHADOW", 3, {"bb_period": 20, "rsi_period": 2, "adx_max_for_range": 20.0},
          "Bollinger MR, range regime contrarian (5m)",
          lambda: BollingerMeanReversionStrategy(contract=MES)),
+        ("turtle_soup", "SHADOW", 2,
+         {"lookback": 20, "atr_stop_multiple": 1.0, "atr_target_multiple": 1.5},
+         "Raschke TurtleSoup — fade failed 20-bar Donchian breakouts (5m)",
+         lambda: TurtleSoupStrategy(contract=MES)),
+        ("supertrend", "SHADOW", 2,
+         {"atr_period": 10, "multiplier": 3.0},
+         "ATR-based Supertrend trend follower, ATR(10)x3.0 (5m)",
+         lambda: SupertrendStrategy(contract=MES)),
+        ("turtles_system2", "SHADOW", 2,
+         {"lookback": 55, "atr_period": 20, "atr_stop_multiple": 2.5, "atr_target_multiple": 4.0},
+         "Turtles System 2 — slower 55-bar breakout variant (5m)",
+         lambda: TurtlesSystem2Strategy(contract=MES)),
     ]
     for name, default_state, tier, params, notes, builder in seeds:
         if name not in registry:

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from acme.broker.base import Bar
-from acme.indicators import ADX, ATR, EMA, RSI, SMA, Bollinger, Stochastic
+from acme.indicators import ADX, ATR, EMA, RSI, SMA, Bollinger, Stochastic, Supertrend
 
 
 def _bars_from(ohlc_tuples):
@@ -182,3 +182,47 @@ def test_adx_strong_trend_high_value():
         adx.update(b)
     assert adx.is_warm
     assert adx.value > 25
+
+
+# ---------- Supertrend ----------
+
+def test_supertrend_warmup_returns_none():
+    st = Supertrend(period=10, multiplier=3.0)
+    t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    # First 10 bars: ATR not yet warm
+    for i in range(10):
+        out = st.update(Bar(t=t0 + timedelta(minutes=i),
+                            o=100, h=100.5, l=99.5, c=100.0, v=10))
+        assert out is None
+    assert not st.is_warm
+
+
+def test_supertrend_flips_on_strong_reversal():
+    """Establish a downtrend, then a sharp up-move should flip trend to +1."""
+    st = Supertrend(period=10, multiplier=3.0)
+    t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    # Downtrend: 30 bars closing lower
+    for i in range(30):
+        c = 100.0 - i * 0.2
+        st.update(Bar(t=t0 + timedelta(minutes=i),
+                      o=c + 0.1, h=c + 0.2, l=c - 0.3, c=c, v=10))
+    assert st.is_warm
+    assert st.value.trend == -1
+    # Sharp up-move: closes ramp up well above the upper band
+    flipped_bar_seen = False
+    for i in range(30, 60):
+        c = 94.0 + (i - 29) * 0.6
+        out = st.update(Bar(t=t0 + timedelta(minutes=i),
+                            o=c - 0.1, h=c + 0.3, l=c - 0.2, c=c, v=10))
+        if out is not None and out.flipped and out.trend == 1:
+            flipped_bar_seen = True
+            break
+    assert flipped_bar_seen
+
+
+def test_supertrend_invalid_params():
+    import pytest
+    with pytest.raises(ValueError):
+        Supertrend(period=0)
+    with pytest.raises(ValueError):
+        Supertrend(period=10, multiplier=0)
