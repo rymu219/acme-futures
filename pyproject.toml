@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "structlog>=24",
     "tenacity>=8",
+    "databento>=0.77.0",
 ]
 
 [dependency-groups]
@@ -20,6 +21,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
     "respx>=0.21",
+    "streamlit>=1.57.0",
 ]
 
 [build-system]

@@ -1,4 +1,26 @@
-# Acme Futures · Web Watcher
+# Acme Futures · Web UIs
+
+Two separate web UIs live in this directory:
+
+1. **`app.py`** — FastAPI dashboard for remote monitoring (deployed to Railway, phone-friendly, token-gated).
+2. **`backtest_ui.py`** — Streamlit-based backtest calculator (local-only; for iterating on strategy parameters).
+
+## Backtest calculator (Streamlit)
+
+Local UI for running backtests with any combination of strategy params, date range, and slippage settings. Launch:
+
+```bash
+cd "/Users/ryanmurphy/Desktop/Acme Futures"
+uv run streamlit run web/backtest_ui.py
+```
+
+Opens in your default browser at http://localhost:8501. Pick a strategy in the sidebar, adjust params, click "Run Backtest". Results show metrics, Stage 0 verdict, equity curve, and full trade history. Default window is 6 months ending today (more responsive to current regime than 2-year backtests).
+
+Tip: change params, click Run again — it runs on the same cached parquet, so subsequent runs take 5–30 seconds depending on date range. No data re-fetching.
+
+---
+
+## Watcher dashboard (FastAPI on Railway)
 
 Tiny FastAPI dashboard for remote monitoring. Reads from Supabase only — no broker code, no Topstep VPS-prohibition concern. Phone-friendly. Token-gated.
 
