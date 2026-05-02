@@ -11,8 +11,12 @@ Launch:
 
 from __future__ import annotations
 
+# Sibling module (not a package). Streamlit runs this file directly; add its
+# directory to sys.path so the import resolves.
+import sys
 from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -26,6 +30,14 @@ from acme.strategies.bb_mr import BBMRConfig, BollingerMeanReversionStrategy
 from acme.strategies.donchian import DonchianBreakoutStrategy, DonchianConfig
 from acme.strategies.ema_cross import EmaCrossConfig, EmaCrossStrategy
 from acme.strategies.orb import OpeningRangeBreakoutStrategy, ORBConfig
+from acme.strategies.supertrend import SupertrendConfig, SupertrendStrategy
+from acme.strategies.turtle_soup import TurtleSoupConfig, TurtleSoupStrategy
+from acme.strategies.turtles_system2 import TurtlesSystem2Config, TurtlesSystem2Strategy
+from acme.telemetry import BarEventLogger
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from inspector_tab import render as render_inspector  # noqa: E402
+from regime_tab import render as render_regime  # noqa: E402
 
 st.set_page_config(
     page_title="Acme Backtest Calculator",
@@ -153,12 +165,77 @@ def _bb_mr_form():
     )
 
 
+def _turtle_soup_form():
+    st.markdown("**Turtle Soup** — Raschke fade of failed 20-bar Donchian breakouts, 5-min bars")
+    c1, c2 = st.columns(2)
+    with c1:
+        lookback = st.number_input("Lookback bars", min_value=5, max_value=60, value=20, step=1, key="ts_lb")
+        atr_stop = st.number_input("ATR stop multiple", min_value=0.25, max_value=5.0, value=1.0, step=0.25, key="ts_stop")
+    with c2:
+        atr_target = st.number_input("ATR target multiple", min_value=0.5, max_value=5.0, value=1.5, step=0.25, key="ts_tgt")
+        risk = st.number_input("Risk per trade ($)", min_value=1.0, max_value=2000.0, value=25.0, step=5.0, key="ts_risk")
+    return TurtleSoupStrategy(
+        config=TurtleSoupConfig(
+            lookback=int(lookback),
+            atr_stop_multiple=float(atr_stop),
+            atr_target_multiple=float(atr_target),
+            risk_dollars_per_trade=float(risk),
+        ),
+        contract=MES,
+    )
+
+
+def _supertrend_form():
+    st.markdown("**Supertrend** — ATR-based trend-flip follower, 5-min bars")
+    c1, c2 = st.columns(2)
+    with c1:
+        atr_p = st.number_input("ATR period", min_value=3, max_value=50, value=10, step=1, key="st_atrp")
+        mult = st.number_input("Band multiplier", min_value=1.0, max_value=8.0, value=3.0, step=0.25, key="st_mult")
+    with c2:
+        atr_target = st.number_input("ATR target multiple", min_value=0.5, max_value=8.0, value=2.0, step=0.25, key="st_tgt")
+        risk = st.number_input("Risk per trade ($)", min_value=1.0, max_value=2000.0, value=25.0, step=5.0, key="st_risk")
+    return SupertrendStrategy(
+        config=SupertrendConfig(
+            atr_period=int(atr_p),
+            multiplier=float(mult),
+            atr_target_multiple=float(atr_target),
+            risk_dollars_per_trade=float(risk),
+        ),
+        contract=MES,
+    )
+
+
+def _turtles_system2_form():
+    st.markdown("**Turtles System 2** — slower 55-bar Donchian variant, 5-min bars")
+    c1, c2 = st.columns(2)
+    with c1:
+        lookback = st.number_input("Lookback bars", min_value=20, max_value=200, value=55, step=1, key="t2_lb")
+        atr_p = st.number_input("ATR period", min_value=5, max_value=50, value=20, step=1, key="t2_atrp")
+    with c2:
+        atr_stop = st.number_input("ATR stop multiple", min_value=0.5, max_value=8.0, value=2.5, step=0.25, key="t2_stop")
+        atr_target = st.number_input("ATR target multiple", min_value=0.5, max_value=10.0, value=4.0, step=0.25, key="t2_tgt")
+    risk = st.number_input("Risk per trade ($)", min_value=1.0, max_value=2000.0, value=25.0, step=5.0, key="t2_risk")
+    return TurtlesSystem2Strategy(
+        config=TurtlesSystem2Config(
+            lookback=int(lookback),
+            atr_period=int(atr_p),
+            atr_stop_multiple=float(atr_stop),
+            atr_target_multiple=float(atr_target),
+            risk_dollars_per_trade=float(risk),
+        ),
+        contract=MES,
+    )
+
+
 STRATEGY_FORMS = {
-    "ema_cross": _ema_cross_form,
-    "anti":      _anti_form,
-    "orb":       _orb_form,
-    "donchian":  _donchian_form,
-    "bb_mr":     _bb_mr_form,
+    "ema_cross":       _ema_cross_form,
+    "anti":            _anti_form,
+    "orb":             _orb_form,
+    "donchian":        _donchian_form,
+    "bb_mr":           _bb_mr_form,
+    "turtle_soup":     _turtle_soup_form,
+    "supertrend":      _supertrend_form,
+    "turtles_system2": _turtles_system2_form,
 }
 
 
@@ -213,118 +290,146 @@ slip_target = st.sidebar.number_input("Target", min_value=0, max_value=10, value
 
 # ---------- main panel ----------
 
-st.title("Acme Futures · Backtest Calculator")
-st.caption(
-    f"Strategy: **{strategy_name}**  |  "
-    f"Window: **{start_date} → {end_date}** ({(end_date - start_date).days} days)"
-)
+st.title("Acme Futures · Calculator")
 
-with st.expander("Strategy parameters", expanded=True):
-    strategy = STRATEGY_FORMS[strategy_name]()
+tab_backtest, tab_inspector, tab_regime = st.tabs(["Backtest", "Inspector", "Regime"])
 
-run = st.button("▶ Run Backtest", type="primary", use_container_width=True)
-
-
-# ---------- run + render ----------
 
 def _money(n: float) -> str:
     sign = "-" if n < 0 else ""
     return f"{sign}${abs(n):,.2f}"
 
 
-if run:
-    start_dt = datetime.combine(start_date, time(0, 0), tzinfo=UTC)
-    end_dt = datetime.combine(end_date, time(23, 59), tzinfo=UTC)
-
-    with st.spinner(f"Running {strategy_name} on {(end_date - start_date).days} days of MES…"):
-        bars_iter = iter_bars(start=start_dt, end=end_dt)
-        report = run_backtest(
-            strategy, bars_iter,
-            profile=TOPSTEP_50K,
-            starting_balance=float(starting_balance),
-            slip_entry_ticks=int(slip_entry),
-            slip_stop_ticks=int(slip_stop),
-            slip_target_ticks=int(slip_target),
-            enforce_time_buckets=enforce_time,
-        )
-
-    st.session_state["last_report"] = report
-    st.session_state["last_starting_balance"] = float(starting_balance)
+with tab_inspector:
+    render_inspector()
 
 
-# Render whatever's in session state (so reruns don't blank the screen)
-if "last_report" in st.session_state:
-    report = st.session_state["last_report"]
-    sb = st.session_state["last_starting_balance"]
-    m = report.metrics
+with tab_regime:
+    render_regime()
 
-    # Top metrics row
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Trades", m.n_trades)
-    c2.metric("Net P&L", _money(m.net_pnl),
-              delta=_money(m.net_pnl) if m.n_trades else None,
-              delta_color="normal" if m.net_pnl >= 0 else "inverse")
-    c3.metric("Win rate", f"{m.win_rate*100:.1f}%")
-    c4.metric("Profit factor", f"{m.profit_factor:.2f}" if m.profit_factor else "—")
-    c5.metric("Sharpe", f"{m.sharpe:.2f}")
 
-    # Stage 0 verdict
-    s0 = evaluate_stage_0(report, sb)
-    if s0["verdict"] == "PASS":
-        st.success("### Stage 0: **PASS**  ✓")
+# ---------- Backtest tab ----------
+
+run = False
+with tab_backtest:
+    st.caption(
+        f"Strategy: **{strategy_name}**  |  "
+        f"Window: **{start_date} → {end_date}** ({(end_date - start_date).days} days)"
+    )
+
+    with st.expander("Strategy parameters", expanded=True):
+        strategy = STRATEGY_FORMS[strategy_name]()
+
+    run = st.button("▶ Run Backtest", type="primary", use_container_width=True)
+
+
+with tab_backtest:
+    if run:
+        start_dt = datetime.combine(start_date, time(0, 0), tzinfo=UTC)
+        end_dt = datetime.combine(end_date, time(23, 59), tzinfo=UTC)
+
+        # Per-click telemetry logger — every Run-Backtest produces its own
+        # run_id so the Inspector can scope analysis to exactly this run.
+        telemetry_logger = BarEventLogger(source="backtest", mode="full")
+
+        with st.spinner(f"Running {strategy_name} on {(end_date - start_date).days} days of MES…"):
+            bars_iter = iter_bars(start=start_dt, end=end_dt)
+            report = run_backtest(
+                strategy, bars_iter,
+                profile=TOPSTEP_50K,
+                starting_balance=float(starting_balance),
+                slip_entry_ticks=int(slip_entry),
+                slip_stop_ticks=int(slip_stop),
+                slip_target_ticks=int(slip_target),
+                enforce_time_buckets=enforce_time,
+                telemetry=telemetry_logger,
+            )
+        telemetry_logger.close()
+
+        st.session_state["last_report"] = report
+        st.session_state["last_starting_balance"] = float(starting_balance)
+        st.session_state["last_run_id"] = telemetry_logger.run_id
+
+
+    # Render whatever's in session state (so reruns don't blank the screen)
+    if "last_report" in st.session_state:
+        report = st.session_state["last_report"]
+        sb = st.session_state["last_starting_balance"]
+        m = report.metrics
+
+        # Top metrics row
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Trades", m.n_trades)
+        c2.metric("Net P&L", _money(m.net_pnl),
+                  delta=_money(m.net_pnl) if m.n_trades else None,
+                  delta_color="normal" if m.net_pnl >= 0 else "inverse")
+        c3.metric("Win rate", f"{m.win_rate*100:.1f}%")
+        c4.metric("Profit factor", f"{m.profit_factor:.2f}" if m.profit_factor else "—")
+        c5.metric("Sharpe", f"{m.sharpe:.2f}")
+
+        if "last_run_id" in st.session_state:
+            st.caption(
+                f"Telemetry run_id: `{st.session_state['last_run_id']}` "
+                "→ open the **Inspector** tab and pick this run to drill into fires."
+            )
+
+        # Stage 0 verdict
+        s0 = evaluate_stage_0(report, sb)
+        if s0["verdict"] == "PASS":
+            st.success("### Stage 0: **PASS**  ✓")
+        else:
+            st.error("### Stage 0: **FAIL**")
+        gate_cols = st.columns(4)
+        for (gate, info), col in zip(s0["gates"].items(), gate_cols, strict=False):
+            mark = "✅" if info["pass"] else "❌"
+            col.write(f"{mark}  **{gate}**  \n{info['actual']}")
+
+        st.markdown("---")
+
+        # Equity curve
+        if report.equity_curve:
+            st.subheader("Equity curve")
+            eq_df = pd.DataFrame(report.equity_curve, columns=["time", "equity_$"])
+            eq_df["time"] = pd.to_datetime(eq_df["time"])
+            eq_df = eq_df.set_index("time")
+            st.line_chart(eq_df, height=300)
+        else:
+            st.info("No closed trades — no equity curve to plot.")
+
+        # Per-trade details
+        if report.trades:
+            st.subheader(f"Trade history ({len(report.trades)} trades)")
+            rows = []
+            for t in report.trades:
+                d = asdict(t)
+                d["entry_t"] = t.entry_t.strftime("%Y-%m-%d %H:%M")
+                d["exit_t"] = t.exit_t.strftime("%Y-%m-%d %H:%M")
+                d["entry_price"] = round(d["entry_price"], 2)
+                d["exit_price"] = round(d["exit_price"], 2)
+                d["net_pnl"] = round(d["net_pnl"], 2)
+                d["gross_pnl"] = round(d["gross_pnl"], 2)
+                d["fees"] = round(d["fees"], 2)
+                rows.append(d)
+            trades_df = pd.DataFrame(rows)
+            # Reorder for readability
+            cols = ["entry_t", "exit_t", "side", "size", "outcome",
+                    "entry_price", "exit_price", "gross_pnl", "fees", "net_pnl", "bars_held"]
+            trades_df = trades_df[cols]
+            st.dataframe(trades_df, use_container_width=True, height=400)
+
+            # Outcome breakdown
+            st.markdown("**Outcome breakdown**")
+            oc1, oc2 = st.columns(2)
+            targets = [t for t in report.trades if t.outcome == "target"]
+            stops = [t for t in report.trades if t.outcome == "stop"]
+            with oc1:
+                st.write(f"🎯 **Targets**: {len(targets)} trades, "
+                         f"avg = {_money(sum(t.net_pnl for t in targets)/max(len(targets),1))}, "
+                         f"total = {_money(sum(t.net_pnl for t in targets))}")
+            with oc2:
+                st.write(f"🛑 **Stops**: {len(stops)} trades, "
+                         f"avg = {_money(sum(t.net_pnl for t in stops)/max(len(stops),1))}, "
+                         f"total = {_money(sum(t.net_pnl for t in stops))}")
+
     else:
-        st.error("### Stage 0: **FAIL**")
-    gate_cols = st.columns(4)
-    for (gate, info), col in zip(s0["gates"].items(), gate_cols, strict=False):
-        mark = "✅" if info["pass"] else "❌"
-        col.write(f"{mark}  **{gate}**  \n{info['actual']}")
-
-    st.markdown("---")
-
-    # Equity curve
-    if report.equity_curve:
-        st.subheader("Equity curve")
-        eq_df = pd.DataFrame(report.equity_curve, columns=["time", "equity_$"])
-        eq_df["time"] = pd.to_datetime(eq_df["time"])
-        eq_df = eq_df.set_index("time")
-        st.line_chart(eq_df, height=300)
-    else:
-        st.info("No closed trades — no equity curve to plot.")
-
-    # Per-trade details
-    if report.trades:
-        st.subheader(f"Trade history ({len(report.trades)} trades)")
-        rows = []
-        for t in report.trades:
-            d = asdict(t)
-            d["entry_t"] = t.entry_t.strftime("%Y-%m-%d %H:%M")
-            d["exit_t"] = t.exit_t.strftime("%Y-%m-%d %H:%M")
-            d["entry_price"] = round(d["entry_price"], 2)
-            d["exit_price"] = round(d["exit_price"], 2)
-            d["net_pnl"] = round(d["net_pnl"], 2)
-            d["gross_pnl"] = round(d["gross_pnl"], 2)
-            d["fees"] = round(d["fees"], 2)
-            rows.append(d)
-        trades_df = pd.DataFrame(rows)
-        # Reorder for readability
-        cols = ["entry_t", "exit_t", "side", "size", "outcome",
-                "entry_price", "exit_price", "gross_pnl", "fees", "net_pnl", "bars_held"]
-        trades_df = trades_df[cols]
-        st.dataframe(trades_df, use_container_width=True, height=400)
-
-        # Outcome breakdown
-        st.markdown("**Outcome breakdown**")
-        oc1, oc2 = st.columns(2)
-        targets = [t for t in report.trades if t.outcome == "target"]
-        stops = [t for t in report.trades if t.outcome == "stop"]
-        with oc1:
-            st.write(f"🎯 **Targets**: {len(targets)} trades, "
-                     f"avg = {_money(sum(t.net_pnl for t in targets)/max(len(targets),1))}, "
-                     f"total = {_money(sum(t.net_pnl for t in targets))}")
-        with oc2:
-            st.write(f"🛑 **Stops**: {len(stops)} trades, "
-                     f"avg = {_money(sum(t.net_pnl for t in stops)/max(len(stops),1))}, "
-                     f"total = {_money(sum(t.net_pnl for t in stops))}")
-
-else:
-    st.info("Configure the strategy on the left and click **Run Backtest** above.")
+        st.info("Configure the strategy on the left and click **Run Backtest** above.")

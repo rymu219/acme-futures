@@ -349,6 +349,41 @@ def _render_leaderboard_html(sb) -> str:
 """
 
 
+REGIME_LABEL = {
+    "trending": "↗ Trending",
+    "ranging": "↔ Ranging",
+    "compressing": "⊟ Compressing",
+    "chaotic": "⚠ Chaotic",
+    "ambiguous": "? Ambiguous",
+}
+
+
+def _fetch_regime_pill(sb) -> str:
+    """Fetch the most recent market_regimes row; render as a status pill."""
+    try:
+        res = (
+            sb.table("market_regimes")
+            .select("ts, regime, confidence")
+            .order("ts", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    r = rows[0]
+    regime = r.get("regime") or "ambiguous"
+    conf = float(r.get("confidence") or 0.0)
+    label = REGIME_LABEL.get(regime, regime)
+    return (
+        f'<span class="meta-pill">regime '
+        f'<strong>{label}</strong> '
+        f'<span class="dim">conf {conf:.2f}</span></span>'
+    )
+
+
 def _render_html(sb) -> str:
     now_ct = datetime.now(CT)
     session_start = _session_start_ct(now_ct)
@@ -438,6 +473,7 @@ def _render_html(sb) -> str:
             f'<span class="pill pill-blocked"><span class="dot"></span>'
             f'{gate_reason.upper()}</span>'
         )
+    regime_pill = _fetch_regime_pill(sb)
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -600,6 +636,7 @@ def _render_html(sb) -> str:
     <span class="meta-pill">topstep session <strong>{trading_date.strftime('%a %m/%d')}</strong></span>
     <span class="meta-pill">flatten <strong>{flatten_str} CT</strong></span>
     <span class="meta-pill">snapshot <strong>{snap_age or '—'}</strong></span>
+    {regime_pill}
   </div>
 
   <div class="stats">

@@ -17,6 +17,7 @@ from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 Cross = Literal["up", "down", "none"]
 
@@ -47,6 +48,16 @@ class EmaCrossStrategy:
         default_lifecycle="PILOT",      # already validated by Phase A round-trip
         timeframe_minutes=1,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("fast", int, 9, 3, 30, 1, "Fast EMA period"),
+            ParameterSpec("slow", int, 21, 10, 100, 1, "Slow EMA period"),
+            ParameterSpec("stop_ticks", int, 8, 4, 40, 1, "Stop distance in ticks"),
+            ParameterSpec("target_ticks", int, 16, 4, 60, 1, "Target distance in ticks"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: EmaCrossConfig | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or EmaCrossConfig()

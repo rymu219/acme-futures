@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 import structlog
 
 from acme.broker.base import BrokerAdapter
-from acme.calendar import CT, can_trade_now, topstep_trading_date
+from acme.calendar import CT, can_trade_now, in_econ_blackout, topstep_trading_date
 from acme.conductor.arbitrator import (
     ArbitrationContext,
     ArbitrationResult,
@@ -35,14 +35,18 @@ from acme.conductor.bar_aggregator import MultiTimeframeAggregator
 from acme.conductor.dry_run import DryRunPosition, check_dry_run_exits
 from acme.conductor.flat_first import FlatFirstFSM
 from acme.config import Config
+from acme.context import MarketContext
 from acme.contracts import MES
 from acme.db import Db
 from acme.perf.scoring import compute_confidence
 from acme.perf.snapshot import write_snapshot
 from acme.perf.tracker import PerfRegistry
+from acme.regime.classifier import RegimeEngine, RegimeSnapshot
+from acme.regime.habitat import eligible_strategies
 from acme.registry import RegisteredStrategy, StrategyRegistry
 from acme.risk import DailyState
 from acme.strategies.base import Signal
+from acme.telemetry import BarEventLogger
 
 log = structlog.get_logger(__name__)
 
@@ -58,6 +62,9 @@ class Conductor:
         registry: StrategyRegistry,
         *,
         dry_run: bool = False,
+        telemetry: BarEventLogger | None = None,
+        regime_engine: RegimeEngine | None = None,
+        regime_timeframe_minutes: int = 5,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -76,6 +83,17 @@ class Conductor:
         self.dry_run_position_per_strategy: dict[str, int] = {}
         # Per-strategy rolling performance metrics. Updated on every closed trade.
         self.perf = PerfRegistry()
+        # Per-bar telemetry — local sqlite, every (strategy, bar) writes one row.
+        # MarketContext is per-timeframe so all strategies sharing a tf see the
+        # same universal features on the same bar. Tests can pass mode="off"
+        # to skip the sqlite write entirely.
+        self._telemetry = telemetry or BarEventLogger(source="live", mode="full")
+        self._context_by_tf: dict[int, MarketContext] = {}
+        # Regime engine — updated only on bars at `regime_timeframe_minutes`.
+        # If None, no regime gating is applied (legacy behavior).
+        self._regime_engine = regime_engine
+        self._regime_tf = regime_timeframe_minutes
+        self._latest_regime: RegimeSnapshot | None = None
 
     # ---------- main entry ----------
 
@@ -155,11 +173,16 @@ class Conductor:
     ) -> None:
         # Build a single MultiTimeframeAggregator across all timeframes the active
         # strategies want. In B1 only ema_cross (1m) is active so this is just 1m.
-        timeframes = sorted({
+        timeframes = {
             s.instance.timeframe_minutes for s in self.registry.list_active()
             if s.instance is not None
-        }) or [1]
-        aggregator = MultiTimeframeAggregator(timeframes=timeframes)
+        }
+        # Ensure the regime timeframe is always available, even if no strategy
+        # currently runs on it — the regime engine still needs bars there.
+        if self._regime_engine is not None:
+            timeframes.add(self._regime_tf)
+        timeframes_sorted = sorted(timeframes) or [1]
+        aggregator = MultiTimeframeAggregator(timeframes=timeframes_sorted)
 
         async for q in self.broker.stream_quotes(contract_id):
             price = q.last or q.bid or q.ask
@@ -195,6 +218,14 @@ class Conductor:
                                 exit_price=cl.exit_price,
                                 closed_at=cl.closed_at,
                             )
+                            if cl.bar_event_id is not None:
+                                self._telemetry.log_outcome(
+                                    cl.bar_event_id,
+                                    exit_t=cl.closed_at,
+                                    exit_price=cl.exit_price,
+                                    net_pnl=cl.net_pnl,
+                                    outcome=cl.outcome,
+                                )
                         # Push a fresh perf snapshot to Supabase on every closed trade
                         # so the leaderboard moves in real-time.
                         if closes and self.db is not None:
@@ -216,6 +247,46 @@ class Conductor:
         starting_balance: float,
         state: DailyState,
     ) -> None:
+        # Update shared market context once per (tf, bar) — features will be
+        # written into every per-strategy telemetry row below.
+        ctx = self._context_by_tf.setdefault(tf, MarketContext())
+        ctx.update(bar)
+        ctx_features = ctx.features
+
+        # Update regime classifier on bars at the regime timeframe (default 5m).
+        # All strategies share the same most-recent snapshot for habitat gating.
+        if self._regime_engine is not None and tf == self._regime_tf:
+            try:
+                blackout, _ = in_econ_blackout(bar.t.astimezone(CT))
+            except Exception:
+                blackout = False
+            self._latest_regime = self._regime_engine.on_bar(bar, news_blackout=blackout)
+            if self.db is not None:
+                try:
+                    self.db.insert_regime_snapshot(self._latest_regime.to_db_row())
+                except Exception as e:
+                    log.error("regime_persist_failed", error=str(e))
+
+        # Habitat gating: if a regime is in force, restrict the active set to
+        # strategies whose declared regime_fit qualifies them. Snapshot must
+        # exist (not warmup) and not be chaotic / low-confidence.
+        eligible: set[str] | None = None
+        if self._latest_regime is not None:
+            snap = self._latest_regime
+            if snap.regime in ("chaotic", "compressing", "ambiguous") or snap.confidence < 0.4:
+                if self.db is not None:
+                    self.db.log_event(
+                        "regime_block",
+                        contract_id=contract_id, symbol="MES",
+                        raw={
+                            "regime": snap.regime,
+                            "confidence": snap.confidence,
+                            "ts": snap.ts.isoformat(),
+                        },
+                    )
+                return
+            eligible = set(eligible_strategies(self.registry, snap.regime, snap.confidence))
+
         # Collect signals from every active strategy whose timeframe matches.
         # Each strategy is told its OWN current phantom position so its internal
         # "already in a position" guard works per-strategy, not fleet-wide.
@@ -223,6 +294,17 @@ class Conductor:
         for rec in self.registry.list_active():
             inst = rec.instance
             if inst is None or inst.timeframe_minutes != tf:
+                continue
+            # Habitat gating: if a regime snapshot is in force, only call on_bar
+            # for strategies eligible in this regime. Strategies still log
+            # telemetry below — that's a "bar I saw but didn't fire on" case.
+            if eligible is not None and rec.name not in eligible:
+                self._telemetry.log(
+                    bar=bar, timeframe=tf, strategy=rec.name,
+                    signal=None, context=ctx_features,
+                    position=0,
+                    balance=starting_balance + state.realized_pnl,
+                )
                 continue
             if self.dry_run:
                 strat_pos = self.dry_run_position_per_strategy.get(rec.name, 0)
@@ -234,6 +316,13 @@ class Conductor:
                 profile=self.config.eval_profile,
                 current_position=strat_pos,
                 current_balance_unrealized=starting_balance + state.realized_pnl,
+            )
+            # Telemetry write — every (strategy, bar) regardless of fire/no-fire.
+            bar_event_id = self._telemetry.log(
+                bar=bar, timeframe=tf, strategy=rec.name,
+                signal=sig, context=ctx_features,
+                position=strat_pos,
+                balance=starting_balance + state.realized_pnl,
             )
             if sig is None:
                 continue
@@ -249,8 +338,9 @@ class Conductor:
             # runs (logs winner/suppressed for analytics) but doesn't gate phantom
             # opens. This gives B3's leaderboard real per-strategy data to score.
             if self.dry_run and sig.size > 0:
-                # Calendar gate still applies (don't simulate trades during forbidden windows).
-                allowed, gate_reason = can_trade_now(datetime.now(CT))
+                # Calendar gate uses bar.t (not wall clock) so backtests and unit
+                # tests are reproducible regardless of when they run.
+                allowed, gate_reason = can_trade_now(bar.t.astimezone(CT))
                 if not allowed:
                     if self.db:
                         self.db.log_event(
@@ -260,7 +350,7 @@ class Conductor:
                             raw={"reason": gate_reason, "side": sig.side, "size": sig.size},
                         )
                     continue
-                self._open_phantom_position(rec.name, sig, bar, contract_id)
+                self._open_phantom_position(rec.name, sig, bar, contract_id, bar_event_id)
             elif self.dry_run and sig.size == 0:
                 if self.db:
                     self.db.log_event(
@@ -378,6 +468,7 @@ class Conductor:
 
     def _open_phantom_position(
         self, strategy_name: str, signal: Signal, bar, contract_id: str,
+        bar_event_id: int | None = None,
     ) -> None:
         stop_ticks = signal.bracket.stop_loss_offset_ticks if signal.bracket else 0
         target_ticks = signal.bracket.take_profit_offset_ticks if signal.bracket else 0
@@ -397,6 +488,7 @@ class Conductor:
             entry_bar_t=bar.t,
             reason=signal.reason,
             strategy=strategy_name,
+            bar_event_id=bar_event_id,
         )
         self.dry_run_open.setdefault(strategy_name, []).append(pos)
         signed = signal.size if signal.side == "buy" else -signal.size

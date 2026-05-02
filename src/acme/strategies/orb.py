@@ -26,6 +26,7 @@ from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 CT = ZoneInfo("America/Chicago")
 
@@ -72,6 +73,15 @@ class OpeningRangeBreakoutStrategy:
         default_lifecycle="SHADOW",
         timeframe_minutes=5,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("or_minutes", int, 15, 5, 30, 5, "Opening range duration (min)"),
+            ParameterSpec("volume_multiple", float, 1.2, 1.0, 2.5, 0.1, "Breakout volume multiplier vs OR avg"),
+            ParameterSpec("target_or_width_multiple", float, 1.0, 0.5, 3.0, 0.1, "Target as multiple of OR width"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: ORBConfig | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or ORBConfig()

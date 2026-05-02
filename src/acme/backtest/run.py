@@ -27,6 +27,7 @@ from acme.strategies.orb import OpeningRangeBreakoutStrategy
 from acme.strategies.supertrend import SupertrendStrategy
 from acme.strategies.turtle_soup import TurtleSoupStrategy
 from acme.strategies.turtles_system2 import TurtlesSystem2Strategy
+from acme.telemetry import BarEventLogger
 
 log = structlog.get_logger(__name__)
 
@@ -52,6 +53,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--until", default=None,
                    help="Latest bar to include, ISO date (e.g. 2026-04-30)")
     p.add_argument("--starting-balance", type=float, default=50_000.0)
+    p.add_argument("--telemetry-mode",
+                   choices=["full", "fires_only", "off"], default="fires_only",
+                   help="Per-bar telemetry: 'full' logs every strategy-tf bar, "
+                        "'fires_only' (default) only fires, 'off' disables.")
     return p.parse_args()
 
 
@@ -75,6 +80,13 @@ def main() -> None:
     print(f"Starting balance: ${starting_balance:,.0f}")
     print()
 
+    # One telemetry logger per CLI invocation — all strategies in this run
+    # share a run_id so the Inspector can group them.
+    telemetry = BarEventLogger(source="backtest", mode=args.telemetry_mode) \
+        if args.telemetry_mode != "off" else None
+    if telemetry is not None:
+        log.info("telemetry_run", run_id=telemetry.run_id, mode=args.telemetry_mode)
+
     reports = []
     for name in names:
         builder = SEED_FLEET[name]
@@ -88,12 +100,16 @@ def main() -> None:
             strat, bars_iter,
             profile=TOPSTEP_50K,
             starting_balance=starting_balance,
+            telemetry=telemetry,
         )
         elapsed = time.time() - t0
         log.info("backtest_done", strategy=name, elapsed_sec=round(elapsed, 1),
                  n_trades=report.metrics.n_trades, net_pnl=round(report.metrics.net_pnl, 2))
         save_report(report, starting_balance)
         reports.append(report)
+
+    if telemetry is not None:
+        telemetry.close()
 
     save_fleet_summary(reports, starting_balance)
     print_table(reports, starting_balance)

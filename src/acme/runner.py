@@ -99,12 +99,18 @@ def _parse_args() -> argparse.Namespace:
 
 async def _amain(dry_run: bool) -> None:
     from acme.broker.projectx import ProjectXAdapter
+    from acme.regime.classifier import RegimeEngine
 
     config: Config = load_config()
     db = Db()
     registry = _build_registry(db)
     broker = ProjectXAdapter()
-    conductor = Conductor(broker, db, config, registry, dry_run=dry_run)
+    regime_engine = RegimeEngine(timeframe_minutes=5)
+    conductor = Conductor(
+        broker, db, config, registry,
+        dry_run=dry_run,
+        regime_engine=regime_engine,
+    )
     try:
         await conductor.run_forever()
     finally:
