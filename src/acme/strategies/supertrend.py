@@ -24,6 +24,7 @@ from acme.contracts import MES, FuturesContract
 from acme.indicators import ATR, Supertrend
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 
 @dataclass
@@ -44,6 +45,15 @@ class SupertrendStrategy:
         default_lifecycle="SHADOW",
         timeframe_minutes=5,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("atr_period", int, 10, 5, 30, 1, "ATR period"),
+            ParameterSpec("multiplier", float, 3.0, 1.5, 5.0, 0.1, "Band multiplier"),
+            ParameterSpec("atr_target_multiple", float, 2.0, 1.0, 4.0, 0.1, "Target as ATR multiple"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: SupertrendConfig | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or SupertrendConfig()

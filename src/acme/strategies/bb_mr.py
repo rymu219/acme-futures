@@ -26,6 +26,7 @@ from acme.contracts import MES, FuturesContract
 from acme.indicators import ADX, ATR, RSI, Bollinger
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 CT = ZoneInfo("America/Chicago")
 
@@ -59,6 +60,20 @@ class BollingerMeanReversionStrategy:
         default_lifecycle="SHADOW",
         timeframe_minutes=5,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("bb_period", int, 20, 10, 50, 1, "Bollinger period"),
+            ParameterSpec("bb_std", float, 2.0, 1.5, 3.0, 0.1, "Bollinger std multiplier"),
+            ParameterSpec("rsi_period", int, 2, 2, 14, 1, "RSI period"),
+            ParameterSpec("rsi_long_threshold", float, 5.0, 2.0, 15.0, 1.0, "RSI threshold for long"),
+            ParameterSpec("rsi_short_threshold", float, 95.0, 85.0, 98.0, 1.0, "RSI threshold for short"),
+            ParameterSpec("adx_max_for_range", float, 20.0, 15.0, 30.0, 1.0, "Max ADX to qualify as ranging"),
+            ParameterSpec("stop_atr_multiple", float, 1.5, 1.0, 3.0, 0.1, "Stop as ATR multiple"),
+            ParameterSpec("daily_trade_cap", int, 2, 1, 5, 1, "Max trades per day"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: BBMRConfig | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or BBMRConfig()

@@ -24,6 +24,7 @@ from acme.contracts import MES
 from acme.registry import StrategyRegistry
 from acme.risk import TOPSTEP_50K
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.telemetry import BarEventLogger
 
 
 class _CapturingDb:
@@ -87,7 +88,10 @@ def _build_conductor(strategy_signals: list[Signal | None], dry_run: bool = True
     registry.upsert(name="stub", version="1", state="PILOT", tier=2)
     registry.attach_instance("stub", _StubStrategy(signal_queue=strategy_signals))
     broker = PaperAdapter()
-    cond = Conductor(broker, db, _config(), registry, dry_run=dry_run)
+    cond = Conductor(
+        broker, db, _config(), registry, dry_run=dry_run,
+        telemetry=BarEventLogger(mode="off"),
+    )
     return cond, db, broker
 
 

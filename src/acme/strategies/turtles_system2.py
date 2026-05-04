@@ -26,6 +26,7 @@ from acme.contracts import MES, FuturesContract
 from acme.indicators import ATR
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 
 @dataclass
@@ -47,6 +48,16 @@ class TurtlesSystem2Strategy:
         default_lifecycle="SHADOW",
         timeframe_minutes=5,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("lookback", int, 55, 30, 100, 1, "Channel lookback bars"),
+            ParameterSpec("atr_period", int, 20, 10, 40, 1, "ATR period"),
+            ParameterSpec("atr_stop_multiple", float, 2.5, 1.5, 4.0, 0.1, "Stop as ATR multiple"),
+            ParameterSpec("atr_target_multiple", float, 4.0, 2.0, 6.0, 0.1, "Target as ATR multiple"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: TurtlesSystem2Config | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or TurtlesSystem2Config()

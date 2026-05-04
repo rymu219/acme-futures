@@ -103,6 +103,74 @@ class Db:
         except Exception as e:
             log.error("db_upsert_daily_state_failed", date=str(trade_date), error=str(e))
 
+    # ---------- C-2 regime helpers ----------
+
+    def insert_regime_snapshot(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("market_regimes").insert(row).execute()
+        except Exception as e:
+            log.error("db_insert_regime_snapshot_failed", error=str(e))
+
+    def insert_regime_snapshots(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        try:
+            self.client.table("market_regimes").insert(rows).execute()
+        except Exception as e:
+            log.error("db_insert_regime_snapshots_failed", n=len(rows), error=str(e))
+
+    def latest_regime(self) -> dict | None:
+        try:
+            res = (
+                self.client.table("market_regimes")
+                .select("*")
+                .order("ts", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return (res.data or [None])[0]
+        except Exception as e:
+            log.error("db_latest_regime_failed", error=str(e))
+            return None
+
+    def regime_at_or_before(self, ts_iso: str) -> dict | None:
+        """Returns the most recent market_regimes row with ts <= ts_iso."""
+        try:
+            res = (
+                self.client.table("market_regimes")
+                .select("*")
+                .lte("ts", ts_iso)
+                .order("ts", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return (res.data or [None])[0]
+        except Exception as e:
+            log.error("db_regime_at_or_before_failed", error=str(e))
+            return None
+
+    def upsert_trade_regime_tag(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("trade_regime_tags").upsert(
+                row, on_conflict="trade_id"
+            ).execute()
+        except Exception as e:
+            log.error("db_upsert_trade_regime_tag_failed", error=str(e))
+
+    def upsert_regime_perf(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("regime_strategy_performance").upsert(
+                row, on_conflict="strategy,regime"
+            ).execute()
+        except Exception as e:
+            log.error("db_upsert_regime_perf_failed", error=str(e))
+
+    def insert_coverage_gap(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("coverage_gaps").insert(row).execute()
+        except Exception as e:
+            log.error("db_insert_coverage_gap_failed", error=str(e))
+
 
 # SQL DDL kept here as a single source of truth — run manually in Supabase Studio.
 SUPABASE_DDL = """
@@ -180,4 +248,84 @@ create table if not exists strategy_perf_snapshot (
 );
 create index if not exists strategy_perf_snapshot_strat_idx
   on strategy_perf_snapshot (strategy, occurred_at desc);
+
+-- C-2 additions: Regime Engine
+-- Per-bar regime classification (5m cadence intraday).
+create table if not exists market_regimes (
+  id               bigserial primary key,
+  ts               timestamptz not null,
+  timeframe        text not null,                 -- '5m', '15m', '1h'
+  adx              numeric,
+  adx_direction    text,                          -- 'rising' | 'falling' | 'flat'
+  atr_current      numeric,
+  atr_ratio        numeric,                       -- atr_current / mean(atr[-20:])
+  bb_width         numeric,
+  bb_width_pct     numeric,                       -- percentile rank in 50-bar lookback
+  hurst            numeric,
+  volume_ratio     numeric,
+  momentum_score   numeric,                       -- 0..1 close position in period range
+  regime           text not null,                 -- trending|ranging|compressing|chaotic|ambiguous
+  regime_direction text,                          -- long_bias|short_bias|neutral
+  confidence       numeric,                       -- 0..1
+  raw_signals      jsonb,
+  created_at       timestamptz not null default now()
+);
+create index if not exists market_regimes_ts_idx     on market_regimes (ts desc);
+create index if not exists market_regimes_regime_idx on market_regimes (regime);
+
+-- One row per trade, joining the trade to the regime active at entry.
+create table if not exists trade_regime_tags (
+  id                  bigserial primary key,
+  trade_id            text not null,              -- references bar_events.id (sqlite) OR
+                                                  -- broker_events.id (live signal_emitted)
+  strategy            text not null,
+  entry_ts            timestamptz not null,
+  regime_at_entry     text not null,
+  regime_direction    text,
+  adx_at_entry        numeric,
+  atr_ratio_at_entry  numeric,
+  hurst_at_entry      numeric,
+  confidence_at_entry numeric,
+  pnl                 numeric,
+  outcome             text,                       -- win|loss|scratch
+  tagged_at           timestamptz not null default now()
+);
+create index if not exists trade_regime_tags_strategy_idx on trade_regime_tags (strategy);
+create index if not exists trade_regime_tags_regime_idx   on trade_regime_tags (regime_at_entry);
+create unique index if not exists trade_regime_tags_unique_trade
+  on trade_regime_tags (trade_id);
+
+-- Aggregated strategy x regime performance. Recomputed via analytics.
+create table if not exists regime_strategy_performance (
+  id              bigserial primary key,
+  strategy        text not null,
+  regime          text not null,
+  trade_count     int,
+  win_count       int,
+  loss_count      int,
+  win_rate        numeric,
+  avg_win         numeric,
+  avg_loss        numeric,
+  profit_factor   numeric,
+  expectancy      numeric,
+  sharpe_approx   numeric,
+  habitat_match   boolean,                        -- regime in this strategy's regime_fit >= 0.7
+  computed_at     timestamptz not null default now()
+);
+create unique index if not exists regime_strategy_perf_unique
+  on regime_strategy_performance (strategy, regime);
+
+-- Periods where the market was in a regime no strategy could trade.
+create table if not exists coverage_gaps (
+  id            bigserial primary key,
+  ts            timestamptz not null,
+  regime        text not null,
+  duration_bars int,
+  adx           numeric,
+  atr_ratio     numeric,
+  hurst         numeric,
+  notes         text,
+  created_at    timestamptz not null default now()
+);
+create index if not exists coverage_gaps_ts_idx on coverage_gaps (ts desc);
 """

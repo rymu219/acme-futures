@@ -32,9 +32,11 @@ import structlog
 from acme.broker.base import Bar
 from acme.calendar import CT, topstep_trading_date
 from acme.conductor.bar_aggregator import MultiTimeframeAggregator
+from acme.context import MarketContext
 from acme.perf.tracker import PerfMetrics, PerfTracker
 from acme.risk import DailyState, EvalProfile
 from acme.strategies.base import Strategy
+from acme.telemetry import BarEventLogger
 
 log = structlog.get_logger(__name__)
 
@@ -48,6 +50,7 @@ class _OpenPosition:
     target_price: float
     entry_bar_t: datetime
     reason: str
+    bar_event_id: int | None = None
 
 
 @dataclass
@@ -169,6 +172,7 @@ def run_backtest(
     slip_stop_ticks: int = 2,
     slip_target_ticks: int = 1,
     enforce_time_buckets: bool = True,
+    telemetry: BarEventLogger | None = None,
 ) -> BacktestReport:
     """Run `strategy` against `bars`, simulating bracket fills with slippage.
 
@@ -191,6 +195,7 @@ def run_backtest(
     state: DailyState | None = None
     last_trading_date = None
     bar_indices_for_pos: dict[int, int] = {}   # id(pos) → bar index when opened
+    context = MarketContext()
 
     for one_min_bar in bars:
         bars_processed += 1
@@ -254,6 +259,12 @@ def run_backtest(
                 entry_price=pos.entry_price, exit_price=exit_price,
                 closed_at=outcome_t,
             )
+            if telemetry is not None and pos.bar_event_id is not None:
+                telemetry.log_outcome(
+                    pos.bar_event_id,
+                    exit_t=outcome_t, exit_price=exit_price,
+                    net_pnl=net, outcome=outcome,
+                )
             equity_curve.append((outcome_t, cum_pnl))
             open_positions.remove(pos)
 
@@ -268,6 +279,8 @@ def run_backtest(
             buckets = getattr(strategy.metadata, "time_buckets", []) or []
             if buckets and not _bar_in_buckets(target_bar.t, buckets):
                 continue
+        # Update market context once per strategy-tf bar
+        context.update(target_bar)
         # Per-strategy phantom position drives the strategy's "already in position" guard
         signed_pos = sum(p.size if p.side == "buy" else -p.size for p in open_positions)
         sig = strategy.on_bar(
@@ -275,6 +288,14 @@ def run_backtest(
             current_position=signed_pos,
             current_balance_unrealized=starting_balance + cum_pnl,
         )
+        bar_event_id: int | None = None
+        if telemetry is not None:
+            bar_event_id = telemetry.log(
+                bar=target_bar, timeframe=tf, strategy=strategy.name,
+                signal=sig, context=context.features,
+                position=signed_pos,
+                balance=starting_balance + cum_pnl,
+            )
         if sig is None or sig.size <= 0:
             continue
         bracket = sig.bracket
@@ -293,6 +314,7 @@ def run_backtest(
             side=sig.side, size=sig.size,
             entry_price=entry, stop_price=stop_price, target_price=target_price,
             entry_bar_t=target_bar.t, reason=sig.reason,
+            bar_event_id=bar_event_id,
         )
         open_positions.append(new_pos)
         bar_indices_for_pos[id(new_pos)] = bars_processed

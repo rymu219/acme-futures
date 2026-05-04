@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.acme-futures.streamlit</string>
+
+    <!-- caffeinate keeps the Mac awake; uv runs Streamlit headless on 0.0.0.0:8501
+         so localhost can reach it AND your phone on the same wifi can hit
+         http://<mac-lan-ip>:8501 directly. No auth — local/LAN only.
+         Find the LAN IP with: ipconfig getifaddr en0 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-dimsu</string>
+        <string>/Users/ryanmurphy/.local/bin/uv</string>
+        <string>run</string>
+        <string>streamlit</string>
+        <string>run</string>
+        <string>web/backtest_ui.py</string>
+        <string>--server.port=8501</string>
+        <string>--server.address=0.0.0.0</string>
+        <string>--server.headless=true</string>
+        <string>--browser.gatherUsageStats=false</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/ryanmurphy/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/ryanmurphy</string>
+    </dict>
+
+    <!-- Start automatically when you log in. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the process crashes. ThrottleInterval prevents
+         a fast crash loop from spinning the CPU; minimum 60 seconds between restarts. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Logs — tail these to see what Streamlit is doing. -->
+    <key>StandardOutPath</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures/logs/streamlit.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryanmurphy/Desktop/Acme Futures/logs/streamlit.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

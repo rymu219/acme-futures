@@ -32,6 +32,7 @@ from acme.contracts import MES, FuturesContract
 from acme.indicators import EMA, Stochastic
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
 from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.params import ParameterSpec
 
 TrendDirection = Literal["up", "down", "none"]
 
@@ -62,6 +63,20 @@ class AntiStrategy:
         default_lifecycle="SHADOW",
         timeframe_minutes=5,
     )
+
+    @classmethod
+    def tunable_params(cls) -> list[ParameterSpec]:
+        return [
+            ParameterSpec("trend_ema_period", int, 20, 5, 50, 1, "Trend EMA period"),
+            ParameterSpec("trend_lookback_bars", int, 3, 2, 10, 1, "Bars to confirm trend slope"),
+            ParameterSpec("fast_k_period", int, 5, 3, 15, 1, "Fast stochastic %K period"),
+            ParameterSpec("slow_k_period", int, 14, 8, 30, 1, "Slow stochastic %K period"),
+            ParameterSpec("stoch_overbought", float, 75.0, 60.0, 90.0, 1.0, "Slow stoch overbought level"),
+            ParameterSpec("stoch_oversold", float, 25.0, 10.0, 40.0, 1.0, "Slow stoch oversold level"),
+            ParameterSpec("swing_lookback", int, 5, 3, 15, 1, "Bars for swing-based stop"),
+            ParameterSpec("target_r_multiple", float, 1.5, 1.0, 3.0, 0.1, "Target as R multiple"),
+            ParameterSpec("risk_dollars_per_trade", float, 25.0, 10.0, 200.0, 5.0, "Risk per trade ($)"),
+        ]
 
     def __init__(self, config: AntiConfig | None = None, contract: FuturesContract = MES) -> None:
         self.config = config or AntiConfig()

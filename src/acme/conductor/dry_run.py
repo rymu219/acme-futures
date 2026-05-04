@@ -37,6 +37,7 @@ class DryRunPosition:
     entry_bar_t: datetime
     reason: str
     strategy: str = "unknown"
+    bar_event_id: int | None = None    # links to telemetry bar_events row
 
 
 @dataclass
@@ -50,6 +51,7 @@ class DryRunClose:
     net_pnl: float
     outcome: str
     closed_at: datetime
+    bar_event_id: int | None = None
 
 
 def check_dry_run_exits(
@@ -124,6 +126,7 @@ def check_dry_run_exits(
             net_pnl=net_pnl,
             outcome=outcome,
             closed_at=bar.t,
+            bar_event_id=pos.bar_event_id,
         ))
         open_positions.remove(pos)
         delta += close_size_change

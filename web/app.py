@@ -349,7 +349,42 @@ def _render_leaderboard_html(sb) -> str:
 """
 
 
-def _render_html(sb) -> str:
+REGIME_LABEL = {
+    "trending": "↗ Trending",
+    "ranging": "↔ Ranging",
+    "compressing": "⊟ Compressing",
+    "chaotic": "⚠ Chaotic",
+    "ambiguous": "? Ambiguous",
+}
+
+
+def _fetch_regime_pill(sb) -> str:
+    """Fetch the most recent market_regimes row; render as a status pill."""
+    try:
+        res = (
+            sb.table("market_regimes")
+            .select("ts, regime, confidence")
+            .order("ts", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    r = rows[0]
+    regime = r.get("regime") or "ambiguous"
+    conf = float(r.get("confidence") or 0.0)
+    label = REGIME_LABEL.get(regime, regime)
+    return (
+        f'<span class="meta-pill">regime '
+        f'<strong>{label}</strong> '
+        f'<span class="dim">conf {conf:.2f}</span></span>'
+    )
+
+
+def _render_html(sb, *, token: str | None = None) -> str:
     now_ct = datetime.now(CT)
     session_start = _session_start_ct(now_ct)
     _, latest = _fetch_snapshots(sb, session_start)
@@ -438,6 +473,7 @@ def _render_html(sb) -> str:
             f'<span class="pill pill-blocked"><span class="dot"></span>'
             f'{gate_reason.upper()}</span>'
         )
+    regime_pill = _fetch_regime_pill(sb)
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -594,12 +630,17 @@ def _render_html(sb) -> str:
     <div class="clock mono">{now_ct.strftime('%a %Y-%m-%d  %H:%M:%S CT')}</div>
   </div>
 
+  <div style="font-size:12px;color:var(--dim-2);margin-bottom:12px">
+    Fleet  ·  <a href="/ryan-spec-v3{('?token=' + token) if token else ''}" style="color:#38bdf8;text-decoration:none">Ryan-Spec v3 &rarr;</a>
+  </div>
+
   <div class="statusrow">
     {status_pill}
     <span class="meta-pill">today <strong>{now_ct.strftime('%a %m/%d')}</strong></span>
     <span class="meta-pill">topstep session <strong>{trading_date.strftime('%a %m/%d')}</strong></span>
     <span class="meta-pill">flatten <strong>{flatten_str} CT</strong></span>
     <span class="meta-pill">snapshot <strong>{snap_age or '—'}</strong></span>
+    {regime_pill}
   </div>
 
   <div class="stats">
@@ -652,7 +693,20 @@ def _render_html(sb) -> str:
 def home(token: str | None = Query(default=None)):
     _check_token(token)
     sb = _client()
-    return _render_html(sb)
+    return _render_html(sb, token=token)
+
+
+@app.get("/ryan-spec-v3", response_class=HTMLResponse)
+def ryan_spec_v3(
+    token: str | None = Query(default=None),
+    mode: str = Query(default="paper"),
+):
+    _check_token(token)
+    if mode not in ("paper", "live", "shadow"):
+        raise HTTPException(status_code=400, detail="invalid mode")
+    sb = _client()
+    from ryan_spec_v3_view import render as render_v3
+    return render_v3(sb, mode=mode, token=token)
 
 
 @app.get("/health")
