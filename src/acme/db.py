@@ -171,6 +171,162 @@ class Db:
         except Exception as e:
             log.error("db_insert_coverage_gap_failed", error=str(e))
 
+    # ---------- ryan_spec helpers ----------
+
+    def upsert_ryan_spec_ground_truth(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("ryan_spec_ground_truth").upsert(
+                row, on_conflict="setup_number"
+            ).execute()
+        except Exception as e:
+            log.error("db_upsert_ryan_spec_ground_truth_failed", error=str(e))
+
+    def update_ryan_spec_ground_truth(self, setup_number: int, fields: dict[str, Any]) -> None:
+        try:
+            self.client.table("ryan_spec_ground_truth").update(fields).eq(
+                "setup_number", setup_number
+            ).execute()
+        except Exception as e:
+            log.error("db_update_ryan_spec_ground_truth_failed",
+                      setup_number=setup_number, error=str(e))
+
+    def select_ryan_spec_ground_truth(self) -> list[dict]:
+        try:
+            res = (
+                self.client.table("ryan_spec_ground_truth")
+                .select("*")
+                .order("setup_number", desc=False)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            log.error("db_select_ryan_spec_ground_truth_failed", error=str(e))
+            return []
+
+    def insert_ryan_spec_trigger(self, row: dict[str, Any]) -> int | None:
+        try:
+            res = self.client.table("ryan_spec_triggers").insert(row).execute()
+            data = res.data or []
+            return data[0]["id"] if data else None
+        except Exception as e:
+            log.error("db_insert_ryan_spec_trigger_failed", error=str(e))
+            return None
+
+    def insert_ryan_spec_triggers(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        try:
+            self.client.table("ryan_spec_triggers").insert(rows).execute()
+        except Exception as e:
+            log.error("db_insert_ryan_spec_triggers_failed", n=len(rows), error=str(e))
+
+    def update_ryan_spec_trigger(self, trigger_id: int, fields: dict[str, Any]) -> None:
+        try:
+            self.client.table("ryan_spec_triggers").update(fields).eq(
+                "id", trigger_id
+            ).execute()
+        except Exception as e:
+            log.error("db_update_ryan_spec_trigger_failed",
+                      trigger_id=trigger_id, error=str(e))
+
+    def bulk_upsert_ryan_spec_triggers(self, rows: list[dict[str, Any]]) -> None:
+        """Bulk update — each row must include the primary `id` column.
+        Uses Supabase upsert (on_conflict=id) so 100s of rows go in one HTTP."""
+        if not rows:
+            return
+        try:
+            self.client.table("ryan_spec_triggers").upsert(
+                rows, on_conflict="id"
+            ).execute()
+        except Exception as e:
+            log.error("db_bulk_upsert_ryan_spec_triggers_failed",
+                      n=len(rows), error=str(e))
+
+    def insert_ryan_spec_regression(self, row: dict[str, Any]) -> None:
+        try:
+            self.client.table("ryan_spec_regression").insert(row).execute()
+        except Exception as e:
+            log.error("db_insert_ryan_spec_regression_failed", error=str(e))
+
+    # ---------- ryan_spec_v3 paper/live trades ----------
+
+    def insert_ryan_spec_v3_trade(self, row: dict[str, Any]) -> int | None:
+        """Insert one open trade row; returns its id on success."""
+        try:
+            res = self.client.table("ryan_spec_v3_trades").insert(row).execute()
+            data = res.data or []
+            return int(data[0]["id"]) if data else None
+        except Exception as e:
+            log.error("db_insert_ryan_spec_v3_trade_failed", error=str(e))
+            return None
+
+    def update_ryan_spec_v3_trade(
+        self, trade_id: int, fields: dict[str, Any]
+    ) -> None:
+        """Patch fields on an existing v3 trade row (used to fill in exit info)."""
+        try:
+            self.client.table("ryan_spec_v3_trades").update(fields).eq(
+                "id", trade_id
+            ).execute()
+        except Exception as e:
+            log.error("db_update_ryan_spec_v3_trade_failed",
+                      trade_id=trade_id, error=str(e))
+
+    def select_ryan_spec_v3_trades(
+        self, *, mode: str | None = None, since: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict]:
+        """Read trades back for the Streamlit viewer + promotion gate."""
+        try:
+            q = self.client.table("ryan_spec_v3_trades").select("*")
+            if mode:
+                q = q.eq("mode", mode)
+            if since:
+                q = q.gte("bar_ts", since)
+            res = q.order("bar_ts", desc=True).limit(limit).execute()
+            return res.data or []
+        except Exception as e:
+            log.error("db_select_ryan_spec_v3_trades_failed", error=str(e))
+            return []
+
+    def truncate_regime_tables(self, *, chunk_size: int = 1000) -> None:
+        """Wipe all regime engine output before a clean re-run. Used by
+        backfill --truncate.
+
+        Supabase enforces a ~10s statement timeout. A single bulk DELETE on
+        market_regimes (~150k rows after a 2yr backfill) exceeds that and
+        times out silently. Chunk the delete in id-range batches instead.
+        """
+        for table in (
+            "coverage_gaps",
+            "regime_strategy_performance",
+            "trade_regime_tags",
+            "market_regimes",
+        ):
+            self._chunk_delete(table, chunk_size=chunk_size)
+
+    def _chunk_delete(self, table: str, *, chunk_size: int = 1000) -> None:
+        deleted = 0
+        try:
+            while True:
+                res = (
+                    self.client.table(table)
+                    .select("id")
+                    .order("id", desc=False)
+                    .limit(chunk_size)
+                    .execute()
+                )
+                ids = [r["id"] for r in (res.data or [])]
+                if not ids:
+                    break
+                lo, hi = ids[0], ids[-1]
+                self.client.table(table).delete().gte("id", lo).lte("id", hi).execute()
+                deleted += len(ids)
+            log.info("regime_table_truncated", table=table, deleted=deleted)
+        except Exception as e:
+            log.error("regime_table_truncate_failed", table=table,
+                      deleted_so_far=deleted, error=str(e))
+
 
 # SQL DDL kept here as a single source of truth — run manually in Supabase Studio.
 SUPABASE_DDL = """
@@ -328,4 +484,96 @@ create table if not exists coverage_gaps (
   created_at    timestamptz not null default now()
 );
 create index if not exists coverage_gaps_ts_idx on coverage_gaps (ts desc);
+
+-- C-6 / Ryan-Spec Bot
+-- Ground truth: 30 hand-tagged ideal setups Ryan curated Oct 14-16 2025.
+-- These are the contract — the spec must trigger on all 30.
+create table if not exists ryan_spec_ground_truth (
+  id              bigserial primary key,
+  setup_number    int unique not null,
+  entry_ts        timestamptz not null,
+  direction       text not null,
+  csv_entry_price numeric,
+  db_entry_price  numeric,
+  ohlc_match      boolean,
+  notes           text,
+  delta_at_entry          int,
+  cum_delta_at_entry      int,
+  regime_at_entry         text,
+  bars_since_session_open int,
+  sub_pattern             text,
+  captured_features       jsonb,
+  matched_track_a         boolean,
+  matched_track_b         boolean,
+  created_at      timestamptz not null default now()
+);
+
+-- Every shadow / backfill trigger from the spec.
+create table if not exists ryan_spec_triggers (
+  id                 bigserial primary key,
+  bar_ts             timestamptz not null,
+  track              text,                          -- 'A' (pullback) | 'B' (momentum)
+  direction          text not null,
+  entry_price        numeric,
+  stop_price         numeric,
+  target_price       numeric,
+  sub_pattern        text,
+  matched_conditions jsonb,
+  features           jsonb,
+  user_tag           text,                       -- 'yes'|'no'|'maybe'|null
+  user_tag_ts        timestamptz,
+  user_tag_note      text,
+  outcome            text,
+  exit_ts            timestamptz,
+  exit_price         numeric,
+  pnl_ticks          int,
+  pnl_dollars        numeric,
+  mfe_atr            numeric,
+  mae_atr            numeric,
+  bars_held          int,
+  created_at         timestamptz not null default now()
+);
+create index if not exists ryan_spec_triggers_bar_ts_idx  on ryan_spec_triggers (bar_ts desc);
+create index if not exists ryan_spec_triggers_outcome_idx on ryan_spec_triggers (outcome);
+create index if not exists ryan_spec_triggers_track_idx   on ryan_spec_triggers (track);
+
+-- Per-spec-version regression test results.
+create table if not exists ryan_spec_regression (
+  id              bigserial primary key,
+  spec_version    text not null,
+  spec_hash       text not null,
+  pass_count      int,
+  missed_setups   int[],
+  failure_reasons jsonb,
+  run_at          timestamptz not null default now()
+);
+create index if not exists ryan_spec_regression_run_at_idx on ryan_spec_regression (run_at desc);
+
+-- Ryan-Spec OOS-v3 paper / live trades. Each row = one round-trip trade.
+-- mode flips from 'paper' → 'live' once promotion gate passes.
+create table if not exists ryan_spec_v3_trades (
+  id                  bigserial primary key,
+  mode                text not null,                 -- 'paper' | 'live' | 'shadow'
+  bar_ts              timestamptz not null,          -- 2m bar that fired the trigger
+  direction           text not null,                 -- 'long' | 'short'
+  entry_ts            timestamptz,
+  entry_price         numeric,                       -- realized fill
+  stop_price          numeric,                       -- working resting stop
+  cum_delta_at_entry  int,
+  atr_at_entry        numeric,
+  -- outcome (filled when trade closes)
+  exit_ts             timestamptz,
+  exit_price          numeric,
+  exit_reason         text,                          -- 'stop' | 'opposite_signal' | 'session_end' | 'time_stop'
+  pnl_dollars         numeric,
+  bars_held           int,
+  mfe_atr             numeric,
+  mae_atr             numeric,
+  slippage_ticks      int,                           -- realized vs modeled (1 tick adverse)
+  created_at          timestamptz not null default now()
+);
+create index if not exists ryan_spec_v3_trades_mode_bar_ts_idx
+  on ryan_spec_v3_trades (mode, bar_ts desc);
+create index if not exists ryan_spec_v3_trades_exit_reason_idx
+  on ryan_spec_v3_trades (exit_reason);
 """
