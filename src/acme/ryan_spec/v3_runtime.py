@@ -1,24 +1,24 @@
 """Standalone async runtime for Ryan-Spec OOS-v3.
 
-Designed to run identically Mac-local OR on Railway as a worker process.
 Connects to a configured broker (paper-mode), streams quotes, builds 2m bars
 with cum-delta via tick rule, drives the v3 engine, places orders, logs to
 Supabase. No conductor dependency.
 
-Env vars (read at startup):
+Env vars (loaded from .env at startup):
   ACME_BROKER             paper | projectx        (default paper)
-  ACME_PROJECTX_USER      ProjectX username        (required if projectx)
-  ACME_PROJECTX_API_KEY   ProjectX API key         (required if projectx)
   ACME_CONTRACT_SYMBOL    e.g. MES                 (default MES)
   ACME_MODE               paper | live | shadow    (default paper)
   ACME_DELTA_SOURCE       quote | trade            (default quote)
   ACME_RISK_CONTRACTS     int                      (default 1)
 
-Run locally:
-  uv run python -m acme.ryan_spec.v3_runtime
+  PROJECTX_USERNAME       ProjectX username        (required if projectx)
+  PROJECTX_API_KEY        ProjectX API key         (required if projectx)
+  PROJECTX_ACCOUNT_ID     optional, falls back to lookup
+  SUPABASE_URL            (required)
+  SUPABASE_SERVICE_ROLE_KEY (required)
 
-Run on Railway:
-  Procfile: `worker: uv run python -m acme.ryan_spec.v3_runtime`
+Run:
+  uv run python -m acme.ryan_spec.v3_runtime
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
+from dotenv import load_dotenv
 
 from acme.broker.base import BracketSpec, BrokerAdapter
 from acme.contracts import MES
@@ -58,12 +59,8 @@ def _build_broker() -> BrokerAdapter:
         return PaperAdapter()  # type: ignore[return-value]
     if kind == "projectx":
         from acme.broker.projectx import ProjectXAdapter
-        user = _env("ACME_PROJECTX_USER")
-        api_key = _env("ACME_PROJECTX_API_KEY")
-        if not user or not api_key:
-            raise SystemExit("ACME_PROJECTX_USER and ACME_PROJECTX_API_KEY "
-                             "required for projectx broker.")
-        return ProjectXAdapter(username=user, api_key=api_key)
+        # ProjectXAdapter reads PROJECTX_USERNAME / PROJECTX_API_KEY from env
+        return ProjectXAdapter()
     raise SystemExit(f"Unknown ACME_BROKER={kind!r}")
 
 
@@ -285,6 +282,8 @@ class V3Runtime:
 
 
 def main() -> None:
+    # Load .env from project root (PROJECTX creds, SUPABASE_*, etc.)
+    load_dotenv()
     structlog.configure(processors=[
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
