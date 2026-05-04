@@ -100,6 +100,14 @@ class V3Runtime:
                  delta_source=self.delta_source, contract=self.contract_symbol,
                  broker=type(self.broker).__name__)
         await self.broker.authenticate()
+        # Resolve the trading account before placing orders. ProjectXAdapter's
+        # account_id property raises until get_account() has populated it (or
+        # PROJECTX_ACCOUNT_ID is set in env), which would surface here as
+        # broker_error on every entry.
+        account = await self.broker.get_account()
+        log.info("v3_runtime_account",
+                 id=account.get("id") or account.get("Id"),
+                 can_trade=account.get("canTrade"))
         self._contract_id = await self.broker.resolve_contract(self.contract_symbol)
         log.info("v3_runtime_contract", id=self._contract_id)
 
