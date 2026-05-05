@@ -212,3 +212,40 @@ def test_engine_no_signal_when_position_open_and_held():
                   bar_delta=0, cum_delta_session=-2580)
     assert d2.action == "none"
     assert d2.reason == "hold"
+
+
+def test_session_end_uses_ct_not_caller_tz():
+    """A UTC-tagged bar at 15:22 UTC is 09:22 CT — well before the 14:50 CT
+    session-end. Engine must NOT fire session_end on it. Regression for the
+    bug where session_end_ct (14:50) was naively compared against bar.t in
+    the caller's tz, causing immediate session_end exits when ProjectX bars
+    (which arrive UTC-tagged) were fed in."""
+    e = RyanSpecV3Engine()
+    # Warm up in CT so we can open a position cleanly
+    t = _flat_warmup(e)
+    e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4998.5, c=4999.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4999.0, h=5001.0, l=4998.5, c=5000.5),
+                 bar_delta=-100, cum_delta_session=-2600)
+    e.open_position(direction="long", entry_ts=d.bar_ts,
+                    entry_fill_price=d.entry_price + 0.25,
+                    atr_at_entry=d.atr_at_entry,
+                    cum_delta_at_entry=d.cum_delta_at_entry)
+
+    # Now feed a UTC-tagged bar at 15:22 UTC = 09:22 CT (mid-session).
+    # Pre-fix this would have triggered session_end immediately because
+    # 15:22 UTC > 14:50 (interpreted as UTC). Post-fix it must not.
+    UTC = timezone(timedelta(hours=0))
+    utc_bar_t = datetime(2026, 5, 4, 15, 22, tzinfo=UTC)
+    d2 = e.on_bar(_bar(utc_bar_t, o=5000.5, h=5001.0, l=5000.4, c=5000.6),
+                  bar_delta=0, cum_delta_session=-2580)
+    assert d2.reason != "session_end"
+
+    # And a UTC-tagged bar at 20:51 UTC = 14:51 CT (after session end)
+    # MUST trigger session_end.
+    utc_after_close = datetime(2026, 5, 4, 20, 51, tzinfo=UTC)
+    d3 = e.on_bar(_bar(utc_after_close, o=5000.6, h=5001.0, l=5000.4, c=5000.5),
+                  bar_delta=0, cum_delta_session=-2580)
+    assert d3.action == "exit"
+    assert d3.reason == "session_end"
