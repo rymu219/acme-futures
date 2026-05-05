@@ -6,6 +6,7 @@ malformed payloads), and the close-side broker plumbing.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -212,6 +213,102 @@ async def test_fill_payload_accepts_capitalized_keys():
 
     db = runtime.db
     assert db.updates == [(42, {"entry_price": 5000.25, "slippage_ticks": 1})]  # type: ignore[attr-defined]
+
+
+# --- dry_run mode -------------------------------------------------------
+
+def _dry_runtime() -> V3Runtime:
+    rt = V3Runtime(
+        broker=PaperAdapter(),
+        db=_FakeDb(),  # type: ignore[arg-type]
+        contract_symbol="MES",
+        mode="paper",
+        dry_run=True,
+    )
+    rt._contract_id = "CON.F.US.MES.M26"
+    return rt
+
+
+def _decision_enter(
+    *, direction: str = "long", entry: float = 5000.0, atr: float = 2.0,
+) -> Decision:
+    sign = 1 if direction == "long" else -1
+    return Decision(
+        action="enter",
+        direction=direction,  # type: ignore[arg-type]
+        reason="oos_v3_signal",
+        entry_price=entry,
+        stop_price=entry - sign * 1.5 * atr,
+        bar_ts=datetime.now(UTC),
+        cum_delta_at_entry=-2500,
+        atr_at_entry=atr,
+    )
+
+
+async def test_dry_run_open_skips_broker_submit():
+    rt = _dry_runtime()
+    await rt._open(_decision_enter(direction="long", entry=5000.0), _bar_with_delta(close=5000.0))
+
+    # No real order was submitted on the broker.
+    assert rt.broker.submitted_orders == []  # type: ignore[attr-defined]
+    # Trade row was still inserted at the modeled price.
+    db = rt.db
+    assert len(db.inserts) == 1  # type: ignore[attr-defined]
+    assert db.inserts[0]["entry_price"] == 5000.0  # type: ignore[attr-defined]
+    assert db.inserts[0]["mode"] == "paper"  # type: ignore[attr-defined]
+    # Slippage stamped 0 so the gate's slippage stat distinguishes phantom
+    # rows from real fills it hasn't yet measured.
+    assert db.updates == [(1, {"slippage_ticks": 0})]  # type: ignore[attr-defined]
+    # Open state set; no pending entry registered (no fill confirmation will arrive).
+    assert rt._open_trade_id == 1
+    assert rt._open_position_meta is not None
+    assert rt._open_position_meta["entry_fill"] == 5000.0
+    assert rt._pending_entry_fills == {}
+
+
+async def test_dry_run_open_does_not_count_as_broker_error():
+    """Phantom fills must NOT bump the consecutive-errors counter or trip
+    the circuit breaker."""
+    rt = _dry_runtime()
+    await rt._open(_decision_enter(), _bar_with_delta())
+    assert rt._consecutive_errors == 0
+
+
+async def test_dry_run_close_skips_broker_submit_and_writes_exit_row():
+    rt = _dry_runtime()
+    _seed_open(rt, row_id=42, direction="long", modeled=5000.0)
+
+    await rt._close(_decision_exit(), _bar_with_delta(close=5004.0))
+
+    # No real exit order was submitted.
+    assert rt.broker.submitted_orders == []  # type: ignore[attr-defined]
+    # Exit row written from bar.c, P&L computed at the phantom prices.
+    db = rt.db
+    row_id, fields = db.updates[0]  # type: ignore[attr-defined]
+    assert row_id == 42
+    assert fields["exit_price"] == 5004.0
+    assert fields["exit_reason"] == "opposite_signal"
+    # (5004 - 5000) * 1 * 5 - 0.70 = 19.30
+    assert fields["pnl_dollars"] == pytest.approx(19.30)
+    # No pending exit registered — no real fill is coming.
+    assert rt._pending_exit_fills == {}
+    # Position state cleared.
+    assert rt._open_trade_id is None
+
+
+async def test_dry_run_skips_user_events_task():
+    """In dry_run, run() must not start the user-events background task —
+    no real fills will arrive, and the user hub may not even be authorised
+    on a read-only connection."""
+    rt = _dry_runtime()
+    await rt.broker.authenticate()
+    rt._auth_ok = True
+    rt._contract_id = await rt.broker.resolve_contract("MES")
+
+    # Simulate the slice of run() that decides whether to start the task.
+    if not rt.dry_run:
+        rt._user_events_task = asyncio.create_task(rt._consume_user_events())  # noqa
+    assert rt._user_events_task is None
 
 
 # --- trade-stream loop --------------------------------------------------

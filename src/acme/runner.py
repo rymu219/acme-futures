@@ -1,18 +1,25 @@
 """Thin entry-point that wires everything into a Conductor and runs forever.
 
-All trading logic lives in `acme.conductor.Conductor`. This module's only job
-is to construct the dependencies (broker, db, registry, config), register the
-active strategies, and start the loop.
+All trading logic lives in `acme.conductor.Conductor` plus the standalone
+`acme.ryan_spec.v3_runtime.V3Runtime`. This module's only job is to construct
+the shared dependencies (one broker connection, one Db, one registry, one
+config), register the active strategies, and start both loops in parallel.
 
 Modes:
   default   — submits real market orders against the configured broker
-  --dry-run — phantom-position simulation; no orders submitted
+  --dry-run — phantom-position simulation; no orders submitted (applies to
+              both the Conductor's 8 strategies and Ryan-Spec v3)
+
+Single ProjectX connection is shared across the Conductor and v3 so we don't
+hit per-credential connection limits — each strategy keeps its own phantom
+P&L bucket via Supabase rows tagged with its strategy name.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 
 import structlog
 
@@ -21,6 +28,12 @@ from acme.config import Config, load_config
 from acme.contracts import MES
 from acme.db import Db
 from acme.registry import StrategyRegistry
+from acme.ryan_spec.v3_runtime import (
+    SESSION_END_CT,
+    SESSION_OPEN_CT,
+    V3Runtime,
+    _parse_hhmm,
+)
 from acme.strategies.anti import AntiStrategy
 from acme.strategies.bb_mr import BollingerMeanReversionStrategy
 from acme.strategies.donchian import DonchianBreakoutStrategy
@@ -97,6 +110,37 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _build_v3_runtime(broker, db: Db, *, dry_run: bool) -> V3Runtime:
+    """Build the Ryan-Spec v3 runtime with the shared broker connection.
+
+    Reads its own env vars (delta source, contract, risk size, session times)
+    so it stays configurable independently of the Conductor's parameters.
+    """
+    contract = os.getenv("ACME_CONTRACT_SYMBOL", "MES")
+    delta_source = os.getenv("ACME_DELTA_SOURCE", "quote")
+    if delta_source not in ("quote", "trade"):
+        raise SystemExit(f"Invalid ACME_DELTA_SOURCE={delta_source!r}")
+    risk = int(os.getenv("ACME_RISK_CONTRACTS", "1") or "1")
+    session_open = _parse_hhmm(
+        os.getenv("ACME_SESSION_OPEN_CT") or SESSION_OPEN_CT.strftime("%H:%M"),
+        field_name="ACME_SESSION_OPEN_CT",
+    )
+    session_end = _parse_hhmm(
+        os.getenv("ACME_SESSION_END_CT") or SESSION_END_CT.strftime("%H:%M"),
+        field_name="ACME_SESSION_END_CT",
+    )
+    return V3Runtime(
+        broker=broker, db=db,
+        contract_symbol=contract,
+        mode="paper" if dry_run else "live",
+        delta_source=delta_source,  # type: ignore[arg-type]
+        risk_contracts=risk,
+        session_open_ct=session_open,
+        session_end_ct=session_end,
+        dry_run=dry_run,
+    )
+
+
 async def _amain(dry_run: bool) -> None:
     from acme.broker.projectx import ProjectXAdapter
     from acme.regime.classifier import RegimeEngine
@@ -104,6 +148,10 @@ async def _amain(dry_run: bool) -> None:
     config: Config = load_config()
     db = Db()
     registry = _build_registry(db)
+    # ONE ProjectX connection shared by the Conductor and Ryan-Spec v3.
+    # Both run as concurrent async tasks against the same broker; each keeps
+    # its own phantom P&L bucket (Conductor → broker_events / perf tables;
+    # v3 → ryan_spec_v3_trades).
     broker = ProjectXAdapter()
     regime_engine = RegimeEngine(timeframe_minutes=5)
     conductor = Conductor(
@@ -111,8 +159,15 @@ async def _amain(dry_run: bool) -> None:
         dry_run=dry_run,
         regime_engine=regime_engine,
     )
+    v3 = _build_v3_runtime(broker, db, dry_run=dry_run)
+    log.info("runner_starting_v3_in_parallel",
+             dry_run=dry_run, contract=v3.contract_symbol,
+             delta_source=v3.delta_source)
     try:
-        await conductor.run_forever()
+        # TaskGroup propagates exceptions and cancels siblings on any failure.
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(conductor.run_forever(), name="conductor")
+            tg.create_task(v3.run(), name="ryan_spec_v3")
     finally:
         await broker.aclose()
 
