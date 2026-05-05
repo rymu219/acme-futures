@@ -20,12 +20,17 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from typing import Literal
 
 from acme.broker.base import Bar
 from acme.indicators import ATR, Bollinger
+
+# CT (America/Chicago, ignoring DST) — engine internally normalizes bar
+# timestamps to CT for the session_end check, so callers can pass bars in
+# any tz (UTC from ProjectX, CT from tests, etc.) and get correct behavior.
+CT = timezone(timedelta(hours=-6))
 
 Direction = Literal["long", "short"]
 Action = Literal["enter", "exit", "none"]
@@ -219,9 +224,11 @@ class RyanSpecV3Engine:
         if stop_hit:
             return Decision(action="exit", reason="stop", bar_ts=bar.t)
 
-        # 2) Session end (bar at/after 14:50 CT in bar's CT-aware time)
-        bar_time = bar.t.timetz()
-        if bar_time >= self._session_end_ct.replace(tzinfo=bar_time.tzinfo):
+        # 2) Session end (bar at/after 14:50 CT). Convert bar.t to CT first
+        # so callers passing UTC bars (live ProjectX feed, history backfill)
+        # get the same answer as callers passing CT-tagged bars (engine tests).
+        bar_time_ct = bar.t.astimezone(CT).time()
+        if bar_time_ct >= self._session_end_ct:
             return Decision(action="exit", reason="session_end", bar_ts=bar.t)
 
         # 3) Opposite-direction trigger fired this bar?
