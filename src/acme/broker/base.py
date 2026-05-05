@@ -23,6 +23,19 @@ class Quote(BaseModel):
     last: float | None = None
 
 
+# Aggressor side: "B" = buy aggressor (lifted offer), "A" = sell aggressor (hit bid).
+# None = broker did not classify; consumer should fall back to tick rule.
+TradeSide = Literal["B", "A"]
+
+
+class Trade(BaseModel):
+    t: datetime
+    contract_id: str
+    price: float
+    size: int
+    side: TradeSide | None = None
+
+
 class Fill(BaseModel):
     order_id: str
     contract_id: str
@@ -58,6 +71,7 @@ class BrokerAdapter(Protocol):
         limit: int = 20_000,
     ) -> list[Bar]: ...
     def stream_quotes(self, contract_id: str) -> AsyncIterator[Quote]: ...
+    def stream_trades(self, contract_id: str) -> AsyncIterator[Trade]: ...
     def stream_user_events(self) -> AsyncIterator[dict]: ...
     async def submit_market_order(
         self,

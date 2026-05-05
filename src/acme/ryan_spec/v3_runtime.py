@@ -10,6 +10,8 @@ Env vars (loaded from .env at startup):
   ACME_MODE               paper | live | shadow    (default paper)
   ACME_DELTA_SOURCE       quote | trade            (default quote)
   ACME_RISK_CONTRACTS     int                      (default 1)
+  ACME_SESSION_OPEN_CT    HH:MM in America/Chicago (default 08:30)
+  ACME_SESSION_END_CT     HH:MM in America/Chicago (default 14:50)
 
   PROJECTX_USERNAME       ProjectX username        (required if projectx)
   PROJECTX_API_KEY        ProjectX API key         (required if projectx)
@@ -27,7 +29,9 @@ import asyncio
 import contextlib
 import os
 import signal
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, tzinfo
+from datetime import time as dtime
 from typing import Any, Literal
 
 import structlog
@@ -39,17 +43,83 @@ from acme.db import Db
 from acme.ryan_spec.v3_engine import (
     FILTER_THRESH_SIZE_WEIGHTED,
     FILTER_THRESH_UNIT_WEIGHTED,
+    SESSION_END_CT,
     Decision,
+    Direction,
     RyanSpecV3Engine,
 )
-from acme.ryan_spec.v3_tick_delta import BarWithDelta, LiveBarDeltaBuilder
+from acme.ryan_spec.v3_tick_delta import (
+    CT,
+    SESSION_OPEN_CT,
+    BarWithDelta,
+    LiveBarDeltaBuilder,
+)
 
 log = structlog.get_logger(__name__)
+
+# Round-turn commission per contract (MES). Matches what was previously
+# hardcoded in _close(); centralised so entry and exit reconciliation share
+# the same number.
+ROUND_TURN_COMMISSION_DOLLARS = 0.70
 
 
 def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name)
     return v if v is not None and v != "" else (default if default is not None else "")
+
+
+def _parse_hhmm(value: str, *, field_name: str) -> dtime:
+    """Parse 'HH:MM' (or 'HHMM') into a naive time. Raises SystemExit on bad input."""
+    s = value.strip().replace(":", "")
+    if len(s) != 4 or not s.isdigit():
+        raise SystemExit(f"Invalid {field_name}={value!r}; expected HH:MM (e.g. 08:30)")
+    hh, mm = int(s[:2]), int(s[2:])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise SystemExit(f"Invalid {field_name}={value!r}; HH must be 0-23, MM 0-59")
+    return dtime(hh, mm)
+
+
+@dataclass(frozen=True)
+class _PendingEntry:
+    """An entry order awaiting its broker fill confirmation."""
+    row_id: int
+    direction: Direction
+    modeled_price: float
+
+
+@dataclass(frozen=True)
+class _PendingExit:
+    """An exit order awaiting its broker fill confirmation.
+
+    `entry_fill` is captured at exit-submit time; if the entry fill arrives
+    *after* the exit submits (rare but possible network race), this snapshot
+    will use the modeled entry, not the real one. The DB's entry_price is
+    patched independently — only pnl_dollars carries this small risk.
+    """
+    row_id: int
+    sign: int            # +1 for long position, -1 for short
+    entry_fill: float
+    commission_dollars: float
+
+
+def compute_entry_slippage_ticks(
+    direction: Direction, modeled_price: float, fill_price: float, tick_size: float
+) -> int:
+    """Signed entry slippage in ticks. Positive = adverse (worse fill).
+
+    Long: positive when fill > modeled (paid more).
+    Short: positive when fill < modeled (received less).
+    """
+    sign = 1 if direction == "long" else -1
+    return int(round((fill_price - modeled_price) * sign / tick_size))
+
+
+def compute_realized_pnl_dollars(
+    sign: int, entry_fill: float, exit_fill: float,
+    point_value: float, commission_dollars: float,
+) -> float:
+    """Realized P&L in dollars: (exit - entry) * sign * point_value - commission."""
+    return (exit_fill - entry_fill) * sign * point_value - commission_dollars
 
 
 def _build_broker() -> BrokerAdapter:
@@ -76,6 +146,9 @@ class V3Runtime:
         mode: Literal["paper", "live", "shadow"] = "paper",
         delta_source: Literal["quote", "trade"] = "quote",
         risk_contracts: int = 1,
+        session_open_ct: dtime = SESSION_OPEN_CT,
+        session_end_ct: dtime = SESSION_END_CT,
+        session_tz: tzinfo = CT,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -88,11 +161,22 @@ class V3Runtime:
         # trade → size-weighted (matches OOS exactly)
         thresh = (FILTER_THRESH_UNIT_WEIGHTED if delta_source == "quote"
                   else FILTER_THRESH_SIZE_WEIGHTED)
-        self.engine = RyanSpecV3Engine(filter_thresh=thresh)
-        self.builder = LiveBarDeltaBuilder(on_bar=self._on_closed_bar)
+        self.engine = RyanSpecV3Engine(
+            filter_thresh=thresh,
+            session_end_ct=session_end_ct,
+            session_tz=session_tz,
+        )
+        self.builder = LiveBarDeltaBuilder(
+            on_bar=self._on_closed_bar,
+            session_open_ct=session_open_ct,
+            session_tz=session_tz,
+        )
         self._contract_id: str | None = None
         self._open_trade_id: int | None = None
         self._open_position_meta: dict[str, Any] | None = None
+        self._pending_entry_fills: dict[str, _PendingEntry] = {}
+        self._pending_exit_fills: dict[str, _PendingExit] = {}
+        self._user_events_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
@@ -109,10 +193,19 @@ class V3Runtime:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self._stop_event.set)
 
-        if self.delta_source == "trade":
-            await self._run_trade_loop()
-        else:
-            await self._run_quote_loop()
+        # Reconcile real broker fills onto open trade rows in the background.
+        self._user_events_task = asyncio.create_task(self._consume_user_events())
+
+        try:
+            if self.delta_source == "trade":
+                await self._run_trade_loop()
+            else:
+                await self._run_quote_loop()
+        finally:
+            if self._user_events_task is not None:
+                self._user_events_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._user_events_task
 
         # Drain final partial bar (best-effort)
         self.builder.force_close_current()
@@ -141,17 +234,22 @@ class V3Runtime:
             raise
 
     async def _run_trade_loop(self) -> None:
-        # The BrokerAdapter Protocol does not currently define stream_trades.
-        # Caller must extend the adapter to expose a (t, price, size, side)
-        # async iterator. This wiring is intentionally explicit so we don't
-        # silently fall back to lower-fidelity quote tick rule.
-        raise NotImplementedError(
-            "delta_source='trade' requires broker.stream_trades(contract_id). "
-            "Extend the BrokerAdapter Protocol + ProjectXAdapter to subscribe "
-            "to the trades hub event (likely 'GatewayTrade'), then replace "
-            "this method body with an async-for over that stream calling "
-            "builder.add_trade(t, price, size, side=...). See module docstring."
+        log.info(
+            "v3_runtime_trade_mode",
+            filter_thresh=FILTER_THRESH_SIZE_WEIGHTED,
+            note=("delta source is TRADE-driven size-weighted aggressor flow. "
+                  "Matches OOS methodology exactly — threshold -2000 size-weighted."),
         )
+        try:
+            async for tr in self.broker.stream_trades(self._contract_id):  # type: ignore[arg-type]
+                if self._stop_event.is_set():
+                    break
+                self.builder.add_trade(
+                    tr.t, float(tr.price), int(tr.size), side=tr.side,
+                )
+        except Exception:
+            log.exception("v3_runtime_trade_loop_failed")
+            raise
 
     # ---------- engine integration ----------
 
@@ -214,7 +312,7 @@ class V3Runtime:
                 self._contract_id,  # type: ignore[arg-type]
                 side,  # type: ignore[arg-type]
                 self.risk_contracts,
-                custom_tag=f"ryan_spec_v3:{row_id}",
+                custom_tag=f"ryan_spec_v3:{row_id}:in",
                 bracket=BracketSpec(
                     stop_loss_offset_ticks=stop_ticks,
                     take_profit_offset_ticks=None,
@@ -233,15 +331,23 @@ class V3Runtime:
         self._open_trade_id = row_id
         self._open_position_meta = {
             "direction": decision.direction,
-            "entry_fill": float(decision.entry_price),
+            "entry_fill": float(decision.entry_price),  # provisional; patched on real fill
             "atr": float(decision.atr_at_entry),
             "cum_delta": int(decision.cum_delta_at_entry or 0),
             "entry_ts": datetime.now(UTC),
             "sign": sign,
         }
-        # Notify engine of the recorded open. (Real fill price may differ;
-        # the broker callback should call engine.open_position with the actual
-        # fill once we have it — for now we use the bar close as a proxy.)
+        # Register the order so _consume_user_events can attribute the fill
+        # back to this row even if the position is closed before fill arrives.
+        self._pending_entry_fills[str(order_id)] = _PendingEntry(
+            row_id=row_id,
+            direction=decision.direction,
+            modeled_price=float(decision.entry_price),
+        )
+        # Notify engine of the recorded open. Real fill arrives async via
+        # _process_user_event, which patches the DB row + meta entry_fill.
+        # Engine state isn't re-seeded — its stop_price drift vs the broker
+        # bracket is bounded by entry slippage, which we measure separately.
         self.engine.open_position(
             direction=decision.direction,
             entry_ts=datetime.now(UTC),
@@ -250,32 +356,180 @@ class V3Runtime:
             cum_delta_at_entry=int(decision.cum_delta_at_entry or 0),
         )
 
+    # ---------- broker fill reconciliation ----------
+
+    async def _consume_user_events(self) -> None:
+        """Background loop: stream broker user events, reconcile fills."""
+        try:
+            async for evt in self.broker.stream_user_events():
+                if self._stop_event.is_set():
+                    break
+                try:
+                    await self._process_user_event(evt)
+                except Exception:
+                    log.exception("v3_runtime_user_event_failed",
+                                  evt_kind=(evt or {}).get("kind"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("v3_runtime_user_event_loop_failed")
+
+    async def _process_user_event(self, evt: dict) -> None:
+        """Handle one event from broker.stream_user_events().
+
+        Public-ish for tests — covers entry- and exit-fill matching by
+        orderId (primary) or customTag (fallback for shapes that omit
+        orderId). Entry fills are tried first, then exits.
+        """
+        if (evt or {}).get("kind") != "fill":
+            return
+        payload = evt.get("payload") or {}
+        order_id = str(payload.get("orderId") or payload.get("OrderId") or "")
+        tag = str(payload.get("customTag") or payload.get("CustomTag") or "")
+
+        pending_entry = (
+            self._pending_entry_fills.pop(order_id, None) if order_id else None
+        )
+        if pending_entry is None:
+            pending_entry = self._match_entry_pending_by_tag(tag)
+        if pending_entry is not None:
+            fill_price = self._extract_fill_price(payload, pending_entry.row_id)
+            if fill_price is not None:
+                self._record_entry_fill(pending_entry, fill_price)
+            return
+
+        pending_exit = (
+            self._pending_exit_fills.pop(order_id, None) if order_id else None
+        )
+        if pending_exit is None:
+            pending_exit = self._match_exit_pending_by_tag(tag)
+        if pending_exit is not None:
+            fill_price = self._extract_fill_price(payload, pending_exit.row_id)
+            if fill_price is not None:
+                self._record_exit_fill(pending_exit, fill_price)
+
+    @staticmethod
+    def _extract_fill_price(payload: dict, row_id: int) -> float | None:
+        price = payload.get("price") or payload.get("Price")
+        if price is None:
+            log.error("v3_runtime_fill_missing_price",
+                      row_id=row_id, payload_keys=list(payload.keys()))
+            return None
+        return float(price)
+
+    def _match_entry_pending_by_tag(self, tag: str) -> _PendingEntry | None:
+        if not tag.startswith("ryan_spec_v3:") or not tag.endswith(":in"):
+            return None
+        for order_id, pending in list(self._pending_entry_fills.items()):
+            if f"ryan_spec_v3:{pending.row_id}:in" == tag:
+                self._pending_entry_fills.pop(order_id, None)
+                return pending
+        return None
+
+    def _match_exit_pending_by_tag(self, tag: str) -> _PendingExit | None:
+        if not tag.startswith("ryan_spec_v3:") or not tag.endswith(":out"):
+            return None
+        for order_id, pending in list(self._pending_exit_fills.items()):
+            if f"ryan_spec_v3:{pending.row_id}:out" == tag:
+                self._pending_exit_fills.pop(order_id, None)
+                return pending
+        return None
+
+    def _record_entry_fill(self, pending: _PendingEntry, fill_price: float) -> None:
+        """Patch DB row + runtime meta with the real entry fill."""
+        slippage = compute_entry_slippage_ticks(
+            pending.direction, pending.modeled_price, fill_price, MES.tick_size
+        )
+        self.db.update_ryan_spec_v3_trade(pending.row_id, {
+            "entry_price": fill_price,
+            "slippage_ticks": slippage,
+        })
+        # If the position is still open and matches, update the meta so the
+        # eventual close P&L is computed against the real fill.
+        if (
+            self._open_trade_id == pending.row_id
+            and self._open_position_meta is not None
+        ):
+            self._open_position_meta["entry_fill"] = fill_price
+        log.info("v3_runtime_entry_fill_reconciled",
+                 row_id=pending.row_id,
+                 direction=pending.direction,
+                 modeled=pending.modeled_price,
+                 fill=fill_price,
+                 slippage_ticks=slippage)
+
+    def _record_exit_fill(self, pending: _PendingExit, fill_price: float) -> None:
+        """Patch DB row with the real exit fill and recomputed P&L."""
+        pnl_dollars = compute_realized_pnl_dollars(
+            sign=pending.sign,
+            entry_fill=pending.entry_fill,
+            exit_fill=fill_price,
+            point_value=MES.point_value,
+            commission_dollars=pending.commission_dollars,
+        )
+        self.db.update_ryan_spec_v3_trade(pending.row_id, {
+            "exit_price": fill_price,
+            "pnl_dollars": float(pnl_dollars),
+        })
+        log.info("v3_runtime_exit_fill_reconciled",
+                 row_id=pending.row_id,
+                 entry_fill=pending.entry_fill,
+                 exit_fill=fill_price,
+                 pnl_dollars=pnl_dollars)
+
     async def _close(self, decision: Decision, bd: BarWithDelta) -> None:
         if self._open_trade_id is None or self._open_position_meta is None:
             return
         log.info("v3_runtime_close_attempt", reason=decision.reason)
-        # Close via flatten_all (paper); for live this should be per-contract.
-        try:
-            await self.broker.flatten_all()
-        except Exception:
-            log.exception("v3_runtime_flatten_failed")
-            # Don't lose the row — record the attempted exit anyway
-        # Realized P&L is approximate (bar close ≠ exact fill); the broker
-        # fill callback should reconcile this. For now we use bar.c.
         meta = self._open_position_meta
+        row_id = self._open_trade_id
         sign = meta["sign"]
+        side = "sell" if meta["direction"] == "long" else "buy"
+
+        # Submit a tagged opposite-side market order so we can attribute the
+        # close fill back to this row when the broker confirms it.
+        order_id: str | None = None
+        try:
+            order_id = await self.broker.submit_market_order(
+                self._contract_id,  # type: ignore[arg-type]
+                side,  # type: ignore[arg-type]
+                self.risk_contracts,
+                custom_tag=f"ryan_spec_v3:{row_id}:out",
+            )
+            log.info("v3_runtime_close_submitted", order_id=order_id, row_id=row_id)
+        except Exception:
+            log.exception("v3_runtime_close_failed")
+            # Don't lose the row — record the attempted exit with bar.c below.
+
+        # Provisional exit using bar.c. Real fill arrives async via
+        # _process_user_event → _record_exit_fill which patches exit_price
+        # and pnl_dollars with the broker-confirmed values.
         exit_price = float(bd.bar.c)
-        pnl_points = (exit_price - meta["entry_fill"]) * sign
-        pnl_dollars = pnl_points * MES.point_value - 0.70  # round-turn commission
+        pnl_dollars = compute_realized_pnl_dollars(
+            sign=sign,
+            entry_fill=float(meta["entry_fill"]),
+            exit_fill=exit_price,
+            point_value=MES.point_value,
+            commission_dollars=ROUND_TURN_COMMISSION_DOLLARS,
+        )
         held_seconds = (datetime.now(UTC) - meta["entry_ts"]).total_seconds()
         bars_held = max(1, int(held_seconds / 120))
-        self.db.update_ryan_spec_v3_trade(self._open_trade_id, {
+        self.db.update_ryan_spec_v3_trade(row_id, {
             "exit_ts": datetime.now(UTC).isoformat(),
             "exit_price": exit_price,
             "exit_reason": decision.reason,
             "pnl_dollars": float(pnl_dollars),
             "bars_held": bars_held,
         })
+
+        if order_id is not None:
+            self._pending_exit_fills[str(order_id)] = _PendingExit(
+                row_id=row_id,
+                sign=sign,
+                entry_fill=float(meta["entry_fill"]),
+                commission_dollars=ROUND_TURN_COMMISSION_DOLLARS,
+            )
+
         self.engine.close_position()
         self._open_trade_id = None
         self._open_position_meta = None
@@ -299,10 +553,18 @@ def main() -> None:
         raise SystemExit(f"Invalid ACME_MODE={mode!r}")
     if delta_source not in ("quote", "trade"):
         raise SystemExit(f"Invalid ACME_DELTA_SOURCE={delta_source!r}")
+    session_open = _parse_hhmm(
+        _env("ACME_SESSION_OPEN_CT", "08:30"), field_name="ACME_SESSION_OPEN_CT",
+    )
+    session_end = _parse_hhmm(
+        _env("ACME_SESSION_END_CT", "14:50"), field_name="ACME_SESSION_END_CT",
+    )
     runtime = V3Runtime(
         broker=broker, db=db, contract_symbol=contract,
         mode=mode, delta_source=delta_source,  # type: ignore[arg-type]
         risk_contracts=risk,
+        session_open_ct=session_open,
+        session_end_ct=session_end,
     )
     asyncio.run(runtime.run())
 

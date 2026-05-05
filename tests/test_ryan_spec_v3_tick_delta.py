@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 from acme.ryan_spec.v3_tick_delta import LiveBarDeltaBuilder
 
 CT = timezone(timedelta(hours=-6))
+CHI = ZoneInfo("America/Chicago")  # observes DST
 
 
 def test_builder_emits_bar_on_bucket_flip():
@@ -91,3 +94,38 @@ def test_builder_force_close_emits_partial_bar():
     b.force_close_current()
     assert len(out) == 1
     assert out[0].bar.v == 5
+
+
+def test_builder_session_open_ct_is_configurable():
+    """Custom session_open_ct shifts the cum_delta reset boundary.
+
+    Uses real Chicago time so the boundary is precise regardless of DST.
+    """
+    out = []
+    b = LiveBarDeltaBuilder(on_bar=out.append, session_open_ct=dtime(9, 0))
+    # Pre-09:00 Chicago — anchor is yesterday's 09:00
+    pre = datetime(2026, 5, 5, 8, 45, tzinfo=CHI)
+    b.add_trade(pre, 5000.0, size=100, side="B")
+    b.force_close_current()
+    # At 09:00 Chicago — anchor flips to today's 09:00 → reset
+    post = datetime(2026, 5, 5, 9, 0, tzinfo=CHI)
+    b.add_trade(post, 5005.0, size=50, side="A")
+    b.force_close_current()
+    assert len(out) == 2
+    assert out[0].cum_delta_session == 100
+    assert out[1].cum_delta_session == -50
+
+
+def test_builder_default_session_open_holds_within_session():
+    """Default 08:30 reset: 08:45 → 09:00 stays in the same Chicago session
+    so cum_delta accumulates rather than resetting."""
+    out = []
+    b = LiveBarDeltaBuilder(on_bar=out.append)  # default 08:30
+    pre = datetime(2026, 5, 5, 8, 45, tzinfo=CHI)
+    b.add_trade(pre, 5000.0, size=100, side="B")
+    b.force_close_current()
+    post = datetime(2026, 5, 5, 9, 0, tzinfo=CHI)
+    b.add_trade(post, 5005.0, size=50, side="A")
+    b.force_close_current()
+    assert out[0].cum_delta_session == 100
+    assert out[1].cum_delta_session == 50  # 100 + (-50), no reset

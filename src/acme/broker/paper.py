@@ -7,7 +7,7 @@ import itertools
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
-from acme.broker.base import Bar, BracketSpec, Position, Quote, Side
+from acme.broker.base import Bar, BracketSpec, Position, Quote, Side, Trade
 
 
 class PaperAdapter:
@@ -62,6 +62,16 @@ class PaperAdapter:
                 bid=self._price + i * self._tick_size,
                 ask=self._price + (i + 1) * self._tick_size,
                 last=self._price + i * self._tick_size,
+            )
+
+    async def stream_trades(self, contract_id: str) -> AsyncIterator[Trade]:
+        for i in range(5):
+            yield Trade(
+                t=datetime.now(),
+                contract_id=contract_id,
+                price=self._price + i * self._tick_size,
+                size=1,
+                side="B" if i % 2 == 0 else "A",
             )
 
     async def stream_user_events(self) -> AsyncIterator[dict]:
