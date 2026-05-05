@@ -154,6 +154,7 @@ class V3Runtime:
         session_open_ct: dtime = SESSION_OPEN_CT,
         session_end_ct: dtime = SESSION_END_CT,
         session_tz: tzinfo = CT,
+        dry_run: bool = False,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -161,6 +162,11 @@ class V3Runtime:
         self.mode = mode
         self.delta_source = delta_source
         self.risk_contracts = risk_contracts
+        # Phantom-fill mode: skip submit_market_order entirely; record trade
+        # rows at the modeled price. Used when running alongside other bots on
+        # one shared broker connection so we can paper-trade all of them
+        # against live market data without competing for real margin.
+        self.dry_run = dry_run
         # Pick the engine's filter threshold based on delta source.
         # quote → unit-weighted (recalibrated to -670 vs OOS-validated -2000)
         # trade → size-weighted (matches OOS exactly)
@@ -231,7 +237,11 @@ class V3Runtime:
                 loop.add_signal_handler(sig, self._stop_event.set)
 
         # Reconcile real broker fills onto open trade rows in the background.
-        self._user_events_task = asyncio.create_task(self._consume_user_events())
+        # Skipped in dry_run mode — no real fills will ever arrive and the
+        # user-events stream may not be authorised when the broker connection
+        # is read-only.
+        if not self.dry_run:
+            self._user_events_task = asyncio.create_task(self._consume_user_events())
 
         try:
             if self.delta_source == "trade":
@@ -422,34 +432,50 @@ class V3Runtime:
             log.error("v3_runtime_db_insert_failed_aborting_order")
             return
 
-        # Submit market entry + resting stop bracket
-        try:
-            order_id = await self.broker.submit_market_order(
-                self._contract_id,  # type: ignore[arg-type]
-                side,  # type: ignore[arg-type]
-                self.risk_contracts,
-                custom_tag=f"ryan_spec_v3:{row_id}:in",
-                bracket=BracketSpec(
-                    stop_loss_offset_ticks=stop_ticks,
-                    take_profit_offset_ticks=None,
-                ),
-            )
-            log.info("v3_runtime_open_submitted", order_id=order_id, row_id=row_id)
-            # Successful submit clears the broker-error streak.
+        if self.dry_run:
+            # Phantom fill at the modeled price. Mark slippage_ticks=0 so the
+            # promotion gate's slippage stat distinguishes phantom rows from
+            # real fills it hasn't yet measured.
+            log.info("v3_runtime_open_phantom",
+                     row_id=row_id, entry=decision.entry_price)
+            self.db.update_ryan_spec_v3_trade(row_id, {"slippage_ticks": 0})
             self._consecutive_errors = 0
-        except Exception:
-            log.exception("v3_runtime_open_failed")
-            # Mark the trade row as broker-error so the row isn't a phantom
-            self.db.update_ryan_spec_v3_trade(row_id, {
-                "exit_reason": "broker_error",
-                "exit_ts": datetime.now(UTC).isoformat(),
-            })
-            # Circuit breaker: count this error and self-halt if we've crossed
-            # the configured threshold. Heartbeat surfaces the new counter.
-            self._consecutive_errors += 1
-            self._maybe_self_halt()
-            self._write_heartbeat()
-            return
+        else:
+            # Submit market entry + resting stop bracket
+            try:
+                order_id = await self.broker.submit_market_order(
+                    self._contract_id,  # type: ignore[arg-type]
+                    side,  # type: ignore[arg-type]
+                    self.risk_contracts,
+                    custom_tag=f"ryan_spec_v3:{row_id}:in",
+                    bracket=BracketSpec(
+                        stop_loss_offset_ticks=stop_ticks,
+                        take_profit_offset_ticks=None,
+                    ),
+                )
+                log.info("v3_runtime_open_submitted", order_id=order_id, row_id=row_id)
+                # Successful submit clears the broker-error streak.
+                self._consecutive_errors = 0
+            except Exception:
+                log.exception("v3_runtime_open_failed")
+                # Mark the trade row as broker-error so the row isn't a phantom
+                self.db.update_ryan_spec_v3_trade(row_id, {
+                    "exit_reason": "broker_error",
+                    "exit_ts": datetime.now(UTC).isoformat(),
+                })
+                # Circuit breaker: count this error and self-halt if we've crossed
+                # the configured threshold. Heartbeat surfaces the new counter.
+                self._consecutive_errors += 1
+                self._maybe_self_halt()
+                self._write_heartbeat()
+                return
+            # Register the order so _consume_user_events can attribute the fill
+            # back to this row even if the position is closed before fill arrives.
+            self._pending_entry_fills[str(order_id)] = _PendingEntry(
+                row_id=row_id,
+                direction=decision.direction,
+                modeled_price=float(decision.entry_price),
+            )
 
         self._open_trade_id = row_id
         self._open_position_meta = {
@@ -460,13 +486,6 @@ class V3Runtime:
             "entry_ts": datetime.now(UTC),
             "sign": sign,
         }
-        # Register the order so _consume_user_events can attribute the fill
-        # back to this row even if the position is closed before fill arrives.
-        self._pending_entry_fills[str(order_id)] = _PendingEntry(
-            row_id=row_id,
-            direction=decision.direction,
-            modeled_price=float(decision.entry_price),
-        )
         # Notify engine of the recorded open. Real fill arrives async via
         # _process_user_event, which patches the DB row + meta entry_fill.
         # Engine state isn't re-seeded — its stop_price drift vs the broker
@@ -611,18 +630,22 @@ class V3Runtime:
 
         # Submit a tagged opposite-side market order so we can attribute the
         # close fill back to this row when the broker confirms it.
+        # In dry_run we skip the submit entirely — bar.c is the phantom fill.
         order_id: str | None = None
-        try:
-            order_id = await self.broker.submit_market_order(
-                self._contract_id,  # type: ignore[arg-type]
-                side,  # type: ignore[arg-type]
-                self.risk_contracts,
-                custom_tag=f"ryan_spec_v3:{row_id}:out",
-            )
-            log.info("v3_runtime_close_submitted", order_id=order_id, row_id=row_id)
-        except Exception:
-            log.exception("v3_runtime_close_failed")
-            # Don't lose the row — record the attempted exit with bar.c below.
+        if self.dry_run:
+            log.info("v3_runtime_close_phantom", row_id=row_id, exit=float(bd.bar.c))
+        else:
+            try:
+                order_id = await self.broker.submit_market_order(
+                    self._contract_id,  # type: ignore[arg-type]
+                    side,  # type: ignore[arg-type]
+                    self.risk_contracts,
+                    custom_tag=f"ryan_spec_v3:{row_id}:out",
+                )
+                log.info("v3_runtime_close_submitted", order_id=order_id, row_id=row_id)
+            except Exception:
+                log.exception("v3_runtime_close_failed")
+                # Don't lose the row — record the attempted exit with bar.c below.
 
         # Provisional exit using bar.c. Real fill arrives async via
         # _process_user_event → _record_exit_fill which patches exit_price
@@ -682,12 +705,14 @@ def main() -> None:
     session_end = _parse_hhmm(
         _env("ACME_SESSION_END_CT", "14:50"), field_name="ACME_SESSION_END_CT",
     )
+    dry_run = _env("ACME_V3_DRY_RUN", "false").lower() in ("1", "true", "yes")
     runtime = V3Runtime(
         broker=broker, db=db, contract_symbol=contract,
         mode=mode, delta_source=delta_source,  # type: ignore[arg-type]
         risk_contracts=risk,
         session_open_ct=session_open,
         session_end_ct=session_end,
+        dry_run=dry_run,
     )
     asyncio.run(runtime.run())
 
