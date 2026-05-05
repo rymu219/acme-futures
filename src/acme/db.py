@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -288,6 +288,78 @@ class Db:
         except Exception as e:
             log.error("db_select_ryan_spec_v3_trades_failed", error=str(e))
             return []
+
+    # ---------- runtime ops: heartbeat + remote kill-switch ----------
+
+    def write_heartbeat(
+        self,
+        service: str,
+        *,
+        last_bar_ts: datetime | None,
+        auth_ok: bool,
+        consecutive_errors: int,
+        position_state: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Upsert a single heartbeat row for `service`. Best-effort —
+        never raises. The runtime calls this on every closed bar so the
+        watcher can detect a stale or dead bot."""
+        row: dict[str, Any] = {
+            "service": service,
+            "ts": datetime.now(UTC).isoformat(),
+            "last_bar_ts": last_bar_ts.astimezone(UTC).isoformat() if last_bar_ts else None,
+            "auth_ok": bool(auth_ok),
+            "consecutive_errors": int(consecutive_errors),
+            "position_state": position_state,
+            "extra": extra or {},
+        }
+        try:
+            self.client.table("runtime_heartbeats").upsert(
+                row, on_conflict="service"
+            ).execute()
+        except Exception as e:
+            log.warning("db_write_heartbeat_failed", service=service, error=str(e))
+
+    def read_runtime_config(self, service: str) -> dict[str, Any]:
+        """Fetch the kill-switch config for `service`. Returns safe defaults
+        on read failure so a Supabase hiccup never silently halts trading."""
+        defaults = {"paused": False, "max_consecutive_errors": 3}
+        try:
+            res = (
+                self.client.table("runtime_config")
+                .select("paused,max_consecutive_errors")
+                .eq("service", service)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            if not rows:
+                return defaults
+            row = rows[0]
+            return {
+                "paused": bool(row.get("paused", False)),
+                "max_consecutive_errors": int(
+                    row.get("max_consecutive_errors") or defaults["max_consecutive_errors"]
+                ),
+            }
+        except Exception as e:
+            log.warning("db_read_runtime_config_failed",
+                        service=service, error=str(e))
+            return defaults
+
+    def set_runtime_paused(self, service: str, *, paused: bool, by: str) -> None:
+        """Flip the remote pause flag. Used by the self-halt circuit breaker
+        and by manual operator action (via Supabase Studio). Best-effort."""
+        try:
+            self.client.table("runtime_config").upsert({
+                "service": service,
+                "paused": bool(paused),
+                "updated_at": datetime.now(UTC).isoformat(),
+                "updated_by": by,
+            }, on_conflict="service").execute()
+        except Exception as e:
+            log.error("db_set_runtime_paused_failed",
+                      service=service, paused=paused, by=by, error=str(e))
 
     def truncate_regime_tables(self, *, chunk_size: int = 1000) -> None:
         """Wipe all regime engine output before a clean re-run. Used by
@@ -576,4 +648,27 @@ create index if not exists ryan_spec_v3_trades_mode_bar_ts_idx
   on ryan_spec_v3_trades (mode, bar_ts desc);
 create index if not exists ryan_spec_v3_trades_exit_reason_idx
   on ryan_spec_v3_trades (exit_reason);
+
+-- Runtime heartbeat (one row per service, upserted each bar by the runtime).
+create table if not exists runtime_heartbeats (
+  service             text primary key,
+  ts                  timestamptz not null,
+  last_bar_ts         timestamptz,
+  auth_ok             boolean not null,
+  consecutive_errors  int not null default 0,
+  position_state      text not null,
+  extra               jsonb
+);
+
+-- Remote kill-switch + circuit breaker config (one row per service).
+create table if not exists runtime_config (
+  service                  text primary key,
+  paused                   boolean not null default false,
+  max_consecutive_errors   int not null default 3,
+  updated_at               timestamptz not null default now(),
+  updated_by               text
+);
+insert into runtime_config (service, paused, max_consecutive_errors)
+values ('ryan_spec_v3', false, 3)
+on conflict (service) do nothing;
 """
