@@ -1,9 +1,9 @@
 """Paper-week promotion gate evaluator.
 
-Per ryanspec-paper-wiring-brief.md Step 7. Reads paper trades from Supabase,
-returns a verdict: PROMOTE_LIVE / EXTEND_PAPER / HALT / INVESTIGATE. Decision
-is automated but the user reviews before flipping the mode flag — caller is
-responsible for the actual mode change.
+Per docs/ryanspec-paper-wiring-brief.md Step 7. Reads paper trades from
+Supabase, returns a verdict: PROMOTE_LIVE / EXTEND_PAPER / HALT /
+INVESTIGATE. Decision is automated but the user reviews before flipping
+the mode flag — caller is responsible for the actual mode change.
 """
 
 from __future__ import annotations

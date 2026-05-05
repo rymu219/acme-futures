@@ -6,12 +6,19 @@ server-enforced and discovered by hitting them. So `EvalProfile` is hardcoded fr
 Topstep's published docs. Local enforcement is intentionally over-protective: we
 check trailing DD against the *unrealized* peak intraday, while Topstep's actual
 rule trails the *realized* EOD peak. That makes our gate a strict superset of theirs.
+
+Each profile carries a `snapshot_date` so callers can detect when the snapshot
+has aged out and prompt a re-validation against the live Topstep docs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+
+# Default freshness budget: re-validate the profile against Topstep docs at
+# least once per quarter.
+EVAL_PROFILE_MAX_AGE_DAYS = 90
 
 # TOPSTEP_50K snapshot 2026-04-29 from help.topstep.com:
 #   Account: $50,000 | Max Loss (trailing EOD): $2,000 | Daily Loss: $1,000
@@ -38,6 +45,9 @@ class EvalProfile:
     round_turn_fees: dict[str, float] = field(default_factory=lambda: {
         "MES": 1.24, "MNQ": 1.24, "ES": 3.80, "NQ": 3.80,
     })
+    # Date this snapshot was last verified against help.topstep.com. Bump on
+    # every re-validation. None means "not tracked" → freshness check is skipped.
+    snapshot_date: date | None = None
 
 
 TOPSTEP_50K = EvalProfile(
@@ -49,9 +59,27 @@ TOPSTEP_50K = EvalProfile(
     min_trading_days=5,
     max_position_contracts={"MES": 50, "MNQ": 50, "ES": 5, "NQ": 5},
     max_single_day_profit=1_500.0,
+    snapshot_date=date(2026, 4, 29),
 )
 
 PROFILES: dict[str, EvalProfile] = {"topstep_50k": TOPSTEP_50K}
+
+
+def eval_profile_age_days(profile: EvalProfile, today: date | None = None) -> int | None:
+    """Days between today and the profile's snapshot date. None if untracked."""
+    if profile.snapshot_date is None:
+        return None
+    return ((today or date.today()) - profile.snapshot_date).days
+
+
+def is_eval_profile_stale(
+    profile: EvalProfile,
+    today: date | None = None,
+    max_age_days: int = EVAL_PROFILE_MAX_AGE_DAYS,
+) -> bool:
+    """True when the snapshot is older than `max_age_days`. Untracked = not stale."""
+    age = eval_profile_age_days(profile, today)
+    return age is not None and age > max_age_days
 
 
 @dataclass
