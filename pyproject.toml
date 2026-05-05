@@ -13,6 +13,7 @@ dependencies = [
     "structlog>=24",
     "tenacity>=8",
     "databento>=0.77.0",
+    "pandas>=2.0",
 ]
 
 [dependency-groups]

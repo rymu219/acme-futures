@@ -20,17 +20,13 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, tzinfo
 from datetime import time as dtime
 from typing import Literal
 
 from acme.broker.base import Bar
 from acme.indicators import ATR, Bollinger
-
-# CT (America/Chicago, ignoring DST) — engine internally normalizes bar
-# timestamps to CT for the session_end check, so callers can pass bars in
-# any tz (UTC from ProjectX, CT from tests, etc.) and get correct behavior.
-CT = timezone(timedelta(hours=-6))
+from acme.ryan_spec.v3_tick_delta import CT
 
 Direction = Literal["long", "short"]
 Action = Literal["enter", "exit", "none"]
@@ -114,6 +110,7 @@ class RyanSpecV3Engine:
         stop_atr_mult: float = STOP_ATR_MULT,
         time_stop_bars: int = TIME_STOP_BARS,
         session_end_ct: dtime = SESSION_END_CT,
+        session_tz: tzinfo = CT,
         filter_thresh: int = FILTER_THRESH,
     ) -> None:
         self._bb = Bollinger(period=bb_period, num_std=bb_std)
@@ -124,6 +121,7 @@ class RyanSpecV3Engine:
         self._stop_atr_mult = stop_atr_mult
         self._time_stop_bars = time_stop_bars
         self._session_end_ct = session_end_ct
+        self._session_tz = session_tz
         self._filter_thresh = filter_thresh
 
     @property
@@ -224,11 +222,11 @@ class RyanSpecV3Engine:
         if stop_hit:
             return Decision(action="exit", reason="stop", bar_ts=bar.t)
 
-        # 2) Session end (bar at/after 14:50 CT). Convert bar.t to CT first
-        # so callers passing UTC bars (live ProjectX feed, history backfill)
-        # get the same answer as callers passing CT-tagged bars (engine tests).
-        bar_time_ct = bar.t.astimezone(CT).time()
-        if bar_time_ct >= self._session_end_ct:
+        # 2) Session end (bar at/after configured close in session-tz local time).
+        # bar.t may be UTC (live) or fixed-offset (some tests) — convert to the
+        # configured session_tz so DST handles itself.
+        bar_local = bar.t.astimezone(self._session_tz).timetz()
+        if bar_local >= self._session_end_ct.replace(tzinfo=bar_local.tzinfo):
             return Decision(action="exit", reason="session_end", bar_ts=bar.t)
 
         # 3) Opposite-direction trigger fired this bar?

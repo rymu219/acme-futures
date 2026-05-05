@@ -19,13 +19,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, tzinfo
 from datetime import time as dtime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from acme.broker.base import Bar
 
-CT = timezone(timedelta(hours=-6))   # America/Chicago, ignoring DST shifts
+# Chicago wall-clock — observes CST/CDT transitions automatically. Treat this
+# as the canonical session-clock tz across the v3 stack; previously the code
+# used a fixed -06:00 offset, which silently drifted by an hour during DST.
+CT: tzinfo = ZoneInfo("America/Chicago")
 SESSION_OPEN_CT = dtime(8, 30)
 
 
@@ -41,13 +45,13 @@ def _bucket_floor_2m(t: datetime) -> datetime:
     return t.replace(minute=minute, second=0, microsecond=0)
 
 
-def _session_anchor_ct(t_any: datetime) -> datetime:
-    """Most recent 08:30 CT for any tz-aware datetime."""
-    t_ct = t_any.astimezone(CT)
-    today_open = t_ct.replace(hour=SESSION_OPEN_CT.hour,
-                              minute=SESSION_OPEN_CT.minute,
-                              second=0, microsecond=0)
-    if t_ct >= today_open:
+def _session_anchor(t_any: datetime, *, session_tz: tzinfo, open_time: dtime) -> datetime:
+    """Most recent session-open instant for any tz-aware datetime."""
+    t_local = t_any.astimezone(session_tz)
+    today_open = t_local.replace(hour=open_time.hour,
+                                 minute=open_time.minute,
+                                 second=0, microsecond=0)
+    if t_local >= today_open:
         return today_open
     return today_open - timedelta(days=1)
 
@@ -62,8 +66,12 @@ class LiveBarDeltaBuilder:
         self,
         *,
         on_bar: Callable[[BarWithDelta], None],
+        session_open_ct: dtime = SESSION_OPEN_CT,
+        session_tz: tzinfo = CT,
     ) -> None:
         self._on_bar = on_bar
+        self._session_open_ct = session_open_ct
+        self._session_tz = session_tz
         self._bucket_start: datetime | None = None
         self._open: float | None = None
         self._high: float = float("-inf")
@@ -74,7 +82,7 @@ class LiveBarDeltaBuilder:
         self._n: int = 0
         self._last_price: float | None = None
         self._last_dir: int = 0    # carried for tick-rule price-equal ties
-        # Session-state for cum_delta reset at 08:30 CT
+        # Session-state for cum_delta reset at session open
         self._session_anchor: datetime | None = None
         self._cum_delta_session: int = 0
 
@@ -127,7 +135,9 @@ class LiveBarDeltaBuilder:
     # ---------- internal ----------
 
     def _maybe_reset_session(self, t: datetime) -> None:
-        anchor = _session_anchor_ct(t)
+        anchor = _session_anchor(
+            t, session_tz=self._session_tz, open_time=self._session_open_ct,
+        )
         if self._session_anchor != anchor:
             self._session_anchor = anchor
             self._cum_delta_session = 0

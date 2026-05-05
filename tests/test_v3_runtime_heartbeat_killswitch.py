@@ -182,7 +182,11 @@ def test_runtime_paused_still_processes_exits():
     bd = _bd(exit_decision.bar_ts, c=4995.0)
     asyncio.run(rt._dispatch_decision(exit_decision, bd))
 
-    assert broker.flatten_calls == 1
+    # Exits go through a tagged opposite-side market order so the close fill
+    # can be attributed back to this row by _record_exit_fill.
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["side"] == "sell"  # closing a long
+    assert broker.submit_calls[0]["tag"] == "ryan_spec_v3:42:out"
     # Position state cleared after close
     assert rt._open_trade_id is None
 

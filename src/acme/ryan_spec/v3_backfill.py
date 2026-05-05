@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from typing import Any
 
@@ -126,10 +125,10 @@ def replay(
             # The engine reports stop hits as bar.l/h crossing pos.stop_price.
             # For backfill we use stop_price as the fill on stop, bar close
             # otherwise. Same convention the OOS simulator used.
-            if decision.reason == "stop":
-                exit_price = open_meta["stop_price"]
-            else:
-                exit_price = float(bar.c)
+            exit_price = (
+                open_meta["stop_price"] if decision.reason == "stop"
+                else float(bar.c)
+            )
             sign = open_meta["sign"]
             pnl_points = (exit_price - open_meta["entry_price"]) * sign
             pnl_dollars = pnl_points * contract_point_value - commission_round_turn
@@ -229,10 +228,10 @@ def main() -> None:
         structlog.dev.ConsoleRenderer(),
     ])
     args = _parse_args()
-    if args.date:
-        target = date.fromisoformat(args.date)
-    else:
-        target = datetime.now(CT).date()
+    target = (
+        date.fromisoformat(args.date) if args.date
+        else datetime.now(CT).date()
+    )
     log.info("v3_backfill_starting", date=str(target),
              dry_run=args.dry_run, mode=args.mode)
     asyncio.run(_amain(target, args.dry_run, args.mode))

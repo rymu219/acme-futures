@@ -1,10 +1,14 @@
-from datetime import date
+from dataclasses import replace
+from datetime import date, timedelta
 
 from acme.risk import (
+    EVAL_PROFILE_MAX_AGE_DAYS,
     TOPSTEP_50K,
     DailyState,
     can_open_new_position,
     dollars_to_contracts,
+    eval_profile_age_days,
+    is_eval_profile_stale,
     trailing_max_loss_limit,
 )
 
@@ -132,3 +136,39 @@ def test_consistency_rule_does_not_block_when_negative_pnl():
     state = _state(peak=50_000, realized=-500)
     ok, _ = can_open_new_position(TOPSTEP_50K, state, 49_500, "MES", 1, 0)
     assert ok
+
+
+# --- EvalProfile freshness ----------------------------------------------
+
+def test_topstep_50k_carries_a_snapshot_date():
+    assert TOPSTEP_50K.snapshot_date == date(2026, 4, 29)
+
+
+def test_age_days_is_positive_when_today_is_after_snapshot():
+    snapshot = date(2026, 1, 1)
+    profile = replace(TOPSTEP_50K, snapshot_date=snapshot)
+    assert eval_profile_age_days(profile, today=date(2026, 4, 1)) == 90
+
+
+def test_age_days_returns_none_when_snapshot_date_is_unset():
+    profile = replace(TOPSTEP_50K, snapshot_date=None)
+    assert eval_profile_age_days(profile, today=date(2026, 4, 1)) is None
+
+
+def test_is_stale_at_threshold_is_not_stale():
+    """Boundary: age == max_age_days does NOT count as stale."""
+    profile = replace(TOPSTEP_50K, snapshot_date=date(2026, 1, 1))
+    today = date(2026, 1, 1) + timedelta(days=EVAL_PROFILE_MAX_AGE_DAYS)
+    assert is_eval_profile_stale(profile, today=today) is False
+
+
+def test_is_stale_one_day_past_threshold():
+    profile = replace(TOPSTEP_50K, snapshot_date=date(2026, 1, 1))
+    today = date(2026, 1, 1) + timedelta(days=EVAL_PROFILE_MAX_AGE_DAYS + 1)
+    assert is_eval_profile_stale(profile, today=today) is True
+
+
+def test_is_stale_returns_false_when_snapshot_unset():
+    """No snapshot_date → can't reason about staleness → don't fire the warning."""
+    profile = replace(TOPSTEP_50K, snapshot_date=None)
+    assert is_eval_profile_stale(profile, today=date(2030, 1, 1)) is False

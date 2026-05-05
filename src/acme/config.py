@@ -3,11 +3,20 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import structlog
 from dotenv import load_dotenv
 
-from acme.risk import PROFILES, EvalProfile
+from acme.risk import (
+    EVAL_PROFILE_MAX_AGE_DAYS,
+    PROFILES,
+    EvalProfile,
+    eval_profile_age_days,
+    is_eval_profile_stale,
+)
 
 load_dotenv()
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,6 +40,16 @@ def load_config() -> Config:
     profile = PROFILES.get(profile_name)
     if not profile:
         raise ValueError(f"unknown ACME_EVAL_PROFILE={profile_name}; known={list(PROFILES)}")
+    if is_eval_profile_stale(profile):
+        log.warning(
+            "eval_profile_stale",
+            profile=profile.name,
+            snapshot_date=(profile.snapshot_date.isoformat()
+                           if profile.snapshot_date else None),
+            age_days=eval_profile_age_days(profile),
+            max_age_days=EVAL_PROFILE_MAX_AGE_DAYS,
+            note="Re-validate against current Topstep docs and bump snapshot_date.",
+        )
     flatten_hh, flatten_mm = _parse_hhmm(os.getenv("ACME_FLATTEN_HHMM", "15:55"))
     return Config(
         eval_profile=profile,

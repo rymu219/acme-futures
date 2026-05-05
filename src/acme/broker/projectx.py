@@ -35,7 +35,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from acme.broker.base import Bar, BracketSpec, BrokerAdapter, Position, Quote, Side
+from acme.broker.base import Bar, BracketSpec, BrokerAdapter, Position, Quote, Side, Trade
 
 log = structlog.get_logger(__name__)
 
@@ -346,6 +346,109 @@ class ProjectXAdapter(BrokerAdapter):
         finally:
             with contextlib.suppress(Exception):
                 connection.send("UnsubscribeContractQuotes", [contract_id])
+            connection.stop()
+
+    async def stream_trades(self, contract_id: str) -> AsyncIterator[Trade]:  # type: ignore[override]
+        from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
+
+        await self._ensure_auth()
+        queue: asyncio.Queue[Trade] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        err_count = {"n": 0}
+
+        def _extract_dict(args: list[Any]) -> dict | None:
+            for a in args or []:
+                if isinstance(a, dict):
+                    return a
+                if isinstance(a, str) and a.startswith("{"):
+                    import json
+                    try:
+                        return json.loads(a)
+                    except Exception:
+                        continue
+            return None
+
+        def _coerce_side(payload: dict) -> str | None:
+            # ProjectX shapes seen: side="B"/"A", aggressor=0/1, type=0/1.
+            # 0/buy aggressor → "B", 1/sell aggressor → "A". When ambiguous,
+            # return None so the bar builder falls back to size-weighted tick rule.
+            raw = (
+                payload.get("side")
+                or payload.get("Side")
+                or payload.get("aggressor")
+                or payload.get("Aggressor")
+                or payload.get("type")
+                or payload.get("Type")
+            )
+            if raw is None:
+                return None
+            if isinstance(raw, str):
+                upper = raw.upper()
+                if upper in ("B", "BUY"):
+                    return "B"
+                if upper in ("A", "S", "SELL", "ASK"):
+                    return "A"
+                return None
+            if isinstance(raw, int | float):
+                if int(raw) == 0:
+                    return "B"
+                if int(raw) == 1:
+                    return "A"
+            return None
+
+        def _on_trade(args: list[Any]) -> None:
+            try:
+                payload = _extract_dict(args)
+                if payload is None:
+                    if err_count["n"] < 3:
+                        log.error("on_trade_no_dict", args_repr=repr(args)[:200])
+                        err_count["n"] += 1
+                    return
+                price = payload.get("price") or payload.get("Price") or payload.get("lastPrice")
+                size = (
+                    payload.get("size") or payload.get("Size")
+                    or payload.get("volume") or payload.get("Volume")
+                )
+                ts = payload.get("timestamp") or payload.get("Timestamp") or payload.get("t")
+                if price is None or size is None:
+                    return
+                t = (
+                    datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if isinstance(ts, str) else datetime.now()
+                )
+                tr = Trade(
+                    t=t,
+                    contract_id=contract_id,
+                    price=float(price),
+                    size=int(size),
+                    side=_coerce_side(payload),  # type: ignore[arg-type]
+                )
+                loop.call_soon_threadsafe(queue.put_nowait, tr)
+            except Exception as e:
+                if err_count["n"] < 3:
+                    log.error("on_trade_failed", error=str(e), args_repr=repr(args)[:200])
+                    err_count["n"] += 1
+
+        token = self._token
+        connection = (
+            HubConnectionBuilder()
+            .with_url(
+                f"{self.market_hub}?access_token={token}",
+                options={"access_token_factory": lambda: token},
+            )
+            .with_automatic_reconnect({"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5})
+            .build()
+        )
+        connection.on("GatewayTrade", _on_trade)
+        connection.start()
+        await asyncio.sleep(1.0)  # give the websocket handshake a moment
+        try:
+            connection.send("SubscribeContractTrades", [contract_id])
+            while True:
+                yield await queue.get()
+        finally:
+            with contextlib.suppress(Exception):
+                connection.send("UnsubscribeContractTrades", [contract_id])
             connection.stop()
 
     async def stream_user_events(self) -> AsyncIterator[dict]:  # type: ignore[override]
