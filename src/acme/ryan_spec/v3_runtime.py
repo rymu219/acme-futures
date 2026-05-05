@@ -62,6 +62,11 @@ log = structlog.get_logger(__name__)
 # the same number.
 ROUND_TURN_COMMISSION_DOLLARS = 0.70
 
+# Service identifier for runtime_heartbeats / runtime_config rows.
+SERVICE_NAME = "ryan_spec_v3"
+# How long to cache the runtime_config row before re-fetching from Supabase.
+CONFIG_CACHE_TTL_SECONDS = 30.0
+
 
 def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name)
@@ -178,14 +183,46 @@ class V3Runtime:
         self._pending_exit_fills: dict[str, _PendingExit] = {}
         self._user_events_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        # Auth status flips to True after broker.authenticate + get_account
+        # succeed in run(). Heartbeat surfaces this so a stale auth shows up.
+        self._auth_ok: bool = False
+        # Last 2m bar timestamp the runtime processed; surfaced in heartbeat.
+        self._last_bar_ts: datetime | None = None
+        # Consecutive broker-error counter for the self-halt circuit breaker.
+        # Reset to 0 on any successful submit_market_order.
+        self._consecutive_errors: int = 0
+        # Runtime_config cache. Refreshed every CONFIG_CACHE_TTL_SECONDS so
+        # operator pause-toggles propagate within ~30s without DB-hammering.
+        self._config_cache: dict[str, Any] = {
+            "paused": False, "max_consecutive_errors": 3,
+        }
+        self._config_last_fetch: datetime | None = None
 
     async def run(self) -> None:
         log.info("v3_runtime_starting", mode=self.mode,
                  delta_source=self.delta_source, contract=self.contract_symbol,
                  broker=type(self.broker).__name__)
         await self.broker.authenticate()
+        # Resolve the trading account before placing orders. ProjectXAdapter's
+        # account_id property raises until get_account() has populated it (or
+        # PROJECTX_ACCOUNT_ID is set in env), which would surface here as
+        # broker_error on every entry.
+        account = await self.broker.get_account()
+        log.info("v3_runtime_account",
+                 id=account.get("id") or account.get("Id"),
+                 can_trade=account.get("canTrade"))
         self._contract_id = await self.broker.resolve_contract(self.contract_symbol)
         log.info("v3_runtime_contract", id=self._contract_id)
+
+        # Bootstrap the kill-switch cache and surface a startup heartbeat so
+        # the watcher sees the bot come alive immediately (don't wait for the
+        # first 2m bar to close).
+        self._auth_ok = True
+        self._refresh_config(force=True)
+        self._write_heartbeat()
+        log.info("v3_runtime_heartbeat_initial",
+                 paused=self._config_cache["paused"],
+                 max_consecutive_errors=self._config_cache["max_consecutive_errors"])
 
         # Set up signal handlers for clean shutdown
         loop = asyncio.get_running_loop()
@@ -251,14 +288,85 @@ class V3Runtime:
             log.exception("v3_runtime_trade_loop_failed")
             raise
 
+    # ---------- ops: heartbeat + remote kill-switch + circuit breaker ----------
+
+    def _position_state(self) -> str:
+        """Compact label for the heartbeat row."""
+        if self._open_position_meta is None:
+            return "flat"
+        return self._open_position_meta.get("direction", "flat")
+
+    def _write_heartbeat(self) -> None:
+        """Best-effort heartbeat upsert. Never raises."""
+        try:
+            self.db.write_heartbeat(
+                SERVICE_NAME,
+                last_bar_ts=self._last_bar_ts,
+                auth_ok=self._auth_ok,
+                consecutive_errors=self._consecutive_errors,
+                position_state=self._position_state(),
+                extra={
+                    "mode": self.mode,
+                    "delta_source": self.delta_source,
+                    "contract_id": self._contract_id,
+                    "broker": type(self.broker).__name__,
+                    "open_trade_id": self._open_trade_id,
+                },
+            )
+        except Exception:
+            log.exception("v3_runtime_heartbeat_write_failed")
+
+    def _refresh_config(self, *, force: bool = False) -> None:
+        """Refresh the kill-switch cache from Supabase if stale. Never raises."""
+        now = datetime.now(UTC)
+        if (not force and self._config_last_fetch is not None
+                and (now - self._config_last_fetch).total_seconds() < CONFIG_CACHE_TTL_SECONDS):
+            return
+        try:
+            cfg = self.db.read_runtime_config(SERVICE_NAME)
+            self._config_cache = cfg
+            self._config_last_fetch = now
+        except Exception:
+            log.exception("v3_runtime_config_refresh_failed")
+            # Keep using whatever was cached; never block trading on this.
+
+    def _is_paused(self) -> bool:
+        """True if the runtime should skip new entries (manual or self-halt)."""
+        self._refresh_config()
+        return bool(self._config_cache.get("paused", False))
+
+    def _maybe_self_halt(self) -> None:
+        """If consecutive_errors crossed the threshold, flip paused=true so
+        we stop the bleeding without operator intervention. Updates the local
+        cache immediately so the very next entry attempt is also skipped."""
+        threshold = int(self._config_cache.get("max_consecutive_errors", 3))
+        if self._consecutive_errors < threshold:
+            return
+        log.error("v3_runtime_self_halted",
+                  consecutive_errors=self._consecutive_errors,
+                  threshold=threshold,
+                  note="auto-paused after consecutive broker errors; "
+                       "investigate then unpause via Supabase Studio "
+                       "(update runtime_config set paused=false ...).")
+        try:
+            self.db.set_runtime_paused(SERVICE_NAME, paused=True, by="self_halt")
+        except Exception:
+            log.exception("v3_runtime_self_halt_db_write_failed")
+        self._config_cache["paused"] = True
+        self._config_last_fetch = datetime.now(UTC)
+
     # ---------- engine integration ----------
 
     def _on_closed_bar(self, bd: BarWithDelta) -> None:
+        self._last_bar_ts = bd.bar.t
         decision = self.engine.on_bar(
             bd.bar,
             bar_delta=bd.delta,
             cum_delta_session=bd.cum_delta_session,
         )
+        # Always heartbeat at bar close so the watcher knows we're alive
+        # even on no-decision bars.
+        self._write_heartbeat()
         if decision.action == "none":
             return
         # Hand off to async dispatch
@@ -269,6 +377,14 @@ class V3Runtime:
     ) -> None:
         try:
             if decision.action == "enter" and self._open_trade_id is None:
+                # Remote kill-switch: skip new entries when paused, but never
+                # block exits — open positions must always be allowed to flatten.
+                if self._is_paused():
+                    log.info("v3_runtime_skipped_remote_paused",
+                             direction=decision.direction,
+                             reason=decision.reason,
+                             bar_ts=bd.bar.t.isoformat())
+                    return
                 await self._open(decision, bd)
             elif decision.action == "exit" and self._open_trade_id is not None:
                 await self._close(decision, bd)
@@ -319,6 +435,8 @@ class V3Runtime:
                 ),
             )
             log.info("v3_runtime_open_submitted", order_id=order_id, row_id=row_id)
+            # Successful submit clears the broker-error streak.
+            self._consecutive_errors = 0
         except Exception:
             log.exception("v3_runtime_open_failed")
             # Mark the trade row as broker-error so the row isn't a phantom
@@ -326,6 +444,11 @@ class V3Runtime:
                 "exit_reason": "broker_error",
                 "exit_ts": datetime.now(UTC).isoformat(),
             })
+            # Circuit breaker: count this error and self-halt if we've crossed
+            # the configured threshold. Heartbeat surfaces the new counter.
+            self._consecutive_errors += 1
+            self._maybe_self_halt()
+            self._write_heartbeat()
             return
 
         self._open_trade_id = row_id
