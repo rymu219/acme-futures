@@ -153,6 +153,18 @@ class RyanSpecV3Engine:
         filter_mode: FilterMode = "static",
         filter_pctile_window_bars: int = DEFAULT_PCTILE_WINDOW_BARS,
         filter_pctile: float = DEFAULT_PCTILE,
+        # E. Disable time-of-day session_end exit. When False, positions are NOT
+        # auto-flattened at 14:50 CT — they ride through the close. Useful for
+        # 24-hour shadow runs where you want pure-thesis exits (stop /
+        # opposite_signal) and analysis later. Don't combine with live trading
+        # without external flatten — Topstep will auto-liquidate at 15:10 CT
+        # but you lose agency over the fill.
+        enable_session_end_exit: bool = True,
+        # F. Disable time_stop (60-bar / 2-hour cap on hold time). When False,
+        # positions only close on stop or opposite_signal (or session_end if
+        # that's still on). Lets the thesis play out across an arbitrary
+        # number of bars.
+        enable_time_stop: bool = True,
     ) -> None:
         self._bb = Bollinger(period=bb_period, num_std=bb_std)
         self._atr = ATR(period=atr_period)
@@ -172,6 +184,8 @@ class RyanSpecV3Engine:
         self._opposite_signal_armor_mfe_atr = opposite_signal_armor_mfe_atr
         self._filter_mode: FilterMode = filter_mode
         self._filter_pctile = filter_pctile
+        self._enable_session_end_exit = enable_session_end_exit
+        self._enable_time_stop = enable_time_stop
         # cum_delta history for percentile filter (independent of _history maxlen)
         self._cum_delta_history: deque[int] = deque(maxlen=filter_pctile_window_bars)
 
@@ -318,10 +332,12 @@ class RyanSpecV3Engine:
 
         # 2) Session end (bar at/after configured close in session-tz local time).
         # bar.t may be UTC (live) or fixed-offset (some tests) — convert to the
-        # configured session_tz so DST handles itself.
-        bar_local = bar.t.astimezone(self._session_tz).timetz()
-        if bar_local >= self._session_end_ct.replace(tzinfo=bar_local.tzinfo):
-            return Decision(action="exit", reason="session_end", bar_ts=bar.t)
+        # configured session_tz so DST handles itself. Skipped when
+        # enable_session_end_exit is False (24-hour shadow mode).
+        if self._enable_session_end_exit:
+            bar_local = bar.t.astimezone(self._session_tz).timetz()
+            if bar_local >= self._session_end_ct.replace(tzinfo=bar_local.tzinfo):
+                return Decision(action="exit", reason="session_end", bar_ts=bar.t)
 
         # 3) Opposite-direction trigger fired this bar?
         opp = self._opposite_direction_triggered_this_bar()
@@ -338,8 +354,8 @@ class RyanSpecV3Engine:
             if not (too_early or armored):
                 return Decision(action="exit", reason="opposite_signal", bar_ts=bar.t)
 
-        # 4) Time stop
-        if pos.bars_held >= self._time_stop_bars:
+        # 4) Time stop. Skipped when enable_time_stop is False.
+        if self._enable_time_stop and pos.bars_held >= self._time_stop_bars:
             return Decision(action="exit", reason="time_stop", bar_ts=bar.t)
 
         return Decision(action="none", reason="hold", bar_ts=bar.t)

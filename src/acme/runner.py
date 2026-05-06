@@ -59,6 +59,12 @@ class _VariantSpec:
     filter_mode: str = "static"
     filter_pctile_window_bars: int = 60
     filter_pctile: float = 5.0
+    # Time-of-day exits. Defaults False across the fleet right now — see
+    # 2026-05-06: user wants 24-hour shadow data with pure-thesis exits
+    # (stop / opposite_signal only). Flip back to True per-variant if you
+    # want to honor RTH session_end / time_stop again.
+    enable_session_end_exit: bool = False
+    enable_time_stop: bool = False
 
 
 # The fleet. To disable a variant, comment it out or set ACME_V3_VARIANTS env
@@ -152,6 +158,8 @@ def _build_runtime(
         filter_mode=spec.filter_mode,  # type: ignore[arg-type]
         filter_pctile_window_bars=spec.filter_pctile_window_bars,
         filter_pctile=spec.filter_pctile,
+        enable_session_end_exit=spec.enable_session_end_exit,
+        enable_time_stop=spec.enable_time_stop,
     )
 
 
