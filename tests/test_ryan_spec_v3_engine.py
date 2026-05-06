@@ -170,6 +170,59 @@ def test_engine_position_exits_on_session_end():
     assert d_exit.reason == "session_end"
 
 
+def test_engine_no_session_end_when_disabled():
+    """enable_session_end_exit=False — bar at 14:50 CT should NOT flatten."""
+    e = RyanSpecV3Engine(enable_session_end_exit=False)
+    t = _flat_warmup(e, start_ct=datetime(2026, 5, 5, 14, 0, tzinfo=CT))
+    e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4998.5, c=4999.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4999.0, h=5001.0, l=4998.5, c=5000.5),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "enter"
+    e.open_position(direction="long", entry_ts=d.bar_ts,
+                    entry_fill_price=d.entry_price + 0.25,
+                    atr_at_entry=d.atr_at_entry,
+                    cum_delta_at_entry=d.cum_delta_at_entry)
+    # Bar at 14:50 CT — would normally trigger session_end
+    t = datetime(2026, 5, 5, 14, 50, tzinfo=CT)
+    d_hold = e.on_bar(_bar(t, o=5000.5, h=5001.0, l=5000.0, c=5000.8),
+                      bar_delta=10, cum_delta_session=-2590)
+    assert d_hold.action == "none"
+    assert d_hold.reason == "hold"
+    # And a bar at 23:52 CT (last night's overnight observation) — also no exit
+    t = datetime(2026, 5, 5, 23, 52, tzinfo=CT)
+    d_late = e.on_bar(_bar(t, o=5000.8, h=5001.0, l=5000.5, c=5000.9),
+                      bar_delta=5, cum_delta_session=-2585)
+    assert d_late.action == "none"
+    assert d_late.reason == "hold"
+
+
+def test_engine_no_time_stop_when_disabled():
+    """enable_time_stop=False — position holds past 60 bars (we use 3 in test)."""
+    e = RyanSpecV3Engine(time_stop_bars=3, enable_time_stop=False)
+    t = _flat_warmup(e)
+    e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4998.5, c=4999.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4999.0, h=5001.0, l=4998.5, c=5000.5),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "enter"
+    e.open_position(direction="long", entry_ts=d.bar_ts,
+                    entry_fill_price=d.entry_price + 0.25,
+                    atr_at_entry=d.atr_at_entry,
+                    cum_delta_at_entry=d.cum_delta_at_entry)
+    # 5 quiet bars — past time_stop_bars=3, but flag is off
+    last = None
+    for _ in range(5):
+        t += timedelta(minutes=2)
+        last = e.on_bar(_bar(t, o=5000.5, h=5001.0, l=5000.4, c=5000.6),
+                        bar_delta=0, cum_delta_session=-2580)
+    assert last is not None
+    assert last.action == "none"
+    assert last.reason == "hold"
+
+
 def test_engine_position_exits_on_time_stop():
     e = RyanSpecV3Engine(time_stop_bars=3)  # shorten for the test
     t = _flat_warmup(e)
