@@ -35,6 +35,19 @@ EXIT_COLORS = {
     "broker_error":      "#dc2626",
 }
 
+# Heartbeat staleness thresholds. The v3 runner writes a heartbeat row per
+# variant on every closed 2-minute bar, so a fresh row is normally <2m old.
+# > LIVE_MAX_S: amber "stale", > OFFLINE_MIN_S: red "offline".
+HEARTBEAT_LIVE_MAX_S = 240    # 4 min — one missed bar is fine
+HEARTBEAT_OFFLINE_MIN_S = 900  # 15 min — clearly dead
+
+HEARTBEAT_COLORS = {
+    "LIVE":    "#16a34a",
+    "STALE":   "#f59e0b",
+    "OFFLINE": "#dc2626",
+    "UNKNOWN": "#64748b",
+}
+
 
 def _money(n: float | None) -> str:
     if n is None:
@@ -110,6 +123,80 @@ def _fetch_open(sb, *, mode: str, strategy_id: str) -> dict | None:
         return rows[0] if rows else None
     except Exception:
         return None
+
+
+def _fetch_heartbeats(sb) -> dict[str, dict]:
+    """Read every runtime_heartbeats row, keyed by service name. The v3 runner
+    writes one row per variant (service == strategy_id, e.g. 'v3-canon').
+    Returns {} on read failure so a missing table never breaks the page."""
+    try:
+        res = sb.table("runtime_heartbeats").select("*").execute()
+        rows = res.data or []
+    except Exception:
+        return {}
+    return {r["service"]: r for r in rows if r.get("service")}
+
+
+def _heartbeat_status(hb: dict | None, now_utc: datetime) -> dict:
+    """Classify a heartbeat row as LIVE / STALE / OFFLINE / UNKNOWN.
+    Returns {state, color, age_s, ago, auth_ok, errors}."""
+    if not hb or not hb.get("ts"):
+        return {"state": "UNKNOWN", "color": HEARTBEAT_COLORS["UNKNOWN"],
+                "age_s": None, "ago": "—", "auth_ok": None, "errors": 0}
+    try:
+        ts = datetime.fromisoformat(hb["ts"].replace("Z", "+00:00"))
+    except Exception:
+        return {"state": "UNKNOWN", "color": HEARTBEAT_COLORS["UNKNOWN"],
+                "age_s": None, "ago": "—", "auth_ok": None, "errors": 0}
+    age_s = max(0, int((now_utc - ts).total_seconds()))
+    if age_s < HEARTBEAT_LIVE_MAX_S:
+        state = "LIVE"
+    elif age_s < HEARTBEAT_OFFLINE_MIN_S:
+        state = "STALE"
+    else:
+        state = "OFFLINE"
+    # If auth has failed, treat as OFFLINE regardless of recency — the runner
+    # may be writing heartbeats but unable to actually trade.
+    if hb.get("auth_ok") is False:
+        state = "OFFLINE"
+    return {
+        "state": state,
+        "color": HEARTBEAT_COLORS[state],
+        "age_s": age_s,
+        "ago": _ago(hb["ts"]),
+        "auth_ok": hb.get("auth_ok"),
+        "errors": int(hb.get("consecutive_errors") or 0),
+    }
+
+
+def _fleet_heartbeat_pill(heartbeats: dict[str, dict], now_utc: datetime) -> str:
+    """Top-of-page pill summarising the fleet's heartbeat state. Shows the
+    worst variant's status so a single dead runner is impossible to miss."""
+    statuses = [_heartbeat_status(heartbeats.get(sid), now_utc)
+                for sid in KNOWN_VARIANTS]
+    severity = {"LIVE": 0, "STALE": 1, "UNKNOWN": 2, "OFFLINE": 3}
+    worst = max(statuses, key=lambda s: severity[s["state"]])
+    n_live = sum(1 for s in statuses if s["state"] == "LIVE")
+    n_total = len(KNOWN_VARIANTS)
+    label = {
+        "LIVE":    f"RUNNER LIVE · {n_live}/{n_total}",
+        "STALE":   f"RUNNER STALE · {n_live}/{n_total} live",
+        "OFFLINE": f"RUNNER OFFLINE · {n_live}/{n_total} live",
+        "UNKNOWN": f"NO HEARTBEAT · {n_live}/{n_total} live",
+    }[worst["state"]]
+    # Hover/title shows the per-variant breakdown so the operator can see which
+    # variant is the laggard without leaving the overview.
+    title = " · ".join(
+        f"{sid}={s['state']}({s['ago']})"
+        for sid, s in zip(KNOWN_VARIANTS, statuses)
+    )
+    return (
+        f'<span class="pill" title="{title}" '
+        f'style="color:{worst["color"]};border-color:{worst["color"]}55;'
+        f'background:{worst["color"]}11">'
+        f'<span class="dot" style="background:{worst["color"]}"></span>'
+        f'{label}</span>'
+    )
 
 
 def _fetch_strategy_summaries(sb, *, mode: str, since_iso: str) -> list[dict]:
@@ -586,6 +673,10 @@ def render_overview(
     gate_rows = _fetch_all_paper_for_gate(sb, since_iso=since)
     verdicts = _verdicts_per_strategy(gate_rows)
 
+    # Heartbeats — surface a stale/offline runner at the top of the page so an
+    # operator doesn't mistake the auto-refresh for "everything's fine".
+    heartbeats = _fetch_heartbeats(sb)
+
     # Aggregate (today)
     agg_today_pnl = sum(s["today"]["total"] for s in summaries.values())
     agg_today_n = sum(s["today"]["n"] for s in summaries.values())
@@ -616,13 +707,20 @@ def render_overview(
         s = summaries[sid]
         v = verdicts.get(sid, {"verdict": "EXTEND_PAPER", "reason": "0/200"})
         vcolor = VERDICT_COLORS.get(v["verdict"], "#94a3b8")
+        hb = _heartbeat_status(heartbeats.get(sid), now_utc)
         in_pos = s["open_pos"] is not None
-        status_text = "FLAT"
-        status_color = "var(--dim)"
-        if in_pos:
+        # OFFLINE/STALE supersedes IN POSITION/FLAT in the panel status line —
+        # if the runner is dead, that's the most important thing to see.
+        if hb["state"] in ("OFFLINE", "STALE", "UNKNOWN"):
+            status_text = f"{hb['state']} · last hb {hb['ago']}"
+            status_color = hb["color"]
+        elif in_pos:
             direction = (s["open_pos"].get("direction") or "?").upper()
             status_text = f"IN POSITION · {direction}"
             status_color = "#38bdf8"
+        else:
+            status_text = "FLAT"
+            status_color = "var(--dim)"
 
         today_pnl = s["today"]["total"]
         today_color = "#16a34a" if today_pnl > 0.005 else (
@@ -718,6 +816,10 @@ def render_overview(
     <div class="clock mono">{now_ct.strftime('%a %Y-%m-%d  %H:%M:%S CT')}</div>
   </div>
 
+  <div class="statusrow">
+    {_fleet_heartbeat_pill(heartbeats, now_utc)}
+  </div>
+
   <div class="stats">
     <div class="card">
       <div class="label">Fleet Today</div>
@@ -795,6 +897,11 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
         "reason": f"0/{GATE_MIN_SETTLED}",
         "settled": 0,
     })
+
+    # Heartbeat for THIS variant — shown alongside the gate/status pills so a
+    # dead runner is visible on the per-variant page too.
+    heartbeats = _fetch_heartbeats(sb)
+    hb_status = _heartbeat_status(heartbeats.get(strategy_id), now_utc)
 
     # Today's metrics (in CT)
     today_ct_date = now_ct.date()
@@ -906,6 +1013,11 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
 
   <div class="statusrow">
     {status_pill}
+    <span class="pill" title="last heartbeat {hb_status['ago']}{(' · auth FAILED' if hb_status['auth_ok'] is False else '')}{(f' · {hb_status["errors"]} consecutive errors' if hb_status['errors'] else '')}"
+          style="color:{hb_status['color']};border-color:{hb_status['color']}55;background:{hb_status['color']}11">
+      <span class="dot" style="background:{hb_status['color']}"></span>
+      {hb_status['state']} · {hb_status['ago']}
+    </span>
     <span class="meta-pill" style="border-left:3px solid {VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}"
           title="{current_verdict.get('reason', '')}">
       gate <strong style="color:{VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}">{current_verdict['verdict']}</strong>
