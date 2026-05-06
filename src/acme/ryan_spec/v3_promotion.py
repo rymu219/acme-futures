@@ -118,6 +118,28 @@ def evaluate_paper_promotion(trades: pd.DataFrame) -> PromotionEvaluation:
     )
 
 
+def evaluate_paper_promotion_per_strategy(
+    trades: pd.DataFrame,
+) -> dict[str, PromotionEvaluation]:
+    """Run the gate independently for each `strategy_id` in the trades frame.
+
+    Returns dict keyed by strategy_id. Each variant's verdict is computed
+    against its own subset of rows — the canon's edge can pass while a
+    variant's degrades (or vice versa) and the verdicts will reflect that.
+
+    Strategies not present in the frame are not in the output. Rows with
+    missing/null strategy_id are grouped under 'unknown'.
+    """
+    if trades.empty or "strategy_id" not in trades.columns:
+        return {}
+    out: dict[str, PromotionEvaluation] = {}
+    for sid, subset in trades.groupby(
+        trades["strategy_id"].fillna("unknown"), sort=True,
+    ):
+        out[str(sid)] = evaluate_paper_promotion(subset)
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Ryan-Spec v3 paper-week promotion gate"
@@ -125,6 +147,9 @@ def main() -> None:
     p.add_argument("--mode", default="paper")
     p.add_argument("--since", default=None,
                    help="ISO date floor (e.g. 2026-05-04T00:00:00)")
+    p.add_argument("--strategy-id", default=None,
+                   help="Limit evaluation to one strategy_id "
+                        "(default: per-strategy verdicts for every variant)")
     args = p.parse_args()
     db = Db()
     rows = db.select_ryan_spec_v3_trades(mode=args.mode, since=args.since,
@@ -133,8 +158,25 @@ def main() -> None:
         print(f"No {args.mode} trades found.")
         return
     df = pd.DataFrame(rows)
-    eval_ = evaluate_paper_promotion(df)
-    print("\n=== Ryan-Spec v3 — Paper Promotion Gate ===")
+    if args.strategy_id:
+        df = df[df["strategy_id"] == args.strategy_id]
+        if df.empty:
+            print(f"No {args.mode} trades found for strategy_id={args.strategy_id}.")
+            return
+        _print_evaluation(args.strategy_id, evaluate_paper_promotion(df))
+    else:
+        per = evaluate_paper_promotion_per_strategy(df)
+        if not per:
+            # Fall back to single-verdict mode (legacy data without strategy_id)
+            _print_evaluation("ryan_spec_v3", evaluate_paper_promotion(df))
+            return
+        for sid in sorted(per):
+            _print_evaluation(sid, per[sid])
+            print()
+
+
+def _print_evaluation(label: str, eval_: PromotionEvaluation) -> None:
+    print(f"\n=== {label} — Paper Promotion Gate ===")
     print(f"Verdict:               {eval_.verdict}")
     print(f"Reason:                {eval_.reason}")
     print(f"Settled trades:        {eval_.settled}")
@@ -144,12 +186,13 @@ def main() -> None:
         print(f"Win rate:              {eval_.win_rate_pct:.1f}%")
     if eval_.avg_slippage_ticks is not None:
         print(f"Avg slippage:          {eval_.avg_slippage_ticks:.2f} ticks")
-    print("\nExit distribution:")
-    for k, v in sorted(eval_.exit_distribution.items(),
-                       key=lambda kv: -kv[1]):
-        print(f"  {k:<22} {v*100:5.1f}%")
+    if eval_.exit_distribution:
+        print("Exit distribution:")
+        for k, v in sorted(eval_.exit_distribution.items(),
+                           key=lambda kv: -kv[1]):
+            print(f"  {k:<22} {v*100:5.1f}%")
     if eval_.monthly_pf:
-        print("\nMonthly PF:")
+        print("Monthly PF:")
         for m, pf_ in sorted(eval_.monthly_pf.items()):
             print(f"  {m}  PF={pf_:.2f}")
 
