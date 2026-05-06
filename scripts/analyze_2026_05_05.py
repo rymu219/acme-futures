@@ -14,14 +14,13 @@ from __future__ import annotations
 import asyncio
 import statistics
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from acme.broker.projectx import ProjectXAdapter
 from acme.db import Db
 
 CT = ZoneInfo("America/Chicago")
-UTC = timezone.utc
 
 # Topstep session boundaries for 2026-05-05 trading session
 SESSION_START_UTC = "2026-05-04T22:00:00+00:00"  # 17:00 CT yesterday
@@ -183,8 +182,8 @@ async def main() -> None:
 
     # 8. Render markdown report
     lines: list[str] = []
-    lines.append(f"# 2026-05-05 trading day — analysis\n")
-    lines.append(f"Topstep session: 2026-05-04 17:00 CT → 2026-05-05 14:36 CT (final exit)")
+    lines.append("# 2026-05-05 trading day — analysis\n")
+    lines.append("Topstep session: 2026-05-04 17:00 CT → 2026-05-05 14:36 CT (final exit)")
     lines.append(f"Generated: {datetime.now(UTC).isoformat()}\n")
 
     lines.append("## Headline\n")
@@ -236,7 +235,6 @@ async def main() -> None:
         lines.append(f"- max: {max(bars_held)}  (= {max(bars_held)*2}m)")
         lines.append(f"- mean: {statistics.mean(bars_held):.1f}")
         lines.append("")
-        bh_counter = Counter(bars_held)
         lines.append("Bars-held buckets:")
         lines.append("| Bars | Trades | Avg P&L |")
         lines.append("|---:|---:|---:|")
