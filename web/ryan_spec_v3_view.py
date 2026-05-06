@@ -549,8 +549,6 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
   </div>
 
   <div class="breadcrumb">
-    <a href="/{('?token=' + token) if token else ''}">&larr; Fleet</a>
-    <span style="margin:0 8px;color:#475569">·</span>
     <strong style="color:#e2e8f0">{strategy_id}</strong>
   </div>
 
