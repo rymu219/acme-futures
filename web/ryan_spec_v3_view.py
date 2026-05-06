@@ -308,17 +308,475 @@ def _variant_nav_html(summaries: list[dict], *, current: str,
     return "".join(parts)
 
 
+_SHARED_CSS = """
+  :root {
+    --bg-0: #0a0f1c; --bg-1: #0f1729; --bg-2: #131c33;
+    --border: #1f2a44; --border-strong: #2c3a5a;
+    --text: #e8eef9; --dim: #7f8aa8; --dim-2: #5a6789;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg-0); color: var(--text);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; padding-bottom: 32px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center;
+             margin-bottom: 14px; }
+  .brand { font-size: 13px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }
+  .brand strong { color: var(--text); }
+  .clock { font-size: 12px; color: var(--dim-2); }
+  .breadcrumb { font-size: 12px; color: var(--dim-2); margin-bottom: 12px; }
+  .breadcrumb a { color: var(--dim); text-decoration: none; }
+  .breadcrumb a:hover { color: var(--text); }
+
+  .statusrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+                margin-bottom: 16px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px;
+           padding: 5px 11px; border-radius: 999px;
+           font-size: 11px; font-weight: 700; letter-spacing: 1px;
+           text-transform: uppercase; border: 1px solid var(--border-strong); }
+  .pill .dot { width: 7px; height: 7px; border-radius: 999px; }
+  .pill-ok { color: #34d399; background: rgba(16,185,129,0.08); border-color: #166534; }
+  .pill-ok .dot { background: #34d399; }
+  .pill-active { color: #38bdf8; background: rgba(56,189,248,0.08); border-color: #075985; }
+  .pill-active .dot { background: #38bdf8; animation: pulse 1.4s infinite; }
+  .pill-blocked { color: #fbbf24; background: rgba(251,191,36,0.08); border-color: #854d0e; }
+  .pill-blocked .dot { background: #fbbf24; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.4 } }
+  .meta-pill { font-size: 11px; color: var(--dim); padding: 4px 10px;
+                background: var(--bg-2); border: 1px solid var(--border);
+                border-radius: 999px; }
+  .meta-pill.drift { color: #fbbf24; border-color: #854d0e; }
+  .meta-pill strong { color: var(--text); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0,1fr));
+            gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--bg-1); border: 1px solid var(--border);
+           border-radius: 14px; padding: 14px 16px; }
+  .card .label { font-size: 10.5px; letter-spacing: 1.6px;
+                  text-transform: uppercase; color: var(--dim); font-weight: 600; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 5px;
+                  font-family: ui-monospace, SF Mono, Menlo, monospace;
+                  font-variant-numeric: tabular-nums; }
+  .card .meta { font-size: 11px; color: var(--dim-2); margin-top: 4px;
+                 font-family: ui-monospace, SF Mono, Menlo, monospace; }
+
+  .events { background: var(--bg-1); border: 1px solid var(--border);
+             border-radius: 14px; overflow: hidden; }
+  .events-header { padding: 10px 14px; border-bottom: 1px solid var(--border);
+                    font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase;
+                    color: var(--dim); font-weight: 600;
+                    display:flex; justify-content:space-between; align-items:center; gap: 16px; }
+  .events-header .right { font-size: 11px; letter-spacing: 0.4px;
+                           text-transform: none; color: var(--dim-2); }
+  table { width:100%; border-collapse: collapse; }
+  th, td { padding: 10px 14px; text-align: left;
+            border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { background: rgba(255,255,255,0.02); color: var(--dim-2);
+        text-transform: uppercase; font-size: 10.5px; letter-spacing: 1.2px;
+        font-weight: 600; }
+  tbody tr:hover { background: rgba(255,255,255,0.025); }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: ui-monospace, SF Mono, Menlo, monospace;
+           font-variant-numeric: tabular-nums; }
+  .dim { color: var(--dim-2); }
+  .kind { font-weight: 600; font-size: 12px; letter-spacing: 0.3px; }
+
+  /* Multi-variant overview grid + panels (added 2026-05-06) */
+  .panels { display: grid; grid-template-columns: repeat(3, minmax(0,1fr));
+             gap: 12px; margin-bottom: 18px; }
+  .panel { background: var(--bg-1); border: 1px solid var(--border);
+            border-radius: 14px; padding: 14px 16px; text-decoration: none;
+            color: inherit; transition: border-color 0.15s ease, transform 0.15s ease;
+            display: block; }
+  .panel:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+  .panel.armed { border-left: 3px solid #38bdf8; }
+  .panel-head { display: flex; justify-content: space-between; align-items: center;
+                 gap: 8px; margin-bottom: 10px; }
+  .panel-name { font-size: 13px; font-weight: 700; letter-spacing: 0.4px; }
+  .panel-status { font-size: 10px; color: var(--dim);
+                   text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
+  .panel-pnl { font-size: 22px; font-weight: 600;
+                font-family: ui-monospace, SF Mono, Menlo, monospace;
+                font-variant-numeric: tabular-nums; margin-bottom: 2px; }
+  .panel-meta { font-size: 11px; color: var(--dim-2);
+                 font-family: ui-monospace, SF Mono, Menlo, monospace; }
+  .panel-row { display: flex; justify-content: space-between;
+                font-size: 11px; color: var(--dim); margin-top: 6px;
+                font-family: ui-monospace, SF Mono, Menlo, monospace; }
+  .panel-row strong { color: var(--text); font-weight: 500; }
+  .panel-verdict { font-size: 10px; font-weight: 700; letter-spacing: 1px;
+                    text-transform: uppercase; padding: 3px 8px; border-radius: 6px;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+
+  /* Pagination */
+  .pagination { padding: 10px 14px; display: flex; gap: 12px;
+                 align-items: center; justify-content: center;
+                 background: rgba(255,255,255,0.02); font-size: 12px; }
+  .page-link { color: var(--dim); text-decoration: none; padding: 4px 10px;
+                border: 1px solid var(--border); border-radius: 6px; }
+  .page-link:hover { color: var(--text); border-color: var(--border-strong); }
+
+  .footer { margin-top: 16px; color: var(--dim-2); font-size: 11px; text-align: center; }
+
+  @media (max-width: 880px) {
+    .stats { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .panels { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .col-ago, .col-mfe, .col-mae, .col-bars { display: none; }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 12px; padding-bottom: 28px; }
+    .stats { gap: 8px; }
+    .panels { grid-template-columns: 1fr; gap: 10px; }
+    .card { padding: 12px 14px; border-radius: 12px; }
+    .card .value { font-size: 22px; }
+    th, td { padding: 9px 10px; font-size: 12px; }
+  }
+"""
+
+
+def _fetch_trades_paginated(
+    sb, *, mode: str, strategy_id: str | None, since_iso: str,
+    page: int, page_size: int = 50,
+) -> tuple[list[dict], int]:
+    """Return (rows, total_count) for the requested page. page is 1-indexed.
+    strategy_id=None means 'all variants' (no filter on strategy_id)."""
+    try:
+        q = (sb.table("ryan_spec_v3_trades")
+             .select("*", count="exact")
+             .eq("mode", mode)
+             .gte("bar_ts", since_iso))
+        if strategy_id:
+            q = q.eq("strategy_id", strategy_id)
+        offset = max(0, (page - 1) * page_size)
+        res = (q.order("bar_ts", desc=True)
+               .range(offset, offset + page_size - 1)
+               .execute())
+        return res.data or [], res.count or 0
+    except Exception:
+        return [], 0
+
+
+def _compute_per_variant_summary(
+    sb, *, mode: str, strategy_id: str, since_iso: str, today_iso: str,
+) -> dict:
+    """Pull the headline numbers a variant's panel shows. Returns:
+        {today: settled_metrics, week: settled_metrics, open_pos, last_trade_ts}"""
+    week_rows = _fetch_trades(sb, mode=mode, strategy_id=strategy_id,
+                              since_iso=since_iso, limit=2000)
+    today_rows = [r for r in week_rows
+                  if (r.get("bar_ts") or "") >= today_iso]
+    open_pos = _fetch_open(sb, mode=mode, strategy_id=strategy_id)
+    last_trade_ts = week_rows[0].get("bar_ts") if week_rows else None
+    return {
+        "today": _settled_metrics(today_rows),
+        "week": _settled_metrics(week_rows),
+        "open_pos": open_pos,
+        "last_trade_ts": last_trade_ts,
+    }
+
+
+def _pagination_html(*, page: int, total: int, page_size: int,
+                     base_params: dict, page_param: str) -> str:
+    """Render prev / next links for a paginated table. base_params is the
+    other query string params to preserve; page_param is the key for the
+    page number in the URL (e.g., 'trades_page')."""
+    if total <= page_size:
+        return ""
+    last_page = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, last_page))
+    start = (page - 1) * page_size + 1
+    end = min(page * page_size, total)
+
+    def _url(p: int) -> str:
+        params = {**base_params, page_param: p}
+        return "?" + "&".join(f"{k}={v}" for k, v in params.items()
+                              if v is not None and v != "")
+
+    prev_html = (f'<a href="{_url(page - 1)}" class="page-link">&larr; prev</a>'
+                 if page > 1 else
+                 '<span class="page-link dim">&larr; prev</span>')
+    next_html = (f'<a href="{_url(page + 1)}" class="page-link">next &rarr;</a>'
+                 if page < last_page else
+                 '<span class="page-link dim">next &rarr;</span>')
+    return (
+        f'<div class="pagination">'
+        f'  {prev_html}'
+        f'  <span class="dim">page {page} / {last_page}</span>'
+        f'  <span class="dim">({start}–{end} of {total:,})</span>'
+        f'  {next_html}'
+        f'</div>'
+    )
+
+
+def _trade_row_html(r: dict, *, show_strategy: bool = False) -> str:
+    """One <tr> for the trades table. Optionally includes a strategy_id col
+    (for the overview / mixed view)."""
+    ts = _ct_str(r.get("bar_ts"))
+    ago = _ago(r.get("bar_ts"))
+    direction = (r.get("direction") or "").upper()
+    dir_color = "#16a34a" if direction == "LONG" else "#dc2626"
+    entry = r.get("entry_price")
+    exit_price = r.get("exit_price")
+    exit_reason = r.get("exit_reason") or ""
+    ex_color = EXIT_COLORS.get(exit_reason, "#e2e8f0") if exit_reason else "#94a3b8"
+    pnl = r.get("pnl_dollars")
+    if pnl is None:
+        pnl_str = '<span class="dim">—</span>'
+    else:
+        pcolor = "#16a34a" if pnl > 0 else ("#dc2626" if pnl < 0 else "#e2e8f0")
+        pnl_str = f'<span style="color:{pcolor}" class="mono">{_money(pnl)}</span>'
+    mfe = r.get("mfe_atr")
+    mae = r.get("mae_atr")
+    bars = r.get("bars_held")
+    strat_cell = (
+        f"<td class='mono dim'>{r.get('strategy_id') or '—'}</td>"
+        if show_strategy else ""
+    )
+    return (
+        "<tr>"
+        f"{strat_cell}"
+        f"<td class='mono'>{ts}</td>"
+        f"<td class='dim mono col-ago'>{ago}</td>"
+        f"<td><span class='kind' style='color:{dir_color}'>{direction}</span></td>"
+        f"<td class='mono'>{_money(entry)}</td>"
+        f"<td class='mono'>{_money(exit_price) if exit_price is not None else '—'}</td>"
+        f"<td><span class='kind' style='color:{ex_color}'>{exit_reason or 'open'}</span></td>"
+        f"<td>{pnl_str}</td>"
+        f"<td class='dim mono col-mfe'>"
+        f"{f'{mfe:.2f}' if mfe is not None else '—'}</td>"
+        f"<td class='dim mono col-mae'>"
+        f"{f'{mae:.2f}' if mae is not None else '—'}</td>"
+        f"<td class='dim mono col-bars'>{bars if bars is not None else '—'}</td>"
+        "</tr>"
+    )
+
+
+def render_overview(
+    sb, *,
+    mode: str = "paper",
+    token: str | None = None,
+    trades_page: int = 1,
+    trades_strategy: str | None = None,
+    page_size: int = 50,
+) -> str:
+    """Multi-variant overview: 5 panels (one per strategy) + paginated
+    all-trades table. Each panel links into the per-strategy detail view."""
+    now_ct = datetime.now(CT)
+    now_utc = datetime.now(UTC)
+    since = (now_utc - timedelta(days=7)).isoformat()
+    today_ct_date = now_ct.date()
+    today_utc_floor = datetime(
+        today_ct_date.year, today_ct_date.month, today_ct_date.day,
+        13, 30, tzinfo=UTC,  # 08:30 CT = 13:30 UTC during CDT (close enough)
+    ).isoformat()
+
+    # Per-variant summaries
+    summaries: dict[str, dict] = {
+        sid: _compute_per_variant_summary(
+            sb, mode=mode, strategy_id=sid,
+            since_iso=since, today_iso=today_utc_floor,
+        )
+        for sid in KNOWN_VARIANTS
+    }
+
+    # Verdicts (per-strategy gate)
+    gate_rows = _fetch_all_paper_for_gate(sb, since_iso=since)
+    verdicts = _verdicts_per_strategy(gate_rows)
+
+    # Aggregate (today)
+    agg_today_pnl = sum(s["today"]["total"] for s in summaries.values())
+    agg_today_n = sum(s["today"]["n"] for s in summaries.values())
+    agg_week_pnl = sum(s["week"]["total"] for s in summaries.values())
+    agg_week_n = sum(s["week"]["n"] for s in summaries.values())
+    n_in_position = sum(1 for s in summaries.values() if s["open_pos"])
+
+    # Paginated trades — last 7d, optionally filtered by strategy
+    trades_strategy_filter = trades_strategy if trades_strategy and trades_strategy != "all" else None
+    page_rows, total_count = _fetch_trades_paginated(
+        sb, mode=mode, strategy_id=trades_strategy_filter,
+        since_iso=since, page=trades_page, page_size=page_size,
+    )
+
+    # ----- HTML pieces -----
+
+    def _params_for_panel(sid: str) -> str:
+        params = []
+        if token:
+            params.append(f"token={token}")
+        params.append(f"strategy_id={sid}")
+        if mode != "paper":
+            params.append(f"mode={mode}")
+        return "?" + "&".join(params)
+
+    panel_html_parts: list[str] = []
+    for sid in KNOWN_VARIANTS:
+        s = summaries[sid]
+        v = verdicts.get(sid, {"verdict": "EXTEND_PAPER", "reason": "0/200"})
+        vcolor = VERDICT_COLORS.get(v["verdict"], "#94a3b8")
+        in_pos = s["open_pos"] is not None
+        status_text = "FLAT"
+        status_color = "var(--dim)"
+        if in_pos:
+            direction = (s["open_pos"].get("direction") or "?").upper()
+            status_text = f"IN POSITION · {direction}"
+            status_color = "#38bdf8"
+
+        today_pnl = s["today"]["total"]
+        today_color = "#16a34a" if today_pnl > 0.005 else (
+            "#dc2626" if today_pnl < -0.005 else "var(--text)"
+        )
+        week_pnl = s["week"]["total"]
+        week_color = "#16a34a" if week_pnl > 0.005 else (
+            "#dc2626" if week_pnl < -0.005 else "var(--dim)"
+        )
+        pf = s["week"]["pf"]
+        pf_str = f"{pf:.2f}" if pf is not None else "—"
+        wr = s["week"]["wr"]
+        wr_str = f"{wr:.0f}%" if s["week"]["n"] > 0 else "—"
+
+        panel_class = "panel armed" if in_pos else "panel"
+        panel_html_parts.append(
+            f'<a class="{panel_class}" href="{_params_for_panel(sid)}">'
+            f'  <div class="panel-head">'
+            f'    <span class="panel-name">{sid}</span>'
+            f'    <span class="panel-verdict" style="color:{vcolor};background:{vcolor}22">{v["verdict"]}</span>'
+            f'  </div>'
+            f'  <div class="panel-pnl" style="color:{today_color}">{_money(today_pnl)}</div>'
+            f'  <div class="panel-meta">today · {s["today"]["n"]} trades</div>'
+            f'  <div class="panel-row"><span>7-day</span>'
+            f'    <strong style="color:{week_color}">{_money(week_pnl)}</strong></div>'
+            f'  <div class="panel-row"><span>{s["week"]["n"]} trades</span>'
+            f'    <strong>{wr_str} WR · PF {pf_str}</strong></div>'
+            f'  <div class="panel-row"><span style="color:{status_color}">{status_text}</span>'
+            f'    <strong class="dim">{v.get("reason", "")}</strong></div>'
+            f'</a>'
+        )
+
+    panels_html = "".join(panel_html_parts)
+
+    # Filter dropdown for the trades table
+    filter_opts = []
+    for opt in ("all", *KNOWN_VARIANTS):
+        sel = " selected" if (trades_strategy or "all") == opt else ""
+        filter_opts.append(f'<option value="{opt}"{sel}>{opt}</option>')
+    filter_form = (
+        '<form method="get" style="display:inline">'
+        + (f'<input type="hidden" name="token" value="{token}">' if token else "")
+        + (f'<input type="hidden" name="mode" value="{mode}">' if mode != "paper" else "")
+        + 'filter: <select name="trades_strategy" onchange="this.form.submit()" '
+          'style="background:var(--bg-2);color:var(--text);border:1px solid var(--border);'
+          'padding:3px 6px;border-radius:6px;font-size:11px">'
+        + "".join(filter_opts)
+        + "</select></form>"
+    )
+
+    # Trades table
+    show_strategy_col = trades_strategy_filter is None  # show col when "all"
+    rows_html = "".join(_trade_row_html(r, show_strategy=show_strategy_col) for r in page_rows)
+    strategy_th = "<th>strategy</th>" if show_strategy_col else ""
+    table_html = (
+        f'<table>'
+        f'<thead><tr>{strategy_th}<th>CT</th><th class="col-ago">ago</th>'
+        f'<th>dir</th><th>entry</th><th>exit</th><th>reason</th><th>P&amp;L</th>'
+        f'<th class="col-mfe">MFE</th><th class="col-mae">MAE</th>'
+        f'<th class="col-bars">bars</th></tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table>'
+    )
+    pagination = _pagination_html(
+        page=trades_page, total=total_count, page_size=page_size,
+        base_params={
+            "token": token,
+            "mode": mode if mode != "paper" else None,
+            "trades_strategy": trades_strategy if trades_strategy else None,
+        },
+        page_param="trades_page",
+    )
+
+    # Hero color for aggregate today P&L
+    agg_color = "#16a34a" if agg_today_pnl > 0.005 else (
+        "#dc2626" if agg_today_pnl < -0.005 else "var(--text)"
+    )
+    agg_week_color = "#16a34a" if agg_week_pnl > 0.005 else (
+        "#dc2626" if agg_week_pnl < -0.005 else "var(--dim)"
+    )
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="refresh" content="5">
+<meta name="theme-color" content="#0b1220">
+<title>Acme Futures · v3 fleet</title>
+<style>{_SHARED_CSS}</style>
+</head><body><div class="wrap">
+  <div class="topbar">
+    <div class="brand"><strong>ACME</strong> · FUTURES · v3 fleet</div>
+    <div class="clock mono">{now_ct.strftime('%a %Y-%m-%d  %H:%M:%S CT')}</div>
+  </div>
+
+  <div class="stats">
+    <div class="card">
+      <div class="label">Fleet Today</div>
+      <div class="value mono" style="color:{agg_color}">{_money(agg_today_pnl)}</div>
+      <div class="meta">{agg_today_n} trades across {len(KNOWN_VARIANTS)} variants</div>
+    </div>
+    <div class="card">
+      <div class="label">Fleet 7-Day</div>
+      <div class="value mono" style="color:{agg_week_color}">{_money(agg_week_pnl)}</div>
+      <div class="meta">{agg_week_n:,} trades</div>
+    </div>
+    <div class="card">
+      <div class="label">In Position</div>
+      <div class="value mono" style="color:{'#38bdf8' if n_in_position else 'var(--dim)'}">{n_in_position} / {len(KNOWN_VARIANTS)}</div>
+      <div class="meta">variants currently holding</div>
+    </div>
+    <div class="card">
+      <div class="label">Mode</div>
+      <div class="value mono">{mode}</div>
+      <div class="meta">all variants shadow-trading</div>
+    </div>
+  </div>
+
+  <div class="panels">
+    {panels_html}
+  </div>
+
+  <div class="events">
+    <div class="events-header">
+      <span>Recent trades</span>
+      <span class="right">{filter_form}</span>
+    </div>
+    {table_html}
+    {pagination}
+  </div>
+
+  <div class="footer">
+    Auto-refresh 5s · service-role read · token-gated
+    <br>
+    Aggregate numbers compare variants of the same strategy — interpret accordingly.
+  </div>
+</div></body></html>"""
+
+
 def render(sb, *, mode: str = "paper", token: str | None = None,
-           strategy_id: str = "v3-canon") -> str:
+           strategy_id: str = "v3-canon",
+           trades_page: int = 1, page_size: int = 50) -> str:
     now_ct = datetime.now(CT)
     now_utc = datetime.now(UTC)
     # Show last 7 days of paper trades
     since = (now_utc - timedelta(days=7)).isoformat()
 
+    # Aggregate stats over the full 7d window (settled metrics)
     rows = _fetch_trades(sb, mode=mode, strategy_id=strategy_id,
                          since_iso=since, limit=2000)
     settled = _settled_metrics(rows)
     open_pos = _fetch_open(sb, mode=mode, strategy_id=strategy_id)
+    # Paginated trade rows for the recent-trades table
+    page_rows, page_total = _fetch_trades_paginated(
+        sb, mode=mode, strategy_id=strategy_id, since_iso=since,
+        page=trades_page, page_size=page_size,
+    )
     # Multi-variant nav data — yesterday-onward window so each strategy's
     # daily total is comparable.
     nav_summaries = _fetch_strategy_summaries(
@@ -404,44 +862,17 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
             f'{actual_opp_pct*100:.0f}% vs OOS {expected_opp_pct*100:.0f}%</span>'
         )
 
-    # Recent trades rows
-    def _row_html(r: dict) -> str:
-        ts = _ct_str(r.get("bar_ts"))
-        ago = _ago(r.get("bar_ts"))
-        direction = (r.get("direction") or "").upper()
-        dir_color = "#16a34a" if direction == "LONG" else "#dc2626"
-        entry = r.get("entry_price")
-        exit_price = r.get("exit_price")
-        exit_reason = r.get("exit_reason") or ""
-        ex_color = EXIT_COLORS.get(exit_reason, "#e2e8f0") if exit_reason else "#94a3b8"
-        pnl = r.get("pnl_dollars")
-        if pnl is None:
-            pnl_str = '<span class="dim">—</span>'
-        else:
-            pcolor = "#16a34a" if pnl > 0 else ("#dc2626" if pnl < 0 else "#e2e8f0")
-            pnl_str = f'<span style="color:{pcolor}" class="mono">{_money(pnl)}</span>'
-        mfe = r.get("mfe_atr")
-        mae = r.get("mae_atr")
-        bars = r.get("bars_held")
-        return (
-            f"<tr>"
-            f"<td class='mono'>{ts}</td>"
-            f"<td class='dim mono col-ago'>{ago}</td>"
-            f"<td><span class='kind' style='color:{dir_color}'>{direction}</span></td>"
-            f"<td class='mono'>{_money(entry)}</td>"
-            f"<td class='mono'>{_money(exit_price) if exit_price is not None else '—'}</td>"
-            f"<td><span class='kind' style='color:{ex_color}'>{exit_reason or 'open'}</span></td>"
-            f"<td>{pnl_str}</td>"
-            f"<td class='dim mono col-mfe'>"
-            f"{f'{mfe:.2f}' if mfe is not None else '—'}</td>"
-            f"<td class='dim mono col-mae'>"
-            f"{f'{mae:.2f}' if mae is not None else '—'}</td>"
-            f"<td class='dim mono col-bars'>{bars if bars is not None else '—'}</td>"
-            f"</tr>"
-        )
-
-    rows_for_table = rows[:MAX_ROWS]
-    rows_html = "".join(_row_html(r) for r in rows_for_table)
+    # Recent trades rows — paginated against the full 7d trade history.
+    rows_html = "".join(_trade_row_html(r) for r in page_rows)
+    pagination_html = _pagination_html(
+        page=trades_page, total=page_total, page_size=page_size,
+        base_params={
+            "token": token,
+            "strategy_id": strategy_id,
+            "mode": mode if mode != "paper" else None,
+        },
+        page_param="trades_page",
+    )
 
     exit_dist_inline = _exit_dist_pill_html(settled["exit_dist"])
     trading_date = _topstep_trading_date(now_ct)
@@ -455,93 +886,7 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0b1220">
 <title>Acme Futures · Ryan-Spec v3</title>
-<style>
-  :root {{
-    --bg-0: #0a0f1c; --bg-1: #0f1729; --bg-2: #131c33;
-    --border: #1f2a44; --border-strong: #2c3a5a;
-    --text: #e8eef9; --dim: #7f8aa8; --dim-2: #5a6789;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin: 0; background: var(--bg-0); color: var(--text);
-         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-         -webkit-font-smoothing: antialiased; }}
-  .wrap {{ max-width: 1200px; margin: 0 auto; padding: 18px; padding-bottom: 32px; }}
-  .topbar {{ display: flex; justify-content: space-between; align-items: center;
-             margin-bottom: 14px; }}
-  .brand {{ font-size: 13px; letter-spacing: 2px; color: var(--dim); text-transform: uppercase; }}
-  .brand strong {{ color: var(--text); }}
-  .clock {{ font-size: 12px; color: var(--dim-2); }}
-  .breadcrumb {{ font-size: 12px; color: var(--dim-2); margin-bottom: 12px; }}
-  .breadcrumb a {{ color: var(--dim); text-decoration: none; }}
-  .breadcrumb a:hover {{ color: var(--text); }}
-
-  .statusrow {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
-                margin-bottom: 16px; }}
-  .pill {{ display: inline-flex; align-items: center; gap: 6px;
-           padding: 5px 11px; border-radius: 999px;
-           font-size: 11px; font-weight: 700; letter-spacing: 1px;
-           text-transform: uppercase; border: 1px solid var(--border-strong); }}
-  .pill .dot {{ width: 7px; height: 7px; border-radius: 999px; }}
-  .pill-ok {{ color: #34d399; background: rgba(16,185,129,0.08); border-color: #166534; }}
-  .pill-ok .dot {{ background: #34d399; }}
-  .pill-active {{ color: #38bdf8; background: rgba(56,189,248,0.08); border-color: #075985; }}
-  .pill-active .dot {{ background: #38bdf8; animation: pulse 1.4s infinite; }}
-  .pill-blocked {{ color: #fbbf24; background: rgba(251,191,36,0.08); border-color: #854d0e; }}
-  .pill-blocked .dot {{ background: #fbbf24; }}
-  @keyframes pulse {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:0.4 }} }}
-  .meta-pill {{ font-size: 11px; color: var(--dim); padding: 4px 10px;
-                background: var(--bg-2); border: 1px solid var(--border);
-                border-radius: 999px; }}
-  .meta-pill.drift {{ color: #fbbf24; border-color: #854d0e; }}
-  .meta-pill strong {{ color: var(--text); }}
-
-  .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0,1fr));
-            gap: 10px; margin-bottom: 16px; }}
-  .card {{ background: var(--bg-1); border: 1px solid var(--border);
-           border-radius: 14px; padding: 14px 16px; }}
-  .card .label {{ font-size: 10.5px; letter-spacing: 1.6px;
-                  text-transform: uppercase; color: var(--dim); font-weight: 600; }}
-  .card .value {{ font-size: 26px; font-weight: 600; margin-top: 5px;
-                  font-family: ui-monospace, SF Mono, Menlo, monospace;
-                  font-variant-numeric: tabular-nums; }}
-  .card .meta {{ font-size: 11px; color: var(--dim-2); margin-top: 4px;
-                 font-family: ui-monospace, SF Mono, Menlo, monospace; }}
-
-  .events {{ background: var(--bg-1); border: 1px solid var(--border);
-             border-radius: 14px; overflow: hidden; }}
-  .events-header {{ padding: 10px 14px; border-bottom: 1px solid var(--border);
-                    font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase;
-                    color: var(--dim); font-weight: 600;
-                    display:flex; justify-content:space-between; align-items:center; gap: 16px; }}
-  .events-header .right {{ font-size: 11px; letter-spacing: 0.4px;
-                           text-transform: none; color: var(--dim-2); }}
-  table {{ width:100%; border-collapse: collapse; }}
-  th, td {{ padding: 10px 14px; text-align: left;
-            border-bottom: 1px solid var(--border); font-size: 13px; }}
-  th {{ background: rgba(255,255,255,0.02); color: var(--dim-2);
-        text-transform: uppercase; font-size: 10.5px; letter-spacing: 1.2px;
-        font-weight: 600; }}
-  tbody tr:hover {{ background: rgba(255,255,255,0.025); }}
-  tr:last-child td {{ border-bottom: none; }}
-  .mono {{ font-family: ui-monospace, SF Mono, Menlo, monospace;
-           font-variant-numeric: tabular-nums; }}
-  .dim {{ color: var(--dim-2); }}
-  .kind {{ font-weight: 600; font-size: 12px; letter-spacing: 0.3px; }}
-
-  .footer {{ margin-top: 16px; color: var(--dim-2); font-size: 11px; text-align: center; }}
-
-  @media (max-width: 880px) {{
-    .stats {{ grid-template-columns: repeat(2, minmax(0,1fr)); }}
-    .col-ago, .col-mfe, .col-mae, .col-bars {{ display: none; }}
-  }}
-  @media (max-width: 520px) {{
-    .wrap {{ padding: 12px; padding-bottom: 28px; }}
-    .stats {{ gap: 8px; }}
-    .card {{ padding: 12px 14px; border-radius: 12px; }}
-    .card .value {{ font-size: 22px; }}
-    th, td {{ padding: 9px 10px; font-size: 12px; }}
-  }}
-</style>
+<style>{_SHARED_CSS}</style>
 </head><body><div class="wrap">
   <div class="topbar">
     <div class="brand"><strong>ACME</strong> · FUTURES · RYAN-SPEC V3</div>
@@ -613,6 +958,7 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
       </tr></thead>
       <tbody>{rows_html or '<tr><td colspan="10" class="dim" style="text-align:center;padding:20px">No trades in last 7 days.</td></tr>'}</tbody>
     </table>
+    {pagination_html}
   </div>
 
   <div class="footer">

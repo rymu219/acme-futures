@@ -693,29 +693,46 @@ def _render_html(sb, *, token: str | None = None) -> str:
 def home(
     token: str | None = Query(default=None),
     mode: str = Query(default="paper"),
-    strategy_id: str = Query(default="v3-canon"),
+    strategy_id: str | None = Query(default=None),
+    trades_page: int = Query(default=1),
+    trades_strategy: str | None = Query(default=None),
 ):
-    """Main page is now the Ryan-Spec v3 multi-variant view. The old
-    fleet/leaderboard view (_render_html) lives in this file but isn't
-    routed — kept around in case we want to re-enable conductor strategies
-    later. Per the 2026-05-05 mission shift, v3 is the anchor and there
-    are no other live strategies."""
+    """Main page: v3 fleet overview when no `strategy_id` is given, or the
+    per-variant detail view when one is. The old conductor leaderboard
+    (_render_html) is preserved at /fleet but not linked from /."""
     _check_token(token)
     if mode not in ("paper", "live", "shadow"):
         raise HTTPException(status_code=400, detail="invalid mode")
+    if trades_page < 1:
+        trades_page = 1
     sb = _client()
     from ryan_spec_v3_view import render as render_v3
-    return render_v3(sb, mode=mode, token=token, strategy_id=strategy_id)
+    from ryan_spec_v3_view import render_overview as render_v3_overview
+
+    if strategy_id:
+        return render_v3(
+            sb, mode=mode, token=token, strategy_id=strategy_id,
+            trades_page=trades_page,
+        )
+    return render_v3_overview(
+        sb, mode=mode, token=token,
+        trades_page=trades_page, trades_strategy=trades_strategy,
+    )
 
 
 @app.get("/ryan-spec-v3", response_class=HTMLResponse)
 def ryan_spec_v3(
     token: str | None = Query(default=None),
     mode: str = Query(default="paper"),
-    strategy_id: str = Query(default="v3-canon"),
+    strategy_id: str | None = Query(default=None),
+    trades_page: int = Query(default=1),
+    trades_strategy: str | None = Query(default=None),
 ):
     """Alias for backward compatibility with old links/bookmarks."""
-    return home(token=token, mode=mode, strategy_id=strategy_id)
+    return home(
+        token=token, mode=mode, strategy_id=strategy_id,
+        trades_page=trades_page, trades_strategy=trades_strategy,
+    )
 
 
 @app.get("/fleet", response_class=HTMLResponse)
