@@ -180,9 +180,90 @@ def _exit_dist_pill_html(exit_dist: dict[str, float]) -> str:
 
 KNOWN_VARIANTS = ("v3-canon", "v3-trail", "v3-min2bar", "v3-armor", "v3-pctile")
 
+# Promotion-gate thresholds — kept in sync with src/acme/ryan_spec/v3_promotion.py.
+# Web has its own minimal requirements.txt (no pandas, no acme), so the gate
+# logic is re-implemented here in pure python rather than importing from
+# the canonical module. Update both when changing.
+GATE_MIN_SETTLED = 200
+GATE_MIN_PF = 1.5
+GATE_MAX_AVG_SLIPPAGE_TICKS = 1.5
+GATE_MIN_OPPOSITE_PCT = 0.40
+
+VERDICT_COLORS = {
+    "PROMOTE_LIVE": "#16a34a",
+    "EXTEND_PAPER": "#94a3b8",
+    "INVESTIGATE":  "#eab308",
+    "HALT":         "#dc2626",
+}
+
+
+def _compute_verdict_pure(rows: list[dict]) -> dict:
+    """Pure-python version of evaluate_paper_promotion. Mirrors the logic
+    in src/acme/ryan_spec/v3_promotion.py:evaluate_paper_promotion. Returns
+    a dict with keys: verdict, reason, settled, pf, opposite_pct, avg_slip.
+    """
+    settled = [r for r in rows if r.get("exit_reason")]
+    n = len(settled)
+    if n < GATE_MIN_SETTLED:
+        return {
+            "verdict": "EXTEND_PAPER",
+            "reason": f"{n}/{GATE_MIN_SETTLED}",
+            "settled": n,
+            "pf": None,
+            "opposite_pct": None,
+            "avg_slip": None,
+        }
+    wins = sum(1 for r in settled if (r.get("pnl_dollars") or 0) > 0)
+    gw = sum(r["pnl_dollars"] for r in settled if (r.get("pnl_dollars") or 0) > 0)
+    gl = abs(sum(r["pnl_dollars"] for r in settled if (r.get("pnl_dollars") or 0) < 0))
+    pf = gw / max(gl, 0.01)
+    opp = sum(1 for r in settled if r.get("exit_reason") == "opposite_signal") / n
+    slips = [r["slippage_ticks"] for r in settled
+             if r.get("slippage_ticks") is not None]
+    avg_slip = (sum(slips) / len(slips)) if slips else None
+    base = {
+        "settled": n, "pf": pf, "opposite_pct": opp, "avg_slip": avg_slip,
+        "win_rate": wins / n,
+    }
+    if pf < GATE_MIN_PF:
+        return {**base, "verdict": "HALT", "reason": f"PF {pf:.2f} < {GATE_MIN_PF}"}
+    if avg_slip is not None and avg_slip > GATE_MAX_AVG_SLIPPAGE_TICKS:
+        return {**base, "verdict": "HALT",
+                "reason": f"slippage {avg_slip:.2f}t > {GATE_MAX_AVG_SLIPPAGE_TICKS}t"}
+    if opp < GATE_MIN_OPPOSITE_PCT:
+        return {**base, "verdict": "INVESTIGATE",
+                "reason": f"opposite-exit {opp*100:.0f}% < {int(GATE_MIN_OPPOSITE_PCT*100)}%"}
+    return {**base, "verdict": "PROMOTE_LIVE", "reason": "all gates pass"}
+
+
+def _fetch_all_paper_for_gate(sb, *, since_iso: str) -> list[dict]:
+    """All paper trades across strategies for the gate window."""
+    try:
+        res = (
+            sb.table("ryan_spec_v3_trades")
+            .select("strategy_id,exit_reason,pnl_dollars,slippage_ticks")
+            .eq("mode", "paper")
+            .gte("bar_ts", since_iso)
+            .limit(20_000)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def _verdicts_per_strategy(rows: list[dict]) -> dict[str, dict]:
+    """Group rows by strategy_id and run the gate per group."""
+    by_strat: dict[str, list[dict]] = {}
+    for r in rows:
+        sid = r.get("strategy_id") or "unknown"
+        by_strat.setdefault(sid, []).append(r)
+    return {sid: _compute_verdict_pure(rs) for sid, rs in by_strat.items()}
+
 
 def _variant_nav_html(summaries: list[dict], *, current: str,
-                      token: str | None, mode: str) -> str:
+                      token: str | None, mode: str,
+                      verdicts: dict[str, dict]) -> str:
     """Render a horizontal pill nav listing each variant + its 24h P&L,
     with the active one styled distinctly."""
     by_id = {s["strategy_id"]: s for s in summaries}
@@ -200,6 +281,9 @@ def _variant_nav_html(summaries: list[dict], *, current: str,
         else:
             tcolor = "#94a3b8"
         bg = "#0f172a" if active else "#020617"
+        # Verdict tints the LEFT border so the gate state is visible at a glance
+        v = verdicts.get(sid, {"verdict": "EXTEND_PAPER"})
+        vcolor = VERDICT_COLORS.get(v["verdict"], "#94a3b8")
         border = "#38bdf8" if active else "#1e293b"
         weight = "700" if active else "500"
         text = "#e2e8f0" if active else "#94a3b8"
@@ -211,8 +295,10 @@ def _variant_nav_html(summaries: list[dict], *, current: str,
         params.append(f"strategy_id={sid}")
         href = f"/ryan-spec-v3?{'&'.join(params)}"
         parts.append(
-            f'<a href="{href}" style="text-decoration:none">'
-            f'<span class="meta-pill" style="background:{bg};border:1px solid {border};'
+            f'<a href="{href}" style="text-decoration:none" '
+            f'title="{v["verdict"]}: {v.get("reason", "")}">'
+            f'<span class="meta-pill" style="background:{bg};'
+            f'border:1px solid {border};border-left:3px solid {vcolor};'
             f'color:{text};font-weight:{weight}">'
             f'{sid}'
             f' <span style="color:{tcolor}" class="mono">{_money(total)}</span>'
@@ -239,6 +325,15 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
         sb, mode=mode,
         since_iso=(now_utc - timedelta(days=1)).isoformat(),
     )
+    # Per-strategy promotion-gate verdicts. Window matches the watcher's
+    # 7-day display so the verdict reflects what the user is looking at.
+    gate_rows = _fetch_all_paper_for_gate(sb, since_iso=since)
+    verdicts = _verdicts_per_strategy(gate_rows)
+    current_verdict = verdicts.get(strategy_id, {
+        "verdict": "EXTEND_PAPER",
+        "reason": f"0/{GATE_MIN_SETTLED}",
+        "settled": 0,
+    })
 
     # Today's metrics (in CT)
     today_ct_date = now_ct.date()
@@ -460,11 +555,16 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
   </div>
 
   <div class="statusrow" style="border-bottom:1px solid #1e293b;padding-bottom:10px;margin-bottom:8px">
-    {_variant_nav_html(nav_summaries, current=strategy_id, token=token, mode=mode)}
+    {_variant_nav_html(nav_summaries, current=strategy_id, token=token, mode=mode, verdicts=verdicts)}
   </div>
 
   <div class="statusrow">
     {status_pill}
+    <span class="meta-pill" style="border-left:3px solid {VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}"
+          title="{current_verdict.get('reason', '')}">
+      gate <strong style="color:{VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}">{current_verdict['verdict']}</strong>
+      <span class="dim">{current_verdict.get('reason', '')}</span>
+    </span>
     <span class="meta-pill">mode <strong>{mode}</strong></span>
     <span class="meta-pill">topstep session <strong>{trading_date.strftime('%a %m/%d')}</strong></span>
     <span class="meta-pill">today trades <strong>{today['n']}</strong></span>

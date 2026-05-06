@@ -14,6 +14,7 @@ from acme.ryan_spec.v3_promotion import (
     MIN_PF_FLOOR,
     MIN_SETTLED_TRADES,
     evaluate_paper_promotion,
+    evaluate_paper_promotion_per_strategy,
 )
 
 # --- helpers ------------------------------------------------------------
@@ -261,3 +262,57 @@ def test_win_rate_computed_from_settled_only():
     df = _trades([30.0] * 120 + [-15.0] * 80)  # 120 wins / 200 = 60%
     e = evaluate_paper_promotion(df)
     assert e.win_rate_pct == 60.0
+
+
+# --- per-strategy gate --------------------------------------------------
+
+def _strategies(spec: dict[str, list[float]]) -> pd.DataFrame:
+    """Build a multi-strategy DataFrame. spec maps strategy_id -> pnl list."""
+    frames = []
+    for sid, pnl in spec.items():
+        df = _trades(pnl, opposite_share=0.55)
+        df["strategy_id"] = sid
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_per_strategy_returns_one_verdict_per_strategy():
+    """Two strategies, distinct PnL profiles, distinct verdicts."""
+    df = _strategies({
+        "v3-canon": _passing_pnl(MIN_SETTLED_TRADES),                  # PF 2.0
+        "v3-bad":   _balanced(MIN_SETTLED_TRADES, win=30.0, loss=-30.0),  # PF 1.0
+    })
+    out = evaluate_paper_promotion_per_strategy(df)
+    assert set(out.keys()) == {"v3-canon", "v3-bad"}
+    assert out["v3-canon"].verdict == "PROMOTE_LIVE"
+    assert out["v3-bad"].verdict == "HALT"
+    assert out["v3-canon"].pf == 2.0
+    assert out["v3-bad"].pf == 1.0
+
+
+def test_per_strategy_extends_paper_when_volume_low_per_variant():
+    """Per-strategy verdicts use each variant's own settled count, not the
+    combined total. Two variants with 100 trades each — each gets EXTEND_PAPER
+    even though their combined total is 200."""
+    df = _strategies({
+        "v3-canon": _passing_pnl(100),
+        "v3-trail": _passing_pnl(100),
+    })
+    out = evaluate_paper_promotion_per_strategy(df)
+    assert out["v3-canon"].verdict == "EXTEND_PAPER"
+    assert out["v3-trail"].verdict == "EXTEND_PAPER"
+
+
+def test_per_strategy_empty_input_returns_empty_dict():
+    df = pd.DataFrame()
+    assert evaluate_paper_promotion_per_strategy(df) == {}
+
+
+def test_per_strategy_groups_null_strategy_id_under_unknown():
+    """Legacy rows without strategy_id (pre-multi-variant migration) get
+    bucketed under 'unknown' rather than crashing."""
+    df = _trades(_passing_pnl(MIN_SETTLED_TRADES))
+    df["strategy_id"] = None  # all rows null
+    out = evaluate_paper_promotion_per_strategy(df)
+    assert "unknown" in out
+    assert out["unknown"].verdict == "PROMOTE_LIVE"
