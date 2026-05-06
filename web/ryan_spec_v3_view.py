@@ -188,7 +188,7 @@ def _fleet_heartbeat_pill(heartbeats: dict[str, dict], now_utc: datetime) -> str
     # variant is the laggard without leaving the overview.
     title = " · ".join(
         f"{sid}={s['state']}({s['ago']})"
-        for sid, s in zip(KNOWN_VARIANTS, statuses)
+        for sid, s in zip(KNOWN_VARIANTS, statuses, strict=True)
     )
     return (
         f'<span class="pill" title="{title}" '
