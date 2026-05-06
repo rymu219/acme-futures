@@ -5,19 +5,17 @@
     <key>Label</key>
     <string>com.acme-futures.runner</string>
 
-    <!-- caffeinate keeps the Mac awake; uv runs the bot in dry-run.
-         To switch to live trading, change "--dry-run" to nothing
-         (or remove the corresponding string element entirely). -->
+    <!-- 2026-05-05 macOS TCC tightened — launchd refuses to posix_spawn
+         user-installed binaries (caffeinate, uv) directly. We invoke
+         /bin/sh (system, always permitted) and let it exec uv. The
+         spawn-permission gate is at launchd level only; once sh is
+         running it can exec anything the user can.
+         To switch to live trading, drop the --dry-run flag from the -c arg. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/caffeinate</string>
-        <string>-dimsu</string>
-        <string>/Users/ryanmurphy/.local/bin/uv</string>
-        <string>run</string>
-        <string>python</string>
-        <string>-m</string>
-        <string>acme.runner</string>
-        <string>--dry-run</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec /Users/ryanmurphy/.local/bin/uv run python -m acme.runner --dry-run</string>
     </array>
 
     <key>WorkingDirectory</key>

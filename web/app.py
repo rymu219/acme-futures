@@ -700,13 +700,14 @@ def home(token: str | None = Query(default=None)):
 def ryan_spec_v3(
     token: str | None = Query(default=None),
     mode: str = Query(default="paper"),
+    strategy_id: str = Query(default="v3-canon"),
 ):
     _check_token(token)
     if mode not in ("paper", "live", "shadow"):
         raise HTTPException(status_code=400, detail="invalid mode")
     sb = _client()
     from ryan_spec_v3_view import render as render_v3
-    return render_v3(sb, mode=mode, token=token)
+    return render_v3(sb, mode=mode, token=token, strategy_id=strategy_id)
 
 
 @app.get("/health")

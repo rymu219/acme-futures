@@ -14,8 +14,11 @@ from typing import Any
 
 from acme.broker.base import Bar
 from acme.ryan_spec.v3_engine import Decision
-from acme.ryan_spec.v3_runtime import SERVICE_NAME, V3Runtime
+from acme.ryan_spec.v3_runtime import V3Runtime
 from acme.ryan_spec.v3_tick_delta import BarWithDelta
+
+# All tests use the default strategy_id ("v3-canon") for the constructed runtime
+DEFAULT_STRATEGY_ID = "v3-canon"
 
 CT = timezone(timedelta(hours=-6))
 
@@ -138,7 +141,7 @@ def test_heartbeat_written_on_each_closed_bar():
     for i in range(3):
         rt._on_closed_bar(_bd(t0 + timedelta(minutes=2 * i)))
     assert len(db.heartbeats) == 3
-    assert all(hb["service"] == SERVICE_NAME for hb in db.heartbeats)
+    assert all(hb["service"] == DEFAULT_STRATEGY_ID for hb in db.heartbeats)
     # last_bar_ts on the third heartbeat matches the third bar
     assert db.heartbeats[-1]["last_bar_ts"] == t0 + timedelta(minutes=4)
     # auth_ok and position_state surfaced
@@ -186,7 +189,7 @@ def test_runtime_paused_still_processes_exits():
     # can be attributed back to this row by _record_exit_fill.
     assert len(broker.submit_calls) == 1
     assert broker.submit_calls[0]["side"] == "sell"  # closing a long
-    assert broker.submit_calls[0]["tag"] == "ryan_spec_v3:42:out"
+    assert broker.submit_calls[0]["tag"] == "v3-canon:42:out"
     # Position state cleared after close
     assert rt._open_trade_id is None
 
