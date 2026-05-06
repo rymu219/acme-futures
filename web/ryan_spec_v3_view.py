@@ -564,11 +564,14 @@ def render_overview(
     now_ct = datetime.now(CT)
     now_utc = datetime.now(UTC)
     since = (now_utc - timedelta(days=7)).isoformat()
+    # "Today" = since midnight CT (so overnight trades after 00:00 CT count).
+    # We convert midnight-CT to UTC for the bar_ts string comparison since
+    # Supabase returns bar_ts in UTC.
     today_ct_date = now_ct.date()
     today_utc_floor = datetime(
         today_ct_date.year, today_ct_date.month, today_ct_date.day,
-        13, 30, tzinfo=UTC,  # 08:30 CT = 13:30 UTC during CDT (close enough)
-    ).isoformat()
+        tzinfo=CT,
+    ).astimezone(UTC).isoformat()
 
     # Per-variant summaries
     summaries: dict[str, dict] = {
