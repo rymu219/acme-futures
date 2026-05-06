@@ -690,10 +690,22 @@ def _render_html(sb, *, token: str | None = None) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(token: str | None = Query(default=None)):
+def home(
+    token: str | None = Query(default=None),
+    mode: str = Query(default="paper"),
+    strategy_id: str = Query(default="v3-canon"),
+):
+    """Main page is now the Ryan-Spec v3 multi-variant view. The old
+    fleet/leaderboard view (_render_html) lives in this file but isn't
+    routed — kept around in case we want to re-enable conductor strategies
+    later. Per the 2026-05-05 mission shift, v3 is the anchor and there
+    are no other live strategies."""
     _check_token(token)
+    if mode not in ("paper", "live", "shadow"):
+        raise HTTPException(status_code=400, detail="invalid mode")
     sb = _client()
-    return _render_html(sb, token=token)
+    from ryan_spec_v3_view import render as render_v3
+    return render_v3(sb, mode=mode, token=token, strategy_id=strategy_id)
 
 
 @app.get("/ryan-spec-v3", response_class=HTMLResponse)
@@ -702,12 +714,18 @@ def ryan_spec_v3(
     mode: str = Query(default="paper"),
     strategy_id: str = Query(default="v3-canon"),
 ):
+    """Alias for backward compatibility with old links/bookmarks."""
+    return home(token=token, mode=mode, strategy_id=strategy_id)
+
+
+@app.get("/fleet", response_class=HTMLResponse)
+def fleet_legacy(token: str | None = Query(default=None)):
+    """Legacy fleet view (8-strategy conductor leaderboard). Kept reachable
+    if you want to look at historical perf rows, but not linked from the
+    main page anymore."""
     _check_token(token)
-    if mode not in ("paper", "live", "shadow"):
-        raise HTTPException(status_code=400, detail="invalid mode")
     sb = _client()
-    from ryan_spec_v3_view import render as render_v3
-    return render_v3(sb, mode=mode, token=token, strategy_id=strategy_id)
+    return _render_html(sb, token=token)
 
 
 @app.get("/health")
