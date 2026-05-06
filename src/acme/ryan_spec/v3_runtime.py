@@ -692,13 +692,34 @@ class V3Runtime:
         )
         held_seconds = (datetime.now(UTC) - meta["entry_ts"]).total_seconds()
         bars_held = max(1, int(held_seconds / 120))
-        self.db.update_ryan_spec_v3_trade(row_id, {
+
+        # Capture MFE/MAE from the engine while pos still exists.
+        # `engine.close_position()` below clears it. Use the engine's own
+        # atr_at_entry as the normalising denominator so the units stay
+        # consistent with how MFE/MAE were computed (per-bar updates use
+        # the same atr the engine recorded at entry).
+        mfe_atr: float | None = None
+        mae_atr: float | None = None
+        epos = self.engine.position
+        if epos is not None and epos.atr_at_entry > 0:
+            atr_e = epos.atr_at_entry
+            # Schema says mfe_atr / mae_atr are `numeric` — store fractional ATR
+            # units for precision. Round to 2 decimals to keep rows tidy.
+            mfe_atr = round(epos.max_favorable_excursion / atr_e, 2)
+            mae_atr = round(epos.max_adverse_excursion / atr_e, 2)
+
+        update_fields: dict[str, Any] = {
             "exit_ts": datetime.now(UTC).isoformat(),
             "exit_price": exit_price,
             "exit_reason": decision.reason,
             "pnl_dollars": float(pnl_dollars),
             "bars_held": bars_held,
-        })
+        }
+        if mfe_atr is not None:
+            update_fields["mfe_atr"] = mfe_atr
+        if mae_atr is not None:
+            update_fields["mae_atr"] = mae_atr
+        self.db.update_ryan_spec_v3_trade(row_id, update_fields)
 
         if order_id is not None:
             self._pending_exit_fills[str(order_id)] = _PendingExit(
