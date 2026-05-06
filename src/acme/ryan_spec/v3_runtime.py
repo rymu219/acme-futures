@@ -155,6 +155,22 @@ class V3Runtime:
         session_end_ct: dtime = SESSION_END_CT,
         session_tz: tzinfo = CT,
         dry_run: bool = False,
+        # Multi-variant: each runtime instance writes trade rows tagged with
+        # its strategy_id and reads its own runtime_config / heartbeat row
+        # under the same key. Default 'v3-canon' = the canonical OOS-validated
+        # configuration; variants override engine flags below to ship as
+        # 'v3-trail' / 'v3-min2bar' / 'v3-armor' / 'v3-pctile'.
+        strategy_id: str = "v3-canon",
+        # Engine variant overrides — passed through to RyanSpecV3Engine.
+        # Defaulting all to canon-equivalent keeps backward compat.
+        enable_trailing_stop: bool = False,
+        trail_be_lock_atr_mult: float = 1.0,
+        trail_atr_mult: float = 1.0,
+        min_bars_before_opposite_exit: int = 0,
+        opposite_signal_armor_mfe_atr: float | None = None,
+        filter_mode: Literal["static", "pctile"] = "static",
+        filter_pctile_window_bars: int = 60,
+        filter_pctile: float = 5.0,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -162,6 +178,7 @@ class V3Runtime:
         self.mode = mode
         self.delta_source = delta_source
         self.risk_contracts = risk_contracts
+        self.strategy_id = strategy_id
         # Phantom-fill mode: skip submit_market_order entirely; record trade
         # rows at the modeled price. Used when running alongside other bots on
         # one shared broker connection so we can paper-trade all of them
@@ -176,6 +193,14 @@ class V3Runtime:
             filter_thresh=thresh,
             session_end_ct=session_end_ct,
             session_tz=session_tz,
+            enable_trailing_stop=enable_trailing_stop,
+            trail_be_lock_atr_mult=trail_be_lock_atr_mult,
+            trail_atr_mult=trail_atr_mult,
+            min_bars_before_opposite_exit=min_bars_before_opposite_exit,
+            opposite_signal_armor_mfe_atr=opposite_signal_armor_mfe_atr,
+            filter_mode=filter_mode,
+            filter_pctile_window_bars=filter_pctile_window_bars,
+            filter_pctile=filter_pctile,
         )
         self.builder = LiveBarDeltaBuilder(
             on_bar=self._on_closed_bar,
@@ -310,7 +335,7 @@ class V3Runtime:
         """Best-effort heartbeat upsert. Never raises."""
         try:
             self.db.write_heartbeat(
-                SERVICE_NAME,
+                self.strategy_id,
                 last_bar_ts=self._last_bar_ts,
                 auth_ok=self._auth_ok,
                 consecutive_errors=self._consecutive_errors,
@@ -321,10 +346,12 @@ class V3Runtime:
                     "contract_id": self._contract_id,
                     "broker": type(self.broker).__name__,
                     "open_trade_id": self._open_trade_id,
+                    "strategy_id": self.strategy_id,
                 },
             )
         except Exception:
-            log.exception("v3_runtime_heartbeat_write_failed")
+            log.exception("v3_runtime_heartbeat_write_failed",
+                          strategy_id=self.strategy_id)
 
     def _refresh_config(self, *, force: bool = False) -> None:
         """Refresh the kill-switch cache from Supabase if stale. Never raises."""
@@ -333,11 +360,12 @@ class V3Runtime:
                 and (now - self._config_last_fetch).total_seconds() < CONFIG_CACHE_TTL_SECONDS):
             return
         try:
-            cfg = self.db.read_runtime_config(SERVICE_NAME)
+            cfg = self.db.read_runtime_config(self.strategy_id)
             self._config_cache = cfg
             self._config_last_fetch = now
         except Exception:
-            log.exception("v3_runtime_config_refresh_failed")
+            log.exception("v3_runtime_config_refresh_failed",
+                          strategy_id=self.strategy_id)
             # Keep using whatever was cached; never block trading on this.
 
     def _is_paused(self) -> bool:
@@ -359,9 +387,10 @@ class V3Runtime:
                        "investigate then unpause via Supabase Studio "
                        "(update runtime_config set paused=false ...).")
         try:
-            self.db.set_runtime_paused(SERVICE_NAME, paused=True, by="self_halt")
+            self.db.set_runtime_paused(self.strategy_id, paused=True, by="self_halt")
         except Exception:
-            log.exception("v3_runtime_self_halt_db_write_failed")
+            log.exception("v3_runtime_self_halt_db_write_failed",
+                          strategy_id=self.strategy_id)
         self._config_cache["paused"] = True
         self._config_last_fetch = datetime.now(UTC)
 
@@ -419,6 +448,7 @@ class V3Runtime:
 
         # Insert open trade row first; we'll patch in fill price on confirmation
         row_id = self.db.insert_ryan_spec_v3_trade({
+            "strategy_id": self.strategy_id,
             "mode": self.mode,
             "bar_ts": bd.bar.t.astimezone(UTC).isoformat(),
             "direction": decision.direction,
@@ -447,7 +477,7 @@ class V3Runtime:
                     self._contract_id,  # type: ignore[arg-type]
                     side,  # type: ignore[arg-type]
                     self.risk_contracts,
-                    custom_tag=f"ryan_spec_v3:{row_id}:in",
+                    custom_tag=f"{self.strategy_id}:{row_id}:in",
                     bracket=BracketSpec(
                         stop_loss_offset_ticks=stop_ticks,
                         take_profit_offset_ticks=None,
@@ -560,19 +590,21 @@ class V3Runtime:
         return float(price)
 
     def _match_entry_pending_by_tag(self, tag: str) -> _PendingEntry | None:
-        if not tag.startswith("ryan_spec_v3:") or not tag.endswith(":in"):
+        prefix = f"{self.strategy_id}:"
+        if not tag.startswith(prefix) or not tag.endswith(":in"):
             return None
         for order_id, pending in list(self._pending_entry_fills.items()):
-            if f"ryan_spec_v3:{pending.row_id}:in" == tag:
+            if f"{self.strategy_id}:{pending.row_id}:in" == tag:
                 self._pending_entry_fills.pop(order_id, None)
                 return pending
         return None
 
     def _match_exit_pending_by_tag(self, tag: str) -> _PendingExit | None:
-        if not tag.startswith("ryan_spec_v3:") or not tag.endswith(":out"):
+        prefix = f"{self.strategy_id}:"
+        if not tag.startswith(prefix) or not tag.endswith(":out"):
             return None
         for order_id, pending in list(self._pending_exit_fills.items()):
-            if f"ryan_spec_v3:{pending.row_id}:out" == tag:
+            if f"{self.strategy_id}:{pending.row_id}:out" == tag:
                 self._pending_exit_fills.pop(order_id, None)
                 return pending
         return None
@@ -640,7 +672,7 @@ class V3Runtime:
                     self._contract_id,  # type: ignore[arg-type]
                     side,  # type: ignore[arg-type]
                     self.risk_contracts,
-                    custom_tag=f"ryan_spec_v3:{row_id}:out",
+                    custom_tag=f"{self.strategy_id}:{row_id}:out",
                 )
                 log.info("v3_runtime_close_submitted", order_id=order_id, row_id=row_id)
             except Exception:
@@ -706,6 +738,7 @@ def main() -> None:
         _env("ACME_SESSION_END_CT", "14:50"), field_name="ACME_SESSION_END_CT",
     )
     dry_run = _env("ACME_V3_DRY_RUN", "false").lower() in ("1", "true", "yes")
+    strategy_id = _env("ACME_STRATEGY_ID", "v3-canon")
     runtime = V3Runtime(
         broker=broker, db=db, contract_symbol=contract,
         mode=mode, delta_source=delta_source,  # type: ignore[arg-type]
@@ -713,6 +746,7 @@ def main() -> None:
         session_open_ct=session_open,
         session_end_ct=session_end,
         dry_run=dry_run,
+        strategy_id=strategy_id,
     )
     asyncio.run(runtime.run())
 

@@ -70,8 +70,17 @@ class ProjectXAdapter(BrokerAdapter):
         self._account_id: str | None = account_id or os.getenv("PROJECTX_ACCOUNT_ID") or None
         self._token: str | None = None
         self._client = client or httpx.AsyncClient(base_url=self.base_url, timeout=20.0)
+        # SignalR fan-out muxes — created lazily on first stream_* call.
+        # ProjectX rejects a second concurrent SignalR connection on the same
+        # JWT, so we MUST share connections across all callers.
+        self._market_mux: _MarketHubMux | None = None
+        self._user_mux: _UserHubMux | None = None
 
     async def aclose(self) -> None:
+        if self._market_mux is not None:
+            self._market_mux.stop()
+        if self._user_mux is not None:
+            self._user_mux.stop()
         await self._client.aclose()
 
     async def __aenter__(self) -> ProjectXAdapter:
@@ -276,230 +285,351 @@ class ProjectXAdapter(BrokerAdapter):
                 log.error("flatten_failed", contract_id=p.contract_id, error=str(e))
 
     # ---------- streaming (SignalR) ----------
-    # SignalR streaming is implemented lazily — the runner.py loop will call these
-    # only when broker is real (smoke + production). Tests use the paper adapter.
+    # ProjectX rejects a second concurrent SignalR connection on the same JWT
+    # (we hit this in PR #6). Streaming is funneled through two muxes that
+    # each open ONE connection and fan out to N consumer queues. Each call
+    # to stream_quotes / stream_trades / stream_user_events returns its own
+    # async iterator; under the hood they share connections.
 
     async def stream_quotes(self, contract_id: str) -> AsyncIterator[Quote]:  # type: ignore[override]
-        from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
-
         await self._ensure_auth()
-        queue: asyncio.Queue[Quote] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        err_count = {"n": 0}
-
-        def _extract_dict(args: list[Any]) -> dict | None:
-            # ProjectX market hub typically delivers [contract_id_str, quote_dict].
-            # Some shapes seen: [dict], [str, dict], [str, json_str].
-            for a in args or []:
-                if isinstance(a, dict):
-                    return a
-                if isinstance(a, str) and a.startswith("{"):
-                    import json
-                    try:
-                        return json.loads(a)
-                    except Exception:
-                        continue
-            return None
-
-        def _on_quote(args: list[Any]) -> None:
-            try:
-                payload = _extract_dict(args)
-                if payload is None:
-                    if err_count["n"] < 3:
-                        log.error("on_quote_no_dict", args_repr=repr(args)[:200])
-                        err_count["n"] += 1
-                    return
-                bid = payload.get("bestBid") or payload.get("bid")
-                ask = payload.get("bestAsk") or payload.get("ask")
-                last = payload.get("lastPrice") or payload.get("last")
-                ts = payload.get("timestamp") or payload.get("t")
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else datetime.now()
-                q = Quote(
-                    t=t,
-                    bid=float(bid) if bid is not None else None,
-                    ask=float(ask) if ask is not None else None,
-                    last=float(last) if last is not None else None,
-                )
-                loop.call_soon_threadsafe(queue.put_nowait, q)
-            except Exception as e:
-                if err_count["n"] < 3:
-                    log.error("on_quote_failed", error=str(e), args_repr=repr(args)[:200])
-                    err_count["n"] += 1
-
-        token = self._token
-        connection = (
-            HubConnectionBuilder()
-            .with_url(
-                f"{self.market_hub}?access_token={token}",
-                options={"access_token_factory": lambda: token},
-            )
-            .with_automatic_reconnect({"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5})
-            .build()
-        )
-        connection.on("GatewayQuote", _on_quote)
-        connection.start()
-        await asyncio.sleep(1.0)  # give the websocket handshake a moment
-        try:
-            connection.send("SubscribeContractQuotes", [contract_id])
-            while True:
-                yield await queue.get()
-        finally:
-            with contextlib.suppress(Exception):
-                connection.send("UnsubscribeContractQuotes", [contract_id])
-            connection.stop()
+        if self._market_mux is None:
+            self._market_mux = _MarketHubMux(self.market_hub, lambda: self._token)
+        async for q in self._market_mux.subscribe_quotes(contract_id):
+            yield q
 
     async def stream_trades(self, contract_id: str) -> AsyncIterator[Trade]:  # type: ignore[override]
-        from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
-
         await self._ensure_auth()
-        queue: asyncio.Queue[Trade] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        err_count = {"n": 0}
-
-        def _extract_dict(args: list[Any]) -> dict | None:
-            for a in args or []:
-                if isinstance(a, dict):
-                    return a
-                if isinstance(a, str) and a.startswith("{"):
-                    import json
-                    try:
-                        return json.loads(a)
-                    except Exception:
-                        continue
-            return None
-
-        def _coerce_side(payload: dict) -> str | None:
-            # ProjectX shapes seen: side="B"/"A", aggressor=0/1, type=0/1.
-            # 0/buy aggressor → "B", 1/sell aggressor → "A". When ambiguous,
-            # return None so the bar builder falls back to size-weighted tick rule.
-            raw = (
-                payload.get("side")
-                or payload.get("Side")
-                or payload.get("aggressor")
-                or payload.get("Aggressor")
-                or payload.get("type")
-                or payload.get("Type")
-            )
-            if raw is None:
-                return None
-            if isinstance(raw, str):
-                upper = raw.upper()
-                if upper in ("B", "BUY"):
-                    return "B"
-                if upper in ("A", "S", "SELL", "ASK"):
-                    return "A"
-                return None
-            if isinstance(raw, int | float):
-                if int(raw) == 0:
-                    return "B"
-                if int(raw) == 1:
-                    return "A"
-            return None
-
-        def _on_trade(args: list[Any]) -> None:
-            try:
-                payload = _extract_dict(args)
-                if payload is None:
-                    if err_count["n"] < 3:
-                        log.error("on_trade_no_dict", args_repr=repr(args)[:200])
-                        err_count["n"] += 1
-                    return
-                price = payload.get("price") or payload.get("Price") or payload.get("lastPrice")
-                size = (
-                    payload.get("size") or payload.get("Size")
-                    or payload.get("volume") or payload.get("Volume")
-                )
-                ts = payload.get("timestamp") or payload.get("Timestamp") or payload.get("t")
-                if price is None or size is None:
-                    return
-                t = (
-                    datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    if isinstance(ts, str) else datetime.now()
-                )
-                tr = Trade(
-                    t=t,
-                    contract_id=contract_id,
-                    price=float(price),
-                    size=int(size),
-                    side=_coerce_side(payload),  # type: ignore[arg-type]
-                )
-                loop.call_soon_threadsafe(queue.put_nowait, tr)
-            except Exception as e:
-                if err_count["n"] < 3:
-                    log.error("on_trade_failed", error=str(e), args_repr=repr(args)[:200])
-                    err_count["n"] += 1
-
-        token = self._token
-        connection = (
-            HubConnectionBuilder()
-            .with_url(
-                f"{self.market_hub}?access_token={token}",
-                options={"access_token_factory": lambda: token},
-            )
-            .with_automatic_reconnect({"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5})
-            .build()
-        )
-        connection.on("GatewayTrade", _on_trade)
-        connection.start()
-        await asyncio.sleep(1.0)  # give the websocket handshake a moment
-        try:
-            connection.send("SubscribeContractTrades", [contract_id])
-            while True:
-                yield await queue.get()
-        finally:
-            with contextlib.suppress(Exception):
-                connection.send("UnsubscribeContractTrades", [contract_id])
-            connection.stop()
+        if self._market_mux is None:
+            self._market_mux = _MarketHubMux(self.market_hub, lambda: self._token)
+        async for tr in self._market_mux.subscribe_trades(contract_id):
+            yield tr
 
     async def stream_user_events(self) -> AsyncIterator[dict]:  # type: ignore[override]
-        from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
-
         await self._ensure_auth()
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        if self._user_mux is None:
+            self._user_mux = _UserHubMux(self.user_hub, lambda: self._token, self.account_id)
+        async for evt in self._user_mux.subscribe():
+            yield evt
 
-        def _emit(kind: str):
-            def handler(args: list[Any]) -> None:
-                payload: Any = None
-                for a in args or []:
-                    if isinstance(a, dict):
-                        payload = a
-                        break
-                    if isinstance(a, str) and a.startswith("{"):
-                        import json
-                        try:
-                            payload = json.loads(a)
-                            break
-                        except Exception:
-                            continue
-                if payload is None:
-                    payload = args
-                evt = {"kind": kind, "payload": payload}
-                loop.call_soon_threadsafe(queue.put_nowait, evt)
-            return handler
 
-        token = self._token
-        connection = (
-            HubConnectionBuilder()
-            .with_url(
-                f"{self.user_hub}?access_token={token}",
-                options={"access_token_factory": lambda: token},
+# ---------- SignalR fan-out muxes ----------
+# Each mux owns ONE connection per hub. Consumers register a queue and read
+# from it; the mux's signalrcore callbacks fan out incoming events to all
+# registered queues. Callbacks run in signalrcore's thread, so we use
+# loop.call_soon_threadsafe to safely hand work back to asyncio.
+
+
+def _extract_dict_from_args(args: list[Any]) -> dict | None:
+    """ProjectX hubs may deliver [dict], [str_id, dict], [str_id, json_str]."""
+    for a in args or []:
+        if isinstance(a, dict):
+            return a
+        if isinstance(a, str) and a.startswith("{"):
+            import json
+            try:
+                return json.loads(a)
+            except Exception:
+                continue
+    return None
+
+
+def _extract_contract_id_from_args(args: list[Any]) -> str | None:
+    """Pulls a non-JSON string id out of the args. Returns None if absent."""
+    for a in args or []:
+        if isinstance(a, str) and not a.startswith("{"):
+            return a
+    return None
+
+
+def _coerce_trade_side(payload: dict) -> str | None:
+    raw = (
+        payload.get("side")
+        or payload.get("Side")
+        or payload.get("aggressor")
+        or payload.get("Aggressor")
+        or payload.get("type")
+        or payload.get("Type")
+    )
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        upper = raw.upper()
+        if upper in ("B", "BUY"):
+            return "B"
+        if upper in ("A", "S", "SELL", "ASK"):
+            return "A"
+        return None
+    if isinstance(raw, int | float):
+        if int(raw) == 0:
+            return "B"
+        if int(raw) == 1:
+            return "A"
+    return None
+
+
+class _MarketHubMux:
+    """One SignalR connection to the market hub, fanned out across N
+    consumers per (contract_id, kind) tuple. Lazily started on first
+    subscribe; lives until the adapter is closed.
+    """
+
+    def __init__(self, market_hub_url: str, token_provider: Any) -> None:
+        self._market_hub_url = market_hub_url
+        self._token_provider = token_provider  # callable -> str | None
+        self._connection: Any = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._started: bool = False
+        self._start_lock = asyncio.Lock()
+        # consumer queues, keyed by contract_id
+        self._quote_consumers: dict[str, list[asyncio.Queue[Quote]]] = {}
+        self._trade_consumers: dict[str, list[asyncio.Queue[Trade]]] = {}
+        # subscriptions already sent to the hub
+        self._subscribed_quotes: set[str] = set()
+        self._subscribed_trades: set[str] = set()
+        # rate-limit log spam on bad parses
+        self._err_count: int = 0
+
+    async def _ensure_started(self) -> None:
+        async with self._start_lock:
+            if self._started:
+                return
+            from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
+            self._loop = asyncio.get_running_loop()
+            token = self._token_provider() or ""
+            self._connection = (
+                HubConnectionBuilder()
+                .with_url(
+                    f"{self._market_hub_url}?access_token={token}",
+                    options={"access_token_factory": lambda: self._token_provider() or ""},
+                )
+                .with_automatic_reconnect(
+                    {"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5}
+                )
+                .build()
             )
-            .with_automatic_reconnect({"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5})
-            .build()
-        )
-        connection.on("GatewayUserOrder", _emit("order"))
-        connection.on("GatewayUserTrade", _emit("fill"))
-        connection.on("GatewayUserPosition", _emit("position"))
-        connection.on("GatewayUserAccount", _emit("account"))
-        connection.start()
-        await asyncio.sleep(1.0)  # give the websocket handshake a moment
+            self._connection.on("GatewayQuote", self._on_quote)
+            self._connection.on("GatewayTrade", self._on_trade)
+            self._connection.start()
+            await asyncio.sleep(1.0)  # signalrcore handshake
+            self._started = True
+            log.info("market_hub_mux_started")
+
+    def _on_quote(self, args: list[Any]) -> None:
         try:
-            connection.send("SubscribeAccounts", [])
-            connection.send("SubscribeOrders", [self.account_id])
-            connection.send("SubscribeTrades", [self.account_id])
-            connection.send("SubscribePositions", [self.account_id])
+            payload = _extract_dict_from_args(args)
+            if payload is None:
+                if self._err_count < 3:
+                    log.error("market_mux_quote_no_dict", args_repr=repr(args)[:200])
+                    self._err_count += 1
+                return
+            cid = _extract_contract_id_from_args(args)
+            bid = payload.get("bestBid") or payload.get("bid")
+            ask = payload.get("bestAsk") or payload.get("ask")
+            last = payload.get("lastPrice") or payload.get("last")
+            ts = payload.get("timestamp") or payload.get("t")
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else datetime.now()
+            q = Quote(
+                t=t,
+                bid=float(bid) if bid is not None else None,
+                ask=float(ask) if ask is not None else None,
+                last=float(last) if last is not None else None,
+            )
+            self._fanout_quote(cid, q)
+        except Exception as e:
+            if self._err_count < 3:
+                log.error("market_mux_quote_failed", error=str(e), args_repr=repr(args)[:200])
+                self._err_count += 1
+
+    def _fanout_quote(self, cid: str | None, q: Quote) -> None:
+        if self._loop is None:
+            return
+        # If contract_id is unknown (some shapes), fan out to ALL subscribed lists.
+        if cid and cid in self._quote_consumers:
+            consumers = list(self._quote_consumers[cid])
+        elif cid is None:
+            consumers = []
+            for qs in self._quote_consumers.values():
+                consumers.extend(qs)
+        else:
+            return
+        for queue in consumers:
+            self._loop.call_soon_threadsafe(queue.put_nowait, q)
+
+    def _on_trade(self, args: list[Any]) -> None:
+        try:
+            payload = _extract_dict_from_args(args)
+            if payload is None:
+                if self._err_count < 3:
+                    log.error("market_mux_trade_no_dict", args_repr=repr(args)[:200])
+                    self._err_count += 1
+                return
+            cid = _extract_contract_id_from_args(args)
+            price = payload.get("price") or payload.get("Price") or payload.get("lastPrice")
+            size = (
+                payload.get("size") or payload.get("Size")
+                or payload.get("volume") or payload.get("Volume")
+            )
+            ts = payload.get("timestamp") or payload.get("Timestamp") or payload.get("t")
+            if price is None or size is None:
+                return
+            t = (
+                datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if isinstance(ts, str) else datetime.now()
+            )
+            tr = Trade(
+                t=t,
+                contract_id=cid or "",
+                price=float(price),
+                size=int(size),
+                side=_coerce_trade_side(payload),  # type: ignore[arg-type]
+            )
+            self._fanout_trade(cid, tr)
+        except Exception as e:
+            if self._err_count < 3:
+                log.error("market_mux_trade_failed", error=str(e), args_repr=repr(args)[:200])
+                self._err_count += 1
+
+    def _fanout_trade(self, cid: str | None, tr: Trade) -> None:
+        if self._loop is None:
+            return
+        if cid and cid in self._trade_consumers:
+            consumers = list(self._trade_consumers[cid])
+        elif cid is None:
+            consumers = []
+            for ts in self._trade_consumers.values():
+                consumers.extend(ts)
+        else:
+            return
+        for queue in consumers:
+            self._loop.call_soon_threadsafe(queue.put_nowait, tr)
+
+    async def subscribe_quotes(self, contract_id: str) -> AsyncIterator[Quote]:
+        await self._ensure_started()
+        consumers = self._quote_consumers.setdefault(contract_id, [])
+        if contract_id not in self._subscribed_quotes:
+            with contextlib.suppress(Exception):
+                self._connection.send("SubscribeContractQuotes", [contract_id])
+            self._subscribed_quotes.add(contract_id)
+        my_queue: asyncio.Queue[Quote] = asyncio.Queue()
+        consumers.append(my_queue)
+        log.info("market_mux_quote_subscriber_added", contract_id=contract_id,
+                 total_consumers=len(consumers))
+        try:
             while True:
-                yield await queue.get()
+                yield await my_queue.get()
         finally:
-            connection.stop()
+            with contextlib.suppress(ValueError):
+                consumers.remove(my_queue)
+            if not consumers and contract_id in self._subscribed_quotes:
+                with contextlib.suppress(Exception):
+                    self._connection.send("UnsubscribeContractQuotes", [contract_id])
+                self._subscribed_quotes.discard(contract_id)
+
+    async def subscribe_trades(self, contract_id: str) -> AsyncIterator[Trade]:
+        await self._ensure_started()
+        consumers = self._trade_consumers.setdefault(contract_id, [])
+        if contract_id not in self._subscribed_trades:
+            with contextlib.suppress(Exception):
+                self._connection.send("SubscribeContractTrades", [contract_id])
+            self._subscribed_trades.add(contract_id)
+        my_queue: asyncio.Queue[Trade] = asyncio.Queue()
+        consumers.append(my_queue)
+        log.info("market_mux_trade_subscriber_added", contract_id=contract_id,
+                 total_consumers=len(consumers))
+        try:
+            while True:
+                yield await my_queue.get()
+        finally:
+            with contextlib.suppress(ValueError):
+                consumers.remove(my_queue)
+            if not consumers and contract_id in self._subscribed_trades:
+                with contextlib.suppress(Exception):
+                    self._connection.send("UnsubscribeContractTrades", [contract_id])
+                self._subscribed_trades.discard(contract_id)
+
+    def stop(self) -> None:
+        if self._connection is not None and self._started:
+            with contextlib.suppress(Exception):
+                self._connection.stop()
+            self._started = False
+
+
+class _UserHubMux:
+    """One SignalR connection to the user hub, fanned out across N consumers.
+    The user hub is per-account (we use one account), so all consumers see
+    the same stream of order/fill/position/account events.
+    """
+
+    def __init__(self, user_hub_url: str, token_provider: Any, account_id: str) -> None:
+        self._user_hub_url = user_hub_url
+        self._token_provider = token_provider
+        self._account_id = account_id
+        self._connection: Any = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._started: bool = False
+        self._start_lock = asyncio.Lock()
+        self._consumers: list[asyncio.Queue[dict]] = []
+        self._err_count: int = 0
+
+    def _emit(self, kind: str):
+        def handler(args: list[Any]) -> None:
+            payload: Any = _extract_dict_from_args(args)
+            if payload is None:
+                payload = args
+            evt = {"kind": kind, "payload": payload}
+            if self._loop is None:
+                return
+            for queue in list(self._consumers):
+                self._loop.call_soon_threadsafe(queue.put_nowait, evt)
+        return handler
+
+    async def _ensure_started(self) -> None:
+        async with self._start_lock:
+            if self._started:
+                return
+            from signalrcore.hub_connection_builder import HubConnectionBuilder  # type: ignore
+            self._loop = asyncio.get_running_loop()
+            token = self._token_provider() or ""
+            self._connection = (
+                HubConnectionBuilder()
+                .with_url(
+                    f"{self._user_hub_url}?access_token={token}",
+                    options={"access_token_factory": lambda: self._token_provider() or ""},
+                )
+                .with_automatic_reconnect(
+                    {"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5}
+                )
+                .build()
+            )
+            self._connection.on("GatewayUserOrder", self._emit("order"))
+            self._connection.on("GatewayUserTrade", self._emit("fill"))
+            self._connection.on("GatewayUserPosition", self._emit("position"))
+            self._connection.on("GatewayUserAccount", self._emit("account"))
+            self._connection.start()
+            await asyncio.sleep(1.0)  # signalrcore handshake
+            with contextlib.suppress(Exception):
+                self._connection.send("SubscribeAccounts", [])
+                self._connection.send("SubscribeOrders", [self._account_id])
+                self._connection.send("SubscribeTrades", [self._account_id])
+                self._connection.send("SubscribePositions", [self._account_id])
+            self._started = True
+            log.info("user_hub_mux_started", account_id=self._account_id)
+
+    async def subscribe(self) -> AsyncIterator[dict]:
+        await self._ensure_started()
+        my_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._consumers.append(my_queue)
+        log.info("user_mux_subscriber_added", total_consumers=len(self._consumers))
+        try:
+            while True:
+                yield await my_queue.get()
+        finally:
+            with contextlib.suppress(ValueError):
+                self._consumers.remove(my_queue)
+
+    def stop(self) -> None:
+        if self._connection is not None and self._started:
+            with contextlib.suppress(Exception):
+                self._connection.stop()
+            self._started = False

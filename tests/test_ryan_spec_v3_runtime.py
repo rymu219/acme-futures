@@ -132,7 +132,7 @@ async def test_fill_matches_via_custom_tag_when_order_id_missing():
 
     await runtime._process_user_event({
         "kind": "fill",
-        "payload": {"customTag": "ryan_spec_v3:42:in", "price": 4999.75},
+        "payload": {"customTag": "v3-canon:42:in", "price": 4999.75},
     })
 
     db = runtime.db
@@ -433,7 +433,7 @@ async def test_exit_fill_matches_via_custom_tag():
 
     await runtime._process_user_event({
         "kind": "fill",
-        "payload": {"customTag": "ryan_spec_v3:42:out", "price": 5004.0},
+        "payload": {"customTag": "v3-canon:42:out", "price": 5004.0},
     })
 
     row_id, fields = runtime.db.updates[0]  # type: ignore[attr-defined]
@@ -508,7 +508,7 @@ async def test_close_submits_tagged_opposite_order_and_registers_pending_exit():
     submitted = runtime.broker.submitted_orders  # type: ignore[attr-defined]
     assert len(submitted) == 1
     assert submitted[0]["side"] == "sell"
-    assert submitted[0]["tag"] == "ryan_spec_v3:42:out"
+    assert submitted[0]["tag"] == "v3-canon:42:out"
 
     # Pending exit registered for fill reconciliation
     assert len(runtime._pending_exit_fills) == 1
@@ -531,7 +531,7 @@ async def test_close_short_position_submits_buy_order():
 
     submitted = runtime.broker.submitted_orders  # type: ignore[attr-defined]
     assert submitted[0]["side"] == "buy"
-    assert submitted[0]["tag"] == "ryan_spec_v3:43:out"
+    assert submitted[0]["tag"] == "v3-canon:43:out"
     pending = next(iter(runtime._pending_exit_fills.values()))
     assert pending.sign == -1
 

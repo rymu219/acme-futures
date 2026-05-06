@@ -31,6 +31,7 @@ from acme.ryan_spec.v3_tick_delta import CT
 Direction = Literal["long", "short"]
 Action = Literal["enter", "exit", "none"]
 ExitReason = Literal["stop", "opposite_signal", "session_end", "time_stop"]
+FilterMode = Literal["static", "pctile"]
 
 # OOS-v3 brief constants (do not modify without re-validating)
 BB_PERIOD = 20
@@ -41,6 +42,11 @@ TIME_STOP_BARS = 60
 SESSION_END_CT = dtime(14, 50)
 SESSION_OPEN_CT = dtime(8, 30)
 HISTORY_BUFFER = 25  # need at least 21 (BB + 1 prior bar)
+
+# Percentile-filter defaults (for filter_mode="pctile")
+DEFAULT_PCTILE_WINDOW_BARS = 60         # 2 hours of recent flow
+DEFAULT_PCTILE = 5.0                    # bottom 5% for longs, top 5% for shorts
+MIN_PCTILE_SAMPLES = 30                 # need at least this many bars before pctile filter activates
 
 # Filter threshold defaults.
 # Two cum_delta sources are supported because ProjectX's stream_quotes only
@@ -78,6 +84,10 @@ class _Position:
     bars_held: int
     cum_delta_at_entry: int
     atr_at_entry: float
+    # Maximum favorable excursion in price points since entry. Ratchets
+    # forward only. Used by trail (option A) and armor (option C) variants
+    # and surfaced via the `mfe_points` property for runtime inspection.
+    max_favorable_excursion: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,32 @@ class RyanSpecV3Engine:
         session_end_ct: dtime = SESSION_END_CT,
         session_tz: tzinfo = CT,
         filter_thresh: int = FILTER_THRESH,
+        # --- variant flags (all default to canonical OOS-validated behavior) ---
+        # A. Trailing stop / let-winners-run.
+        # When enabled: track MFE; once MFE >= trail_be_lock_atr_mult × ATR,
+        # ratchet stop to break-even; once MFE >= 2 × ATR, trail at trail_atr_mult
+        # × ATR behind MFE high-water-mark. Ratchet is monotone (never loosens).
+        enable_trailing_stop: bool = False,
+        trail_be_lock_atr_mult: float = 1.0,
+        trail_atr_mult: float = 1.0,
+        # B. Minimum bars before opposite_signal exit.
+        # When > 0: opposite_signal exits are suppressed until pos.bars_held
+        # crosses this floor. Stop / session_end / time_stop still fire normally.
+        min_bars_before_opposite_exit: int = 0,
+        # C. Opposite-signal armor when deeply profitable.
+        # When set: once MFE >= armor × ATR, suppress opposite_signal exits.
+        # Stop / session_end / time_stop still fire. Lets the move develop
+        # past the first reversal candle.
+        opposite_signal_armor_mfe_atr: float | None = None,
+        # D. Percentile-based entry filter.
+        # When mode="pctile": use the X-th percentile of recent cum_delta
+        # values (window = filter_pctile_window_bars) as the dynamic threshold,
+        # instead of the static filter_thresh constant. Adapts to the current
+        # session's flow regime — useful when live cum_delta values are far
+        # outside the static threshold's calibration range.
+        filter_mode: FilterMode = "static",
+        filter_pctile_window_bars: int = DEFAULT_PCTILE_WINDOW_BARS,
+        filter_pctile: float = DEFAULT_PCTILE,
     ) -> None:
         self._bb = Bollinger(period=bb_period, num_std=bb_std)
         self._atr = ATR(period=atr_period)
@@ -123,6 +159,16 @@ class RyanSpecV3Engine:
         self._session_end_ct = session_end_ct
         self._session_tz = session_tz
         self._filter_thresh = filter_thresh
+        # variant flags
+        self._enable_trailing_stop = enable_trailing_stop
+        self._trail_be_lock_atr_mult = trail_be_lock_atr_mult
+        self._trail_atr_mult = trail_atr_mult
+        self._min_bars_before_opposite_exit = min_bars_before_opposite_exit
+        self._opposite_signal_armor_mfe_atr = opposite_signal_armor_mfe_atr
+        self._filter_mode: FilterMode = filter_mode
+        self._filter_pctile = filter_pctile
+        # cum_delta history for percentile filter (independent of _history maxlen)
+        self._cum_delta_history: deque[int] = deque(maxlen=filter_pctile_window_bars)
 
     @property
     def in_position(self) -> bool:
@@ -161,6 +207,10 @@ class RyanSpecV3Engine:
         """
         bb_out = self._bb.update(bar.c)
         atr_val = self._atr.update(bar)
+
+        # Always track cum_delta history (independent of warmup) so the
+        # pctile filter has enough samples once it's needed.
+        self._cum_delta_history.append(cum_delta_session)
 
         # If indicators not yet warm, hold any position by default but skip
         # entries (matches OOS — only fires when indicators are warm).
@@ -214,6 +264,36 @@ class RyanSpecV3Engine:
         pos = self._position
         pos.bars_held += 1
 
+        # Update MFE from the bar's intra-bar extreme (used by trail + armor)
+        sign = 1 if pos.direction == "long" else -1
+        bar_mfe_pts = (bar.h - pos.entry_fill) if pos.direction == "long" \
+                      else (pos.entry_fill - bar.l)
+        pos.max_favorable_excursion = max(
+            pos.max_favorable_excursion, bar_mfe_pts
+        )
+
+        # Trailing-stop ratchet (option A). Monotone — never loosens.
+        # Applied BEFORE the stop check so the new stop applies this bar
+        # if the bar's low/high pierces it. Worst case: ratchet to BE on
+        # a bar that promptly retraces to entry → exit "stop" at entry.
+        if self._enable_trailing_stop and pos.atr_at_entry > 0:
+            mfe_atr = pos.max_favorable_excursion / pos.atr_at_entry
+            if mfe_atr >= self._trail_be_lock_atr_mult:
+                be_stop = pos.entry_fill
+                if pos.direction == "long":
+                    pos.stop_price = max(pos.stop_price, be_stop)
+                else:
+                    pos.stop_price = min(pos.stop_price, be_stop)
+            if mfe_atr >= 2.0:
+                trail_offset = self._trail_atr_mult * pos.atr_at_entry
+                # high-water = entry + MFE in the favorable direction
+                hw = pos.entry_fill + sign * pos.max_favorable_excursion
+                trail_stop = hw - sign * trail_offset
+                if pos.direction == "long":
+                    pos.stop_price = max(pos.stop_price, trail_stop)
+                else:
+                    pos.stop_price = min(pos.stop_price, trail_stop)
+
         # 1) Stop check on intra-bar low/high
         stop_hit = (
             bar.l <= pos.stop_price if pos.direction == "long"
@@ -232,7 +312,17 @@ class RyanSpecV3Engine:
         # 3) Opposite-direction trigger fired this bar?
         opp = self._opposite_direction_triggered_this_bar()
         if opp is not None and opp != pos.direction:
-            return Decision(action="exit", reason="opposite_signal", bar_ts=bar.t)
+            # B. Suppress before min bars threshold OR
+            # C. Suppress when deeply profitable (MFE >= armor × ATR)
+            armored = (
+                self._opposite_signal_armor_mfe_atr is not None
+                and pos.atr_at_entry > 0
+                and (pos.max_favorable_excursion / pos.atr_at_entry)
+                    >= self._opposite_signal_armor_mfe_atr
+            )
+            too_early = pos.bars_held < self._min_bars_before_opposite_exit
+            if not (too_early or armored):
+                return Decision(action="exit", reason="opposite_signal", bar_ts=bar.t)
 
         # 4) Time stop
         if pos.bars_held >= self._time_stop_bars:
@@ -266,11 +356,40 @@ class RyanSpecV3Engine:
         sign = 1 if long_trig else -1
         cum_delta_in_dir = current.cum_delta * sign
 
-        # The validated filter
-        if cum_delta_in_dir >= self._filter_thresh:
-            return Decision(action="none",
-                            reason=f"filter_blocked cum_delta_in_dir={cum_delta_in_dir}",
-                            bar_ts=state.bar.t)
+        # The entry filter — static (OOS-validated -670/-2000) or pctile (D).
+        if self._filter_mode == "pctile":
+            # Need enough samples in the rolling window before the pctile
+            # threshold is meaningful; until then, fall back to the static
+            # filter so we don't enter on garbage during early bars.
+            if len(self._cum_delta_history) >= MIN_PCTILE_SAMPLES:
+                threshold = self._compute_pctile_threshold(direction)
+                if direction == "long":
+                    blocked = current.cum_delta >= threshold
+                else:
+                    blocked = current.cum_delta <= threshold
+                if blocked:
+                    return Decision(
+                        action="none",
+                        reason=(f"filter_blocked_pctile cum_delta={current.cum_delta} "
+                                f"threshold={threshold:.0f} pctile={self._filter_pctile}"),
+                        bar_ts=state.bar.t,
+                    )
+            else:
+                # Insufficient pctile samples — fall back to static filter
+                if cum_delta_in_dir >= self._filter_thresh:
+                    return Decision(
+                        action="none",
+                        reason=(f"filter_blocked_static_fallback "
+                                f"cum_delta_in_dir={cum_delta_in_dir}"),
+                        bar_ts=state.bar.t,
+                    )
+        else:  # static
+            if cum_delta_in_dir >= self._filter_thresh:
+                return Decision(
+                    action="none",
+                    reason=f"filter_blocked cum_delta_in_dir={cum_delta_in_dir}",
+                    bar_ts=state.bar.t,
+                )
 
         # All checks pass — recommend market entry at the close
         return Decision(
@@ -283,6 +402,24 @@ class RyanSpecV3Engine:
             cum_delta_at_entry=current.cum_delta,
             atr_at_entry=state.atr,
         )
+
+    def _compute_pctile_threshold(self, direction: Direction) -> float:
+        """Compute the percentile-based filter threshold for the given entry
+        direction from the current cum_delta history window.
+
+        Long entries fire when cum_delta < (low pctile, e.g. 5th percentile).
+        Short entries fire when cum_delta > (high pctile, e.g. 95th percentile).
+        Returns the threshold value. Caller compares cum_delta to it.
+        """
+        sorted_cd = sorted(self._cum_delta_history)
+        n = len(sorted_cd)
+        if direction == "long":
+            # Bottom X percentile — index = (X/100) * n
+            idx = max(0, min(n - 1, int(round(self._filter_pctile / 100.0 * (n - 1)))))
+        else:
+            # Top X percentile — index = ((100-X)/100) * n
+            idx = max(0, min(n - 1, int(round((100.0 - self._filter_pctile) / 100.0 * (n - 1)))))
+        return float(sorted_cd[idx])
 
     def _opposite_direction_triggered_this_bar(self) -> Direction | None:
         """Did the most-recent bar fire a universal two-bar reversal trigger?

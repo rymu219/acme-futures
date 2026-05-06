@@ -75,12 +75,14 @@ def _topstep_trading_date(now_ct: datetime) -> date:
     return now_ct.date() if now_ct.hour < 17 else (now_ct.date() + timedelta(days=1))
 
 
-def _fetch_trades(sb, *, mode: str, since_iso: str, limit: int = 1000) -> list[dict]:
+def _fetch_trades(sb, *, mode: str, strategy_id: str, since_iso: str,
+                  limit: int = 1000) -> list[dict]:
     try:
         res = (
             sb.table("ryan_spec_v3_trades")
             .select("*")
             .eq("mode", mode)
+            .eq("strategy_id", strategy_id)
             .gte("bar_ts", since_iso)
             .order("bar_ts", desc=True)
             .limit(limit)
@@ -91,12 +93,13 @@ def _fetch_trades(sb, *, mode: str, since_iso: str, limit: int = 1000) -> list[d
         return []
 
 
-def _fetch_open(sb, *, mode: str) -> dict | None:
+def _fetch_open(sb, *, mode: str, strategy_id: str) -> dict | None:
     try:
         res = (
             sb.table("ryan_spec_v3_trades")
             .select("*")
             .eq("mode", mode)
+            .eq("strategy_id", strategy_id)
             .is_("exit_ts", "null")
             .not_.is_("entry_ts", "null")
             .order("entry_ts", desc=True)
@@ -107,6 +110,31 @@ def _fetch_open(sb, *, mode: str) -> dict | None:
         return rows[0] if rows else None
     except Exception:
         return None
+
+
+def _fetch_strategy_summaries(sb, *, mode: str, since_iso: str) -> list[dict]:
+    """For the multi-variant nav: pull today's P&L per strategy_id so the
+    nav buttons can show each variant's running total at a glance."""
+    try:
+        res = (
+            sb.table("ryan_spec_v3_trades")
+            .select("strategy_id,pnl_dollars,exit_reason")
+            .eq("mode", mode)
+            .gte("bar_ts", since_iso)
+            .limit(20_000)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:
+        return []
+    by_strat: dict[str, dict] = {}
+    for r in rows:
+        sid = r.get("strategy_id") or "?"
+        bucket = by_strat.setdefault(sid, {"strategy_id": sid, "n": 0, "total": 0.0})
+        if r.get("exit_reason"):
+            bucket["n"] += 1
+            bucket["total"] += r.get("pnl_dollars") or 0.0
+    return sorted(by_strat.values(), key=lambda b: b["strategy_id"])
 
 
 def _settled_metrics(rows: list[dict]) -> dict:
@@ -150,15 +178,67 @@ def _exit_dist_pill_html(exit_dist: dict[str, float]) -> str:
     return "  ·  ".join(parts)
 
 
-def render(sb, *, mode: str = "paper", token: str | None = None) -> str:
+KNOWN_VARIANTS = ("v3-canon", "v3-trail", "v3-min2bar", "v3-armor", "v3-pctile")
+
+
+def _variant_nav_html(summaries: list[dict], *, current: str,
+                      token: str | None, mode: str) -> str:
+    """Render a horizontal pill nav listing each variant + its 24h P&L,
+    with the active one styled distinctly."""
+    by_id = {s["strategy_id"]: s for s in summaries}
+    parts = []
+    for sid in KNOWN_VARIANTS:
+        s = by_id.get(sid, {"n": 0, "total": 0.0})
+        active = sid == current
+        total = s["total"]
+        n = s["n"]
+        # Color: green if positive, red if negative, gray if zero/no trades
+        if total > 0.005:
+            tcolor = "#16a34a"
+        elif total < -0.005:
+            tcolor = "#dc2626"
+        else:
+            tcolor = "#94a3b8"
+        bg = "#0f172a" if active else "#020617"
+        border = "#38bdf8" if active else "#1e293b"
+        weight = "700" if active else "500"
+        text = "#e2e8f0" if active else "#94a3b8"
+        params = []
+        if token:
+            params.append(f"token={token}")
+        if mode != "paper":
+            params.append(f"mode={mode}")
+        params.append(f"strategy_id={sid}")
+        href = f"/ryan-spec-v3?{'&'.join(params)}"
+        parts.append(
+            f'<a href="{href}" style="text-decoration:none">'
+            f'<span class="meta-pill" style="background:{bg};border:1px solid {border};'
+            f'color:{text};font-weight:{weight}">'
+            f'{sid}'
+            f' <span style="color:{tcolor}" class="mono">{_money(total)}</span>'
+            f' <span class="dim">({n})</span>'
+            f'</span></a>'
+        )
+    return "".join(parts)
+
+
+def render(sb, *, mode: str = "paper", token: str | None = None,
+           strategy_id: str = "v3-canon") -> str:
     now_ct = datetime.now(CT)
     now_utc = datetime.now(UTC)
     # Show last 7 days of paper trades
     since = (now_utc - timedelta(days=7)).isoformat()
 
-    rows = _fetch_trades(sb, mode=mode, since_iso=since, limit=2000)
+    rows = _fetch_trades(sb, mode=mode, strategy_id=strategy_id,
+                         since_iso=since, limit=2000)
     settled = _settled_metrics(rows)
-    open_pos = _fetch_open(sb, mode=mode)
+    open_pos = _fetch_open(sb, mode=mode, strategy_id=strategy_id)
+    # Multi-variant nav data — yesterday-onward window so each strategy's
+    # daily total is comparable.
+    nav_summaries = _fetch_strategy_summaries(
+        sb, mode=mode,
+        since_iso=(now_utc - timedelta(days=1)).isoformat(),
+    )
 
     # Today's metrics (in CT)
     today_ct_date = now_ct.date()
@@ -375,6 +455,12 @@ def render(sb, *, mode: str = "paper", token: str | None = None) -> str:
 
   <div class="breadcrumb">
     <a href="/{('?token=' + token) if token else ''}">&larr; Fleet</a>
+    <span style="margin:0 8px;color:#475569">·</span>
+    <strong style="color:#e2e8f0">{strategy_id}</strong>
+  </div>
+
+  <div class="statusrow" style="border-bottom:1px solid #1e293b;padding-bottom:10px;margin-bottom:8px">
+    {_variant_nav_html(nav_summaries, current=strategy_id, token=token, mode=mode)}
   </div>
 
   <div class="statusrow">
