@@ -562,6 +562,64 @@ async def test_close_then_exit_fill_overrides_provisional_pnl():
     assert pending.row_id == 42  # sanity
 
 
+# --- MFE/MAE capture on close -------------------------------------------
+
+async def test_close_writes_mfe_atr_and_mae_atr_from_engine():
+    """When a position closes, V3Runtime reads MFE/MAE off engine.position
+    (in price points), divides by atr_at_entry, and writes the resulting
+    ATR-units values to the DB row alongside the other exit fields.
+    """
+    runtime = _runtime()
+    runtime._contract_id = "CON.X"
+    _seed_open(runtime, row_id=42, direction="long", modeled=5000.00)
+    # Force the engine into a position state with explicit MFE/MAE values.
+    # We'll bypass the bar-driven update and just plant the values directly.
+    from datetime import datetime as _dt
+
+    from acme.ryan_spec.v3_engine import _Position
+    runtime.engine._position = _Position(
+        direction="long",
+        entry_ts=_dt.now(UTC),
+        entry_fill=5000.0,
+        stop_price=4995.0,
+        bars_held=3,
+        cum_delta_at_entry=-2500,
+        atr_at_entry=2.0,
+        max_favorable_excursion=5.0,   # 2.5 ATR
+        max_adverse_excursion=3.0,     # 1.5 ATR
+    )
+
+    await runtime._close(_decision_exit(), _bar_with_delta(close=5004.0))
+
+    # The exit-row update should include mfe_atr and mae_atr in ATR units
+    db = runtime.db
+    row_id, fields = db.updates[0]  # type: ignore[attr-defined]
+    assert row_id == 42
+    assert fields["mfe_atr"] == 2.5
+    assert fields["mae_atr"] == 1.5
+    # Sanity: other exit fields still present
+    assert "exit_ts" in fields
+    assert "exit_reason" in fields
+
+
+async def test_close_skips_mfe_mae_when_engine_has_no_position():
+    """If engine.position is None at close-time (race or already-closed),
+    the runtime still writes the provisional exit row but omits mfe_atr/mae_atr
+    rather than crashing or writing zeros."""
+    runtime = _runtime()
+    runtime._contract_id = "CON.X"
+    _seed_open(runtime, row_id=42, direction="long", modeled=5000.00)
+    runtime.engine._position = None  # simulate engine already-closed race
+
+    await runtime._close(_decision_exit(), _bar_with_delta(close=5004.0))
+
+    db = runtime.db
+    row_id, fields = db.updates[0]  # type: ignore[attr-defined]
+    assert row_id == 42
+    assert "mfe_atr" not in fields
+    assert "mae_atr" not in fields
+
+
 # --- _parse_hhmm helper -------------------------------------------------
 
 def test_parse_hhmm_colon_form():

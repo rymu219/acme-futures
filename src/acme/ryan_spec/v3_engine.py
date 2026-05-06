@@ -88,6 +88,11 @@ class _Position:
     # forward only. Used by trail (option A) and armor (option C) variants
     # and surfaced via the `mfe_points` property for runtime inspection.
     max_favorable_excursion: float = 0.0
+    # Maximum adverse excursion in price points since entry. Ratchets
+    # forward only. Long: how far below entry price went. Short: mirror.
+    # Persisted on the trade row at close so the give-back / drawdown
+    # analyses can run forward-going without backfill from cached bars.
+    max_adverse_excursion: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -264,12 +269,21 @@ class RyanSpecV3Engine:
         pos = self._position
         pos.bars_held += 1
 
-        # Update MFE from the bar's intra-bar extreme (used by trail + armor)
+        # Update MFE / MAE from the bar's intra-bar extremes.
+        # Long: MFE = how high above entry; MAE = how far below.
+        # Short: mirror. Both ratchet forward — never decrease.
         sign = 1 if pos.direction == "long" else -1
-        bar_mfe_pts = (bar.h - pos.entry_fill) if pos.direction == "long" \
-                      else (pos.entry_fill - bar.l)
+        if pos.direction == "long":
+            bar_mfe_pts = bar.h - pos.entry_fill
+            bar_mae_pts = pos.entry_fill - bar.l
+        else:
+            bar_mfe_pts = pos.entry_fill - bar.l
+            bar_mae_pts = bar.h - pos.entry_fill
         pos.max_favorable_excursion = max(
             pos.max_favorable_excursion, bar_mfe_pts
+        )
+        pos.max_adverse_excursion = max(
+            pos.max_adverse_excursion, bar_mae_pts
         )
 
         # Trailing-stop ratchet (option A). Monotone — never loosens.

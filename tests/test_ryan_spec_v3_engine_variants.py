@@ -260,6 +260,57 @@ def test_pctile_filter_uses_percentile_when_warm():
     assert "filter_blocked" in d.reason
 
 
+# --- MFE / MAE tracking (always-on observability, not a variant) ---------
+
+def test_mfe_and_mae_both_ratchet_independently():
+    """MFE tracks the highest favourable price excursion; MAE tracks the
+    worst adverse. Both move forward only — never decrease."""
+    e = RyanSpecV3Engine()
+    t = _flat_warmup(e)
+    t, atr = _open_long(e, t)
+    entry = e.position.entry_fill
+    # Bar 1: bar swings both ways (high above entry, low below)
+    t += timedelta(minutes=2)
+    e.on_bar(_bar(t, o=entry + 0.5, h=entry + 5.0, l=entry - 3.0,
+                  c=entry + 1.0),
+             bar_delta=0, cum_delta_session=-2600)
+    assert e.position.max_favorable_excursion == 5.0
+    assert e.position.max_adverse_excursion == 3.0
+    # Bar 2: more adverse, less favourable — MAE grows, MFE holds
+    t += timedelta(minutes=2)
+    e.on_bar(_bar(t, o=entry + 1.0, h=entry + 2.0, l=entry - 4.5,
+                  c=entry - 2.0),
+             bar_delta=0, cum_delta_session=-2700)
+    assert e.position.max_favorable_excursion == 5.0  # holds
+    assert e.position.max_adverse_excursion == 4.5    # ratcheted up
+
+
+def test_mae_uses_correct_direction_for_short():
+    """For shorts, MAE is the highest the bar high reached above entry
+    (price went against us = up); MFE is the lowest the bar low reached."""
+    # Build a clean SHORT position. Use the short trigger setup.
+    e = RyanSpecV3Engine()
+    t = _flat_warmup(e)
+    # Prior bar UP, current bar DOWN with close < prior close — short trigger
+    e.on_bar(_bar(t, o=5000.0, h=5001.5, l=4999.5, c=5001.0),
+             bar_delta=200, cum_delta_session=2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=5001.0, h=5001.5, l=4998.5, c=4999.5),
+                 bar_delta=100, cum_delta_session=2600)
+    assert d.action == "enter" and d.direction == "short"
+    e.open_position(direction="short", entry_ts=d.bar_ts,
+                    entry_fill_price=d.entry_price,
+                    atr_at_entry=d.atr_at_entry,
+                    cum_delta_at_entry=d.cum_delta_at_entry)
+    entry = e.position.entry_fill
+    # Bar: high goes 4 above entry (adverse for short), low goes 2 below (favourable)
+    t += timedelta(minutes=2)
+    e.on_bar(_bar(t, o=entry, h=entry + 4.0, l=entry - 2.0, c=entry - 1.0),
+             bar_delta=0, cum_delta_session=2700)
+    assert e.position.max_favorable_excursion == 2.0  # price went 2 below entry
+    assert e.position.max_adverse_excursion == 4.0    # price went 4 above entry
+
+
 def test_pctile_filter_passes_when_cum_delta_is_extreme_relative_to_recent():
     """A long entry should fire when current cum_delta is far below the
     bottom-pctile of recent values, even though it's not extreme by static
