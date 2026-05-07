@@ -10,6 +10,7 @@ Mounted at /ryan-spec-v3?token=...
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -224,12 +225,54 @@ def _fetch_strategy_summaries(sb, *, mode: str, since_iso: str) -> list[dict]:
     return sorted(by_strat.values(), key=lambda b: b["strategy_id"])
 
 
+def _max_drawdown(rows_chrono: list[dict]) -> float:
+    """Largest peak-to-trough dip in cumulative P&L over the given (chronologically
+    ordered) settled rows. Returns a non-negative number; 0 means no drawdown
+    (monotonically rising or insufficient data)."""
+    cum = 0.0
+    peak = 0.0
+    mdd = 0.0
+    for r in rows_chrono:
+        cum += r.get("pnl_dollars") or 0.0
+        if cum > peak:
+            peak = cum
+        dip = peak - cum
+        if dip > mdd:
+            mdd = dip
+    return mdd
+
+
+def _daily_cum_pnl(rows: list[dict]) -> list[tuple[str, float]]:
+    """Return [(YYYY-MM-DD, cumulative_pnl)] in chronological order.
+    Used to power the panel sparkline. Days with no settled trades are skipped
+    (the sparkline is point-to-point, not gap-filled)."""
+    by_day: dict[str, float] = {}
+    for r in rows:
+        if not r.get("exit_reason"):
+            continue
+        bar_ts = r.get("bar_ts") or ""
+        try:
+            d = datetime.fromisoformat(bar_ts.replace("Z", "+00:00")) \
+                    .astimezone(CT).date().isoformat()
+        except Exception:
+            continue
+        by_day[d] = by_day.get(d, 0.0) + (r.get("pnl_dollars") or 0.0)
+    days = sorted(by_day.keys())
+    out: list[tuple[str, float]] = []
+    cum = 0.0
+    for d in days:
+        cum += by_day[d]
+        out.append((d, cum))
+    return out
+
+
 def _settled_metrics(rows: list[dict]) -> dict:
     settled = [r for r in rows if r.get("exit_reason")]
     n = len(settled)
     if n == 0:
         return {"n": 0, "wins": 0, "losses": 0, "wr": 0.0, "pf": None,
-                "exp": 0.0, "total": 0.0, "exit_dist": {}}
+                "exp": 0.0, "total": 0.0, "mdd": 0.0, "exit_dist": {},
+                "daily_cum": []}
     wins = sum(1 for r in settled if (r.get("pnl_dollars") or 0) > 0)
     losses = sum(1 for r in settled if (r.get("pnl_dollars") or 0) < 0)
     wr = wins / n * 100
@@ -238,6 +281,12 @@ def _settled_metrics(rows: list[dict]) -> dict:
     pf = (gw / gl) if gl > 0 else None
     total = sum((r.get("pnl_dollars") or 0) for r in settled)
     exp = total / n
+    # MDD: the worst peak-to-trough run over the window. Trades are
+    # supplied DESC by callers, so reverse for chronological accumulation.
+    chrono = sorted(settled, key=lambda r: r.get("bar_ts") or "")
+    mdd = _max_drawdown(chrono)
+    # Per-day cumulative P&L feeds the panel sparkline.
+    daily_cum = _daily_cum_pnl(chrono)
     # Exit distribution
     counts: dict[str, int] = {}
     for r in settled:
@@ -245,7 +294,8 @@ def _settled_metrics(rows: list[dict]) -> dict:
         counts[k] = counts.get(k, 0) + 1
     exit_dist = {k: v / n for k, v in counts.items()}
     return {"n": n, "wins": wins, "losses": losses, "wr": wr, "pf": pf,
-            "exp": exp, "total": total, "exit_dist": exit_dist}
+            "exp": exp, "total": total, "mdd": mdd, "exit_dist": exit_dist,
+            "daily_cum": daily_cum}
 
 
 def _exit_dist_pill_html(exit_dist: dict[str, float]) -> str:
@@ -278,9 +328,125 @@ GATE_MIN_OPPOSITE_PCT = 0.40
 
 VERDICT_COLORS = {
     "PROMOTE_LIVE": "#16a34a",
-    "EXTEND_PAPER": "#94a3b8",
+    "EXTEND_PAPER": "#22c55e",
     "INVESTIGATE":  "#eab308",
     "HALT":         "#dc2626",
+}
+
+# Datestamps inside `manual_cleanup_YYYY_MM_DD[_suffix]` exit reasons add noise to
+# the trades table. Render the date out and keep the meaningful suffix
+# (e.g. `manual_cleanup_2026_05_06_signalr_drop` → `signalr_drop`).
+_MANUAL_CLEANUP_RE = re.compile(r"^manual_cleanup_\d{4}_\d{2}_\d{2}(?:_(.+))?$")
+
+
+def _short_reason(reason: str | None) -> str:
+    """Compact display label for an exit_reason. Full string is preserved
+    elsewhere for hover tooltips so nothing is lost."""
+    if not reason:
+        return ""
+    m = _MANUAL_CLEANUP_RE.match(reason)
+    if m:
+        return m.group(1) or "manual_cleanup"
+    return reason
+
+
+def _sparkline_svg(daily_cum: list[tuple[str, float]],
+                   *, color: str, width: int = 120, height: int = 28) -> str:
+    """Inline SVG sparkline of daily cumulative P&L. Empty if <2 points
+    so we don't render a single dot or a meaningless flat line."""
+    if not daily_cum or len(daily_cum) < 2:
+        return ""
+    ys = [v for _, v in daily_cum]
+    y_min = min(ys + [0.0])
+    y_max = max(ys + [0.0])
+    y_range = max(y_max - y_min, 0.01)
+    n = len(daily_cum)
+    pad = 2
+    inner_w = width - 2 * pad
+    inner_h = height - 2 * pad
+
+    def _xy(i: int, y: float) -> tuple[float, float]:
+        x = pad + (i / (n - 1)) * inner_w
+        # Flip y because SVG y grows downward.
+        ny = pad + inner_h - ((y - y_min) / y_range) * inner_h
+        return x, ny
+
+    points = [_xy(i, v) for i, v in enumerate(ys)]
+    line_d = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y in points)
+    # Close the path down to the bottom edge to fill the area below the line.
+    last_x = points[-1][0]
+    first_x = points[0][0]
+    bottom = pad + inner_h
+    area_d = line_d + f" L {last_x:.1f} {bottom:.1f} L {first_x:.1f} {bottom:.1f} Z"
+    # Zero baseline (only meaningful if the series straddles 0).
+    zero_line = ""
+    if y_min < 0 < y_max:
+        _, zero_y = _xy(0, 0.0)
+        zero_line = (f'<line class="zero" x1="{pad}" y1="{zero_y:.1f}" '
+                     f'x2="{pad + inner_w:.1f}" y2="{zero_y:.1f}"/>')
+    return (
+        f'<svg class="sparkline" viewBox="0 0 {width} {height}" '
+        f'preserveAspectRatio="none" aria-hidden="true">'
+        f'<path class="area" d="{area_d}" fill="{color}"/>'
+        f'<path class="line" d="{line_d}" stroke="{color}"/>'
+        f'{zero_line}'
+        f'</svg>'
+    )
+
+
+def _gate_progress_html(current: int, target: int, color: str) -> str:
+    """Compact progress bar: filled track + N/target label. Used to make the
+    bare `83/200` text on each panel an at-a-glance promotion-gate progress
+    indicator."""
+    pct = max(0.0, min(1.0, current / target if target > 0 else 0.0))
+    return (
+        f'<span class="gate-bar" title="{current}/{target} settled trades '
+        f'toward promotion gate">'
+        f'<span class="track"><span class="fill" '
+        f'style="width:{pct*100:.0f}%;background:{color}"></span></span>'
+        f'<span class="label">{current}/{target}</span>'
+        f'</span>'
+    )
+
+
+def _cluster_trades(rows: list[dict]) -> list[dict]:
+    """Group rows that share (bar_ts, direction, entry_price, exit_reason).
+    Returns a list of clusters; clusters with len==1 are still wrapped (the
+    caller decides whether to flatten). Order preserved from input."""
+    clusters: list[dict] = []
+    by_key: dict[tuple, dict] = {}
+    for r in rows:
+        key = (
+            r.get("bar_ts"),
+            r.get("direction"),
+            r.get("entry_price"),
+            r.get("exit_price"),
+            r.get("exit_reason"),
+        )
+        c = by_key.get(key)
+        if c is None:
+            c = {"key": key, "rows": []}
+            by_key[key] = c
+            clusters.append(c)
+        c["rows"].append(r)
+    return clusters
+
+
+VERDICT_TOOLTIPS = {
+    "PROMOTE_LIVE": "All gates pass — variant is ready to promote from paper to live.",
+    "EXTEND_PAPER": (
+        "Variant is performing well, but hasn't yet hit the minimum settled-trade "
+        f"threshold ({GATE_MIN_SETTLED}). Paper-trading continues until it does."
+    ),
+    "INVESTIGATE": (
+        "Variant has enough trades, but the exit-reason mix is off "
+        f"(opposite-signal share < {int(GATE_MIN_OPPOSITE_PCT*100)}%). "
+        "Manual review before promotion."
+    ),
+    "HALT": (
+        f"Gate failed — profit factor below {GATE_MIN_PF} or slippage above "
+        f"{GATE_MAX_AVG_SLIPPAGE_TICKS} ticks. Stop trading this variant."
+    ),
 }
 
 
@@ -324,11 +490,12 @@ def _compute_verdict_pure(rows: list[dict]) -> dict:
 
 
 def _fetch_all_paper_for_gate(sb, *, since_iso: str) -> list[dict]:
-    """All paper trades across strategies for the gate window."""
+    """All paper trades across strategies for the gate window. Selects bar_ts
+    too so callers can compute fleet-wide chronological metrics (MDD)."""
     try:
         res = (
             sb.table("ryan_spec_v3_trades")
-            .select("strategy_id,exit_reason,pnl_dollars,slippage_ticks")
+            .select("strategy_id,exit_reason,pnl_dollars,slippage_ticks,bar_ts")
             .eq("mode", "paper")
             .gte("bar_ts", since_iso)
             .limit(20_000)
@@ -447,26 +614,58 @@ _SHARED_CSS = """
   .card .meta { font-size: 11px; color: var(--dim-2); margin-top: 4px;
                  font-family: ui-monospace, SF Mono, Menlo, monospace; }
 
+  /* `overflow: clip` clips visually like hidden but does NOT establish a
+     scroll container, so position:sticky on the inner thead still works. */
   .events { background: var(--bg-1); border: 1px solid var(--border);
-             border-radius: 14px; overflow: hidden; }
+             border-radius: 14px; overflow: clip; }
   .events-header { padding: 10px 14px; border-bottom: 1px solid var(--border);
                     font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase;
                     color: var(--dim); font-weight: 600;
                     display:flex; justify-content:space-between; align-items:center; gap: 16px; }
   .events-header .right { font-size: 11px; letter-spacing: 0.4px;
                            text-transform: none; color: var(--dim-2); }
-  table { width:100%; border-collapse: collapse; }
+  /* `separate + border-spacing:0` looks identical to `border-collapse:collapse`
+     but unlocks position:sticky on <thead> in Chrome. */
+  table { width:100%; border-collapse: separate; border-spacing: 0; }
   th, td { padding: 10px 14px; text-align: left;
             border-bottom: 1px solid var(--border); font-size: 13px; }
-  th { background: rgba(255,255,255,0.02); color: var(--dim-2);
+  thead { position: sticky; top: 0; z-index: 1; }
+  th { background: var(--bg-1); color: var(--dim-2);
         text-transform: uppercase; font-size: 10.5px; letter-spacing: 1.2px;
-        font-weight: 600; }
+        font-weight: 600;
+        box-shadow: 0 1px 0 var(--border); }
   tbody tr:hover { background: rgba(255,255,255,0.025); }
   tr:last-child td { border-bottom: none; }
   .mono { font-family: ui-monospace, SF Mono, Menlo, monospace;
            font-variant-numeric: tabular-nums; }
   .dim { color: var(--dim-2); }
   .kind { font-weight: 600; font-size: 12px; letter-spacing: 0.3px; }
+  .help { border-bottom: 1px dotted var(--dim-2); cursor: help; }
+
+  /* Inline sparkline shown on each panel — area chart of cumulative pnl. */
+  .sparkline { display: block; height: 28px; width: 100%; margin: 6px 0 4px; }
+  .sparkline path.area { opacity: 0.18; }
+  .sparkline path.line { fill: none; stroke-width: 1.5; }
+  .sparkline line.zero { stroke: var(--dim-2); stroke-width: 0.5;
+                          stroke-dasharray: 2 2; opacity: 0.5; }
+
+  /* Promotion-gate progress bar: ▰▰▰▰▱▱▱▱ X/200 visualization. */
+  .gate-bar { display: inline-flex; align-items: center; gap: 6px;
+               font-family: ui-monospace, SF Mono, Menlo, monospace;
+               font-size: 11px; }
+  .gate-bar .track { display: inline-block; width: 64px; height: 6px;
+                      background: var(--bg-0); border: 1px solid var(--border);
+                      border-radius: 3px; overflow: hidden; vertical-align: middle; }
+  .gate-bar .fill { display: block; height: 100%; }
+  .gate-bar .label { color: var(--dim-2); font-size: 10.5px; }
+
+  /* Live position context inside a panel — entry / unrealized P&L. */
+  .pos-row { display: flex; justify-content: space-between;
+              font-size: 11px; color: var(--dim);
+              font-family: ui-monospace, SF Mono, Menlo, monospace;
+              margin-top: 4px; padding-top: 4px;
+              border-top: 1px dashed var(--border); }
+  .pos-row strong { color: var(--text); font-weight: 500; }
 
   /* Multi-variant overview grid + panels (added 2026-05-06) */
   .panels { display: grid; grid-template-columns: repeat(3, minmax(0,1fr));
@@ -505,6 +704,13 @@ _SHARED_CSS = """
 
   .footer { margin-top: 16px; color: var(--dim-2); font-size: 11px; text-align: center; }
 
+  /* Wide desktop: fit all 5 strategy panels in one row. The default 3-col
+     grid orphans the last two; a 5-col layout reads as a fleet at a glance. */
+  @media (min-width: 1200px) {
+    .wrap { max-width: 1500px; }
+    .stats { grid-template-columns: repeat(5, minmax(0,1fr)); }
+    .panels { grid-template-columns: repeat(5, minmax(0,1fr)); }
+  }
   @media (max-width: 880px) {
     .stats { grid-template-columns: repeat(2, minmax(0,1fr)); }
     .panels { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -512,7 +718,7 @@ _SHARED_CSS = """
   }
   @media (max-width: 520px) {
     .wrap { padding: 12px; padding-bottom: 28px; }
-    .stats { gap: 8px; }
+    .stats { grid-template-columns: 1fr; gap: 8px; }
     .panels { grid-template-columns: 1fr; gap: 10px; }
     .card { padding: 12px 14px; border-radius: 12px; }
     .card .value { font-size: 22px; }
@@ -595,9 +801,11 @@ def _pagination_html(*, page: int, total: int, page_size: int,
     )
 
 
-def _trade_row_html(r: dict, *, show_strategy: bool = False) -> str:
+def _trade_row_html(r: dict, *, show_strategy: bool = False,
+                    extra_class: str = "") -> str:
     """One <tr> for the trades table. Optionally includes a strategy_id col
-    (for the overview / mixed view)."""
+    (for the overview / mixed view) or an extra CSS class (for cluster
+    children rendered inside a <details> element)."""
     ts = _ct_str(r.get("bar_ts"))
     ago = _ago(r.get("bar_ts"))
     direction = (r.get("direction") or "").upper()
@@ -606,6 +814,8 @@ def _trade_row_html(r: dict, *, show_strategy: bool = False) -> str:
     exit_price = r.get("exit_price")
     exit_reason = r.get("exit_reason") or ""
     ex_color = EXIT_COLORS.get(exit_reason, "#e2e8f0") if exit_reason else "#94a3b8"
+    short = _short_reason(exit_reason) if exit_reason else "open"
+    reason_title = exit_reason if short != exit_reason else ""
     pnl = r.get("pnl_dollars")
     if pnl is None:
         pnl_str = '<span class="dim">—</span>'
@@ -619,15 +829,22 @@ def _trade_row_html(r: dict, *, show_strategy: bool = False) -> str:
         f"<td class='mono dim'>{r.get('strategy_id') or '—'}</td>"
         if show_strategy else ""
     )
+    tr_class = f' class="{extra_class}"' if extra_class else ""
+    reason_cell = (
+        f"<td><span class='kind' style='color:{ex_color}' "
+        f"title='{reason_title}'>{short}</span></td>"
+        if reason_title else
+        f"<td><span class='kind' style='color:{ex_color}'>{short}</span></td>"
+    )
     return (
-        "<tr>"
+        f"<tr{tr_class}>"
         f"{strat_cell}"
         f"<td class='mono'>{ts}</td>"
         f"<td class='dim mono col-ago'>{ago}</td>"
         f"<td><span class='kind' style='color:{dir_color}'>{direction}</span></td>"
         f"<td class='mono'>{_money(entry)}</td>"
         f"<td class='mono'>{_money(exit_price) if exit_price is not None else '—'}</td>"
-        f"<td><span class='kind' style='color:{ex_color}'>{exit_reason or 'open'}</span></td>"
+        f"{reason_cell}"
         f"<td>{pnl_str}</td>"
         f"<td class='dim mono col-mfe'>"
         f"{f'{mfe:.2f}' if mfe is not None else '—'}</td>"
@@ -636,6 +853,80 @@ def _trade_row_html(r: dict, *, show_strategy: bool = False) -> str:
         f"<td class='dim mono col-bars'>{bars if bars is not None else '—'}</td>"
         "</tr>"
     )
+
+
+def _cluster_summary_row_html(cluster: dict, *, show_strategy: bool) -> str:
+    """Render a single 'summary' <tr> representing N variants that fired the
+    same signal. Shown by default; expanding the <details> reveals the per-
+    variant child rows. Strategy column shows the variant count instead of
+    a single id."""
+    rows = cluster["rows"]
+    n = len(rows)
+    head = rows[0]
+    ts = _ct_str(head.get("bar_ts"))
+    ago = _ago(head.get("bar_ts"))
+    direction = (head.get("direction") or "").upper()
+    dir_color = "#16a34a" if direction == "LONG" else "#dc2626"
+    entry = head.get("entry_price")
+    exit_price = head.get("exit_price")
+    exit_reason = head.get("exit_reason") or ""
+    ex_color = EXIT_COLORS.get(exit_reason, "#e2e8f0") if exit_reason else "#94a3b8"
+    short = _short_reason(exit_reason) if exit_reason else "open"
+    reason_title = exit_reason if short != exit_reason else ""
+    # Sum P&L across the cluster (e.g., 5 variants × $0.55 = $2.75 fleet impact).
+    pnls = [r.get("pnl_dollars") for r in rows if r.get("pnl_dollars") is not None]
+    if not pnls:
+        pnl_str = '<span class="dim">—</span>'
+    else:
+        total = sum(pnls)
+        pcolor = "#16a34a" if total > 0 else ("#dc2626" if total < 0 else "#e2e8f0")
+        pnl_str = (f'<span style="color:{pcolor}" class="mono">'
+                   f'{_money(total)}<span class="dim"> sum</span></span>')
+    strat_cell = (
+        f"<td class='mono dim'>{n}× variants</td>"
+        if show_strategy else ""
+    )
+    reason_cell = (
+        f"<td><span class='kind' style='color:{ex_color}' "
+        f"title='{reason_title}'>{short}</span></td>"
+        if reason_title else
+        f"<td><span class='kind' style='color:{ex_color}'>{short}</span></td>"
+    )
+    return (
+        "<tr>"
+        f"{strat_cell}"
+        f"<td class='mono'>{ts}</td>"
+        f"<td class='dim mono col-ago'>{ago}</td>"
+        f"<td><span class='kind' style='color:{dir_color}'>{direction}</span></td>"
+        f"<td class='mono'>{_money(entry)}</td>"
+        f"<td class='mono'>{_money(exit_price) if exit_price is not None else '—'}</td>"
+        f"{reason_cell}"
+        f"<td>{pnl_str}</td>"
+        f"<td class='dim mono col-mfe'>—</td>"
+        f"<td class='dim mono col-mae'>—</td>"
+        f"<td class='dim mono col-bars'>—</td>"
+        "</tr>"
+    )
+
+
+def _trades_tbody_html(rows: list[dict], *, show_strategy: bool,
+                       cluster: bool) -> str:
+    """Build the <tbody> for the trades table. When `cluster=True`, rows that
+    share (bar_ts, direction, entry, exit_price, exit_reason) collapse into
+    a single 'N× variants' summary row — typical of the v3 fleet, where one
+    SignalR signal triggers identical entries/exits across all 5 variants.
+    When variants' exits diverge (e.g., trail vs canon) they form distinct
+    clusters and each renders normally. To see the per-variant detail of a
+    collapsed cluster, use the strategy filter."""
+    if not cluster:
+        return "".join(_trade_row_html(r, show_strategy=show_strategy) for r in rows)
+    parts: list[str] = []
+    for c in _cluster_trades(rows):
+        if len(c["rows"]) == 1:
+            parts.append(_trade_row_html(c["rows"][0], show_strategy=show_strategy))
+        else:
+            parts.append(_cluster_summary_row_html(c, show_strategy=show_strategy))
+    return "".join(parts)
 
 
 def render_overview(
@@ -683,6 +974,15 @@ def render_overview(
     agg_week_pnl = sum(s["week"]["total"] for s in summaries.values())
     agg_week_n = sum(s["week"]["n"] for s in summaries.values())
     n_in_position = sum(1 for s in summaries.values() if s["open_pos"])
+    # Fleet MDD: largest peak-to-trough dip in the *combined* cumulative P&L
+    # across all variants over the 7-day window. Computed from gate_rows so we
+    # don't refetch trades. Sum of per-variant MDDs would overstate; this
+    # respects the actual time-ordering of fleet-level cumulative P&L.
+    fleet_chrono = sorted(
+        (r for r in gate_rows if r.get("exit_reason")),
+        key=lambda r: r.get("bar_ts") or "",
+    )
+    agg_week_mdd = _max_drawdown(fleet_chrono)
 
     # Paginated trades — last 7d, optionally filtered by strategy
     trades_strategy_filter = trades_strategy if trades_strategy and trades_strategy != "all" else None
@@ -705,8 +1005,12 @@ def render_overview(
     panel_html_parts: list[str] = []
     for sid in KNOWN_VARIANTS:
         s = summaries[sid]
-        v = verdicts.get(sid, {"verdict": "EXTEND_PAPER", "reason": "0/200"})
+        v = verdicts.get(sid, {"verdict": "EXTEND_PAPER",
+                               "reason": f"0/{GATE_MIN_SETTLED}"})
         vcolor = VERDICT_COLORS.get(v["verdict"], "#94a3b8")
+        vtip = VERDICT_TOOLTIPS.get(v["verdict"], "")
+        if v.get("reason"):
+            vtip = f"{vtip}\nGate state: {v['reason']}" if vtip else v["reason"]
         hb = _heartbeat_status(heartbeats.get(sid), now_utc)
         in_pos = s["open_pos"] is not None
         # OFFLINE/STALE supersedes IN POSITION/FLAT in the panel status line —
@@ -734,22 +1038,65 @@ def render_overview(
         pf_str = f"{pf:.2f}" if pf is not None else "—"
         wr = s["week"]["wr"]
         wr_str = f"{wr:.0f}%" if s["week"]["n"] > 0 else "—"
+        mdd = s["week"]["mdd"]
+        mdd_str = f"-{_money(mdd).lstrip('$')}" if mdd > 0.005 else "—"
+        mdd_color = "#dc2626" if mdd > 0.005 else "var(--dim-2)"
+        # Sparkline color tracks the week's overall direction.
+        spark_color = ("#16a34a" if week_pnl > 0.005
+                       else "#dc2626" if week_pnl < -0.005
+                       else "#94a3b8")
+        sparkline = _sparkline_svg(s["week"]["daily_cum"], color=spark_color,
+                                   width=180, height=28)
+
+        # Settled-trade count drives the X/200 promotion-gate progress bar.
+        # `verdict` data only exposes `settled` after the threshold is met; for
+        # the EXTEND_PAPER/INVESTIGATE cases we have to fall back to week["n"].
+        settled_count = v.get("settled") or s["week"]["n"]
+        gate_pct = settled_count / GATE_MIN_SETTLED if GATE_MIN_SETTLED else 1.0
+        gate_color = (vcolor if gate_pct >= 1.0 else "#38bdf8")
+        gate_html = _gate_progress_html(settled_count, GATE_MIN_SETTLED,
+                                        gate_color)
+
+        # Live-position context: when a variant is currently in a trade, show
+        # entry price + unrealized P&L below the metrics row so the operator
+        # doesn't have to scroll to the trades table.
+        pos_html = ""
+        if in_pos:
+            op = s["open_pos"]
+            entry_p = op.get("entry_price")
+            held = _ago(op.get("entry_ts"))
+            # No real-time mark-to-market in the data layer; show position size
+            # and held duration as the actionable context. Unrealized P&L would
+            # require a live mark price which the watcher doesn't currently
+            # subscribe to.
+            pos_html = (
+                '  <div class="pos-row">'
+                f'    <span>entry</span>'
+                f'    <strong>{_money(entry_p)} · held {held}</strong>'
+                '  </div>'
+            )
 
         panel_class = "panel armed" if in_pos else "panel"
         panel_html_parts.append(
             f'<a class="{panel_class}" href="{_params_for_panel(sid)}">'
             f'  <div class="panel-head">'
             f'    <span class="panel-name">{sid}</span>'
-            f'    <span class="panel-verdict" style="color:{vcolor};background:{vcolor}22">{v["verdict"]}</span>'
+            f'    <span class="panel-verdict help" '
+            f'style="color:{vcolor};background:{vcolor}22" '
+            f'title="{vtip}">{v["verdict"]}</span>'
             f'  </div>'
             f'  <div class="panel-pnl" style="color:{today_color}">{_money(today_pnl)}</div>'
             f'  <div class="panel-meta">today · {s["today"]["n"]} trades</div>'
+            f'  {sparkline}'
             f'  <div class="panel-row"><span>7-day</span>'
             f'    <strong style="color:{week_color}">{_money(week_pnl)}</strong></div>'
             f'  <div class="panel-row"><span>{s["week"]["n"]} trades</span>'
             f'    <strong>{wr_str} WR · PF {pf_str}</strong></div>'
+            f'  <div class="panel-row"><span>MDD</span>'
+            f'    <strong style="color:{mdd_color}">{mdd_str}</strong></div>'
             f'  <div class="panel-row"><span style="color:{status_color}">{status_text}</span>'
-            f'    <strong class="dim">{v.get("reason", "")}</strong></div>'
+            f'    {gate_html}</div>'
+            f'  {pos_html}'
             f'</a>'
         )
 
@@ -771,9 +1118,14 @@ def render_overview(
         + "</select></form>"
     )
 
-    # Trades table
-    show_strategy_col = trades_strategy_filter is None  # show col when "all"
-    rows_html = "".join(_trade_row_html(r, show_strategy=show_strategy_col) for r in page_rows)
+    # Trades table: cluster correlated rows when viewing the unfiltered fleet.
+    # When the user has filtered to one variant, clustering would always be
+    # 1 row → 1 cluster, so leave it off for clarity.
+    show_strategy_col = trades_strategy_filter is None
+    rows_html = _trades_tbody_html(
+        page_rows, show_strategy=show_strategy_col,
+        cluster=show_strategy_col,
+    )
     strategy_th = "<th>strategy</th>" if show_strategy_col else ""
     table_html = (
         f'<table>'
@@ -801,30 +1153,32 @@ def render_overview(
     agg_week_color = "#16a34a" if agg_week_pnl > 0.005 else (
         "#dc2626" if agg_week_pnl < -0.005 else "var(--dim)"
     )
+    mdd_color = "#dc2626" if agg_week_mdd > 0.005 else "var(--dim)"
+    mdd_display = (f'-{_money(agg_week_mdd).lstrip("$")}'
+                   if agg_week_mdd > 0.005 else "—")
 
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta http-equiv="refresh" content="5">
+<meta http-equiv="refresh" content="30">
 <meta name="theme-color" content="#0b1220">
 <title>Acme Futures · v3 fleet</title>
 <style>{_SHARED_CSS}</style>
 </head><body><div class="wrap">
   <div class="topbar">
     <div class="brand"><strong>ACME</strong> · FUTURES · v3 fleet</div>
-    <div class="clock mono">{now_ct.strftime('%a %Y-%m-%d  %H:%M:%S CT')}</div>
-  </div>
-
-  <div class="statusrow">
-    {_fleet_heartbeat_pill(heartbeats, now_utc)}
+    <div style="display:flex;align-items:center;gap:12px">
+      {_fleet_heartbeat_pill(heartbeats, now_utc)}
+      <span class="clock mono">{now_ct.strftime('%a %Y-%m-%d  %H:%M:%S CT')}</span>
+    </div>
   </div>
 
   <div class="stats">
     <div class="card">
       <div class="label">Fleet Today</div>
       <div class="value mono" style="color:{agg_color}">{_money(agg_today_pnl)}</div>
-      <div class="meta">{agg_today_n} trades across {len(KNOWN_VARIANTS)} variants</div>
+      <div class="meta">{agg_today_n} trades across {len(KNOWN_VARIANTS)} variants · mode {mode}</div>
     </div>
     <div class="card">
       <div class="label">Fleet 7-Day</div>
@@ -837,9 +1191,9 @@ def render_overview(
       <div class="meta">variants currently holding</div>
     </div>
     <div class="card">
-      <div class="label">Mode</div>
-      <div class="value mono">{mode}</div>
-      <div class="meta">all variants shadow-trading</div>
+      <div class="label">Fleet 7-Day MDD</div>
+      <div class="value mono" style="color:{mdd_color}">{mdd_display}</div>
+      <div class="meta">worst peak-to-trough dip</div>
     </div>
   </div>
 
@@ -857,7 +1211,7 @@ def render_overview(
   </div>
 
   <div class="footer">
-    Auto-refresh 5s · service-role read · token-gated
+    Auto-refresh 30s · service-role read · token-gated
     <br>
     Aggregate numbers compare variants of the same strategy — interpret accordingly.
   </div>
@@ -948,6 +1302,9 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
     cum_color = "#16a34a" if cum_pnl > 0 else ("#dc2626" if cum_pnl < 0 else "#e2e8f0")
     today_pnl = today["total"]
     today_color = "#16a34a" if today_pnl > 0 else ("#dc2626" if today_pnl < 0 else "#e2e8f0")
+    mdd = settled["mdd"]
+    mdd_str = f'-{_money(mdd).lstrip("$")}' if mdd > 0.005 else "—"
+    mdd_color = "#dc2626" if mdd > 0.005 else "#94a3b8"
 
     if open_pos is not None:
         op_dir = (open_pos.get("direction") or "?").upper()
@@ -991,7 +1348,7 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta http-equiv="refresh" content="5">
+<meta http-equiv="refresh" content="30">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0b1220">
@@ -1018,8 +1375,8 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
       <span class="dot" style="background:{hb_status['color']}"></span>
       {hb_status['state']} · {hb_status['ago']}
     </span>
-    <span class="meta-pill" style="border-left:3px solid {VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}"
-          title="{current_verdict.get('reason', '')}">
+    <span class="meta-pill help" style="border-left:3px solid {VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}"
+          title="{VERDICT_TOOLTIPS.get(current_verdict['verdict'], '')}{(chr(10) + 'Gate state: ' + current_verdict['reason']) if current_verdict.get('reason') else ''}">
       gate <strong style="color:{VERDICT_COLORS.get(current_verdict['verdict'], '#94a3b8')}">{current_verdict['verdict']}</strong>
       <span class="dim">{current_verdict.get('reason', '')}</span>
     </span>
@@ -1051,6 +1408,11 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
       <div class="value mono" style="color:{pf_color}">{pf_str}</div>
       <div class="meta">OOS {OOS_REF['pf']:.2f} · floor 1.50</div>
     </div>
+    <div class="card">
+      <div class="label">Max Drawdown</div>
+      <div class="value mono" style="color:{mdd_color}">{mdd_str}</div>
+      <div class="meta">7-day worst peak-to-trough</div>
+    </div>
   </div>
 
   <div class="events">
@@ -1078,6 +1440,6 @@ def render(sb, *, mode: str = "paper", token: str | None = None,
 
   <div class="footer">
     Ryan-Spec v3 · OOS PF 2.30 · filter: cum_delta_in_dir &lt; -2000 · stop 1.5 ATR · no target<br>
-    Auto-refresh 5s · service-role read · token-gated
+    Auto-refresh 30s · service-role read · token-gated
   </div>
 </div></body></html>"""
