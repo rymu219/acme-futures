@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Fresh label to escape the BTM/AMFI "burned" record on
+         com.acme-futures.runner from 2026-05-05. -->
+    <key>Label</key>
+    <string>com.acme-futures.v3-runner</string>
+
+    <!-- Two layers of supervision:
+         1. launchd keeps THIS plist alive (KeepAlive=true) → restarts if
+            the watchdog script ever crashes.
+         2. The watchdog script keeps the python runner alive — restarts
+            on signalrcore zombie loop OR Supabase heartbeat staleness.
+         caffeinate is invoked from inside the watchdog script per
+         spawned runner generation. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ryanmurphy/acme-futures/scripts/runner_watchdog.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryanmurphy/acme-futures</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/ryanmurphy/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/ryanmurphy</string>
+    </dict>
+
+    <!-- Auto-start at user login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Auto-restart if the watchdog script ever exits. The throttle
+         prevents a hot crash loop. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- The runner writes its own structured logs via the watchdog into
+         logs/runner.out.log. These two paths capture stderr/stdout from
+         launchd → /bin/sh → watchdog itself (mostly empty). -->
+    <key>StandardOutPath</key>
+    <string>/Users/ryanmurphy/acme-futures/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryanmurphy/acme-futures/logs/launchd.err.log</string>
+</dict>
+</plist>
