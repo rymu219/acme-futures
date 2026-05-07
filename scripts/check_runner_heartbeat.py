@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # Cheap .env loader — avoid pulling python-dotenv just for this.
@@ -51,7 +51,7 @@ def main() -> int:
     if not rows:
         print("no v3 heartbeats found")
         return 1
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now - timedelta(seconds=MAX_STALE_SEC)
     fresh: list[str] = []
     stale: list[tuple[str, float]] = []
