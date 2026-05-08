@@ -9,13 +9,16 @@ is exiting too eagerly (88% of exits, vs OOS 53%). Rather than picking one
 fix, we ship four variant hypotheses alongside the canonical configuration
 and let live shadow data compare them:
 
-  - v3-canon    — control, OOS-validated config
-  - v3-trail    — trailing stop / let-winners-run (option A from the brief)
-  - v3-min2bar  — refuse opposite_signal exits before bar 2
-  - v3-armor    — suppress opposite_signal exits when MFE >= 2 ATR
-  - v3-pctile   — dynamic filter using 5th/95th percentile of recent cum_delta
+  - v3-canon       — control, OOS-validated config
+  - v3-trail       — trailing stop / let-winners-run (option A from the brief)
+  - v3-min2bar     — refuse opposite_signal exits before bar 2
+  - v3-armor       — suppress opposite_signal exits when MFE >= 2 ATR
+  - v3-pctile      — dynamic filter using 5th/95th percentile of recent cum_delta
+  - v4-loose-shorts — asymmetric pctile (5% longs, 12% shorts) — first short-bias
+                     variant, added 2026-05-07 after the fleet fired 1,063 longs
+                     vs 1 short over 4 days (see docs/2026-05-07-trading-day-analysis.md)
 
-All five share ONE ProjectXAdapter (SignalR fan-out at the broker layer
+All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
 tagged with its strategy_id; each has its own heartbeat / kill-switch row.
 
@@ -59,6 +62,10 @@ class _VariantSpec:
     filter_mode: str = "static"
     filter_pctile_window_bars: int = 60
     filter_pctile: float = 5.0
+    # Asymmetric short-side pctile. None → symmetric (use filter_pctile for
+    # both legs). Set to a wider value (e.g. 10) to make the short leg fire
+    # more often on a market like MES where cum_delta drifts negative.
+    filter_pctile_short: float | None = None
     # Time-of-day exits. Defaults False across the fleet right now — see
     # 2026-05-06: user wants 24-hour shadow data with pure-thesis exits
     # (stop / opposite_signal only). Flip back to True per-variant if you
@@ -97,6 +104,20 @@ VARIANTS: list[_VariantSpec] = [
         filter_mode="pctile",
         filter_pctile_window_bars=60,
         filter_pctile=5.0,
+    ),
+    # 2026-05-07 post-mortem (docs/2026-05-07-trading-day-analysis.md): the
+    # static filter is structurally long-biased on MES because cum_delta drifts
+    # negative — over 4 days the fleet fired 1,063 longs vs 1 short. This
+    # variant loosens the short leg to top 12% (vs the default 5%) so shorts
+    # actually qualify, while keeping the long leg at the canonical 5%. First
+    # of the v4 series (S5 from the post-mortem).
+    _VariantSpec(
+        strategy_id="v4-loose-shorts",
+        description="Asymmetric pctile: bottom 5% longs, top 12% shorts",
+        filter_mode="pctile",
+        filter_pctile_window_bars=60,
+        filter_pctile=5.0,
+        filter_pctile_short=12.0,
     ),
 ]
 
@@ -158,6 +179,7 @@ def _build_runtime(
         filter_mode=spec.filter_mode,  # type: ignore[arg-type]
         filter_pctile_window_bars=spec.filter_pctile_window_bars,
         filter_pctile=spec.filter_pctile,
+        filter_pctile_short=spec.filter_pctile_short,
         enable_session_end_exit=spec.enable_session_end_exit,
         enable_time_stop=spec.enable_time_stop,
     )

@@ -171,6 +171,7 @@ class V3Runtime:
         filter_mode: Literal["static", "pctile"] = "static",
         filter_pctile_window_bars: int = 60,
         filter_pctile: float = 5.0,
+        filter_pctile_short: float | None = None,
         # Time-of-day exits. Default True keeps OOS-validated behavior. Set
         # both False for 24-hour shadow runs where exits should be pure
         # thesis (stop / opposite_signal) only.
@@ -206,6 +207,7 @@ class V3Runtime:
             filter_mode=filter_mode,
             filter_pctile_window_bars=filter_pctile_window_bars,
             filter_pctile=filter_pctile,
+            filter_pctile_short=filter_pctile_short,
             enable_session_end_exit=enable_session_end_exit,
             enable_time_stop=enable_time_stop,
         )

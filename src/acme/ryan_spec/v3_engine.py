@@ -150,9 +150,14 @@ class RyanSpecV3Engine:
         # instead of the static filter_thresh constant. Adapts to the current
         # session's flow regime — useful when live cum_delta values are far
         # outside the static threshold's calibration range.
+        # `filter_pctile` is the symmetric default; `filter_pctile_short` lets
+        # the short leg use a looser percentile than the long leg, since on
+        # MES cum_delta drifts negative and the long-side threshold is reached
+        # far more often than the short-side mirror. None = symmetric.
         filter_mode: FilterMode = "static",
         filter_pctile_window_bars: int = DEFAULT_PCTILE_WINDOW_BARS,
         filter_pctile: float = DEFAULT_PCTILE,
+        filter_pctile_short: float | None = None,
         # E. Disable time-of-day session_end exit. When False, positions are NOT
         # auto-flattened at 14:50 CT — they ride through the close. Useful for
         # 24-hour shadow runs where you want pure-thesis exits (stop /
@@ -184,6 +189,11 @@ class RyanSpecV3Engine:
         self._opposite_signal_armor_mfe_atr = opposite_signal_armor_mfe_atr
         self._filter_mode: FilterMode = filter_mode
         self._filter_pctile = filter_pctile
+        # Asymmetric short-side pctile. Falls back to the long-side value
+        # when None so existing callers stay symmetric.
+        self._filter_pctile_short = (
+            filter_pctile_short if filter_pctile_short is not None else filter_pctile
+        )
         self._enable_session_end_exit = enable_session_end_exit
         self._enable_time_stop = enable_time_stop
         # cum_delta history for percentile filter (independent of _history maxlen)
@@ -437,8 +447,11 @@ class RyanSpecV3Engine:
         """Compute the percentile-based filter threshold for the given entry
         direction from the current cum_delta history window.
 
-        Long entries fire when cum_delta < (low pctile, e.g. 5th percentile).
-        Short entries fire when cum_delta > (high pctile, e.g. 95th percentile).
+        Long entries fire when cum_delta < (low pctile, e.g. 5th percentile of
+        recent samples — uses `filter_pctile`).
+        Short entries fire when cum_delta > (high pctile, e.g. 95th percentile —
+        uses `filter_pctile_short`, defaulting to the long-side value).
+
         Returns the threshold value. Caller compares cum_delta to it.
         """
         sorted_cd = sorted(self._cum_delta_history)
@@ -447,8 +460,11 @@ class RyanSpecV3Engine:
             # Bottom X percentile — index = (X/100) * n
             idx = max(0, min(n - 1, int(round(self._filter_pctile / 100.0 * (n - 1)))))
         else:
-            # Top X percentile — index = ((100-X)/100) * n
-            idx = max(0, min(n - 1, int(round((100.0 - self._filter_pctile) / 100.0 * (n - 1)))))
+            # Top X percentile — index = ((100-X)/100) * n; X may differ
+            # from the long-side value to compensate for the negative cum_delta
+            # drift on MES (without it, shorts almost never qualify).
+            short_pctile = self._filter_pctile_short
+            idx = max(0, min(n - 1, int(round((100.0 - short_pctile) / 100.0 * (n - 1)))))
         return float(sorted_cd[idx])
 
     def _opposite_direction_triggered_this_bar(self) -> Direction | None:
