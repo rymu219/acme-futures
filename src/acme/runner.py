@@ -14,6 +14,12 @@ and let live shadow data compare them:
   - v3-min2bar     — refuse opposite_signal exits before bar 2
   - v3-armor       — suppress opposite_signal exits when MFE >= 2 ATR
   - v3-pctile      — dynamic filter using 5th/95th percentile of recent cum_delta
+  - v3.1-canon / -trail / -min2bar / -armor / -pctile — same engine flags as the
+                     base v3-* siblings, plus the three safeguards from the
+                     2026-05-07 win-loss anatomy: ATR ≤ 2.5 ceiling, hour
+                     blacklist (06-08 and 11-12 CT), bar-1 fast-fail when
+                     MAE > MFE × 1.5. Retroactively turns 2026-05-07 from
+                     -$1,739 to +$321 across the family.
   - v4-loose-shorts — asymmetric pctile (5% longs, 12% shorts) — first short-bias
                      variant, added 2026-05-07 after the fleet fired 1,063 longs
                      vs 1 short over 4 days (see docs/2026-05-07-trading-day-analysis.md)
@@ -99,6 +105,13 @@ class _VariantSpec:
     # want to honor RTH session_end / time_stop again.
     enable_session_end_exit: bool = False
     enable_time_stop: bool = False
+    # v3.1 refinements (PR-G — sourced from the 2026-05-07 win-loss
+    # anatomy). All default to off. The v3.1-* variants flip them on; the
+    # base v3-* variants stay bit-identical to their pre-PR behavior.
+    entry_atr_ceiling: float | None = None
+    entry_hour_blacklist_ct: tuple[int, ...] = ()
+    enable_bar1_fast_fail: bool = False
+    bar1_fast_fail_mae_mfe_ratio: float = 1.5
 
 
 # The fleet. To disable a variant, comment it out or set ACME_V3_VARIANTS env
@@ -131,6 +144,62 @@ VARIANTS: list[_VariantSpec] = [
         filter_mode="pctile",
         filter_pctile_window_bars=60,
         filter_pctile=5.0,
+    ),
+    # ─── v3.1 family (PR-G) ────────────────────────────────────────────
+    # Each v3.1-* mirrors its v3-* counterpart's engine flags AND adds the
+    # three refinements from the 2026-05-07 win-loss anatomy
+    # (docs/2026-05-07-v3-win-loss-anatomy.md):
+    #   • entry_atr_ceiling=2.5 — losses fired at median ATR 2.36-3.67;
+    #     wins at 2.02-2.27. A 2.5 ceiling cleanly separates the cohorts.
+    #   • entry_hour_blacklist_ct=(6,7,8,11,12) — hours where every
+    #     variant ran 7-20% WR. Mostly pre-RTH ramp + mid-morning chop.
+    #   • enable_bar1_fast_fail=True — bar-1 cut when MAE > MFE × 1.5.
+    #     Wins have MAE ≪ MFE by bar 1; losses already inverted.
+    # Retroactively applied to 2026-05-07 the fleet flips from -$1,739 to
+    # +$321 (v3-armor stays red even after the gate, expected). Live data
+    # over the next sessions will tell us whether this generalizes.
+    _VariantSpec(
+        strategy_id="v3.1-canon",
+        description="v3-canon + ATR≤2.5 entry / hour gate / bar-1 fast-fail",
+        entry_atr_ceiling=2.5,
+        entry_hour_blacklist_ct=(6, 7, 8, 11, 12),
+        enable_bar1_fast_fail=True,
+    ),
+    _VariantSpec(
+        strategy_id="v3.1-trail",
+        description="v3-trail + ATR≤2.5 entry / hour gate / bar-1 fast-fail",
+        enable_trailing_stop=True,
+        trail_be_lock_atr_mult=1.0,
+        trail_atr_mult=1.0,
+        entry_atr_ceiling=2.5,
+        entry_hour_blacklist_ct=(6, 7, 8, 11, 12),
+        enable_bar1_fast_fail=True,
+    ),
+    _VariantSpec(
+        strategy_id="v3.1-min2bar",
+        description="v3-min2bar + ATR≤2.5 entry / hour gate / bar-1 fast-fail",
+        min_bars_before_opposite_exit=2,
+        entry_atr_ceiling=2.5,
+        entry_hour_blacklist_ct=(6, 7, 8, 11, 12),
+        enable_bar1_fast_fail=True,
+    ),
+    _VariantSpec(
+        strategy_id="v3.1-armor",
+        description="v3-armor + ATR≤2.5 entry / hour gate / bar-1 fast-fail",
+        opposite_signal_armor_mfe_atr=2.0,
+        entry_atr_ceiling=2.5,
+        entry_hour_blacklist_ct=(6, 7, 8, 11, 12),
+        enable_bar1_fast_fail=True,
+    ),
+    _VariantSpec(
+        strategy_id="v3.1-pctile",
+        description="v3-pctile + ATR≤2.5 entry / hour gate / bar-1 fast-fail",
+        filter_mode="pctile",
+        filter_pctile_window_bars=60,
+        filter_pctile=5.0,
+        entry_atr_ceiling=2.5,
+        entry_hour_blacklist_ct=(6, 7, 8, 11, 12),
+        enable_bar1_fast_fail=True,
     ),
     # 2026-05-07 post-mortem (docs/2026-05-07-trading-day-analysis.md): the
     # static filter is structurally long-biased on MES because cum_delta drifts
@@ -304,6 +373,10 @@ def _build_runtime(
         filter_pctile_short=spec.filter_pctile_short,
         enable_session_end_exit=spec.enable_session_end_exit,
         enable_time_stop=spec.enable_time_stop,
+        entry_atr_ceiling=spec.entry_atr_ceiling,
+        entry_hour_blacklist_ct=spec.entry_hour_blacklist_ct,
+        enable_bar1_fast_fail=spec.enable_bar1_fast_fail,
+        bar1_fast_fail_mae_mfe_ratio=spec.bar1_fast_fail_mae_mfe_ratio,
         regime_classifier=_resolve_classifier(spec.regime_classifier_name),
         regime_gate_mode=spec.regime_gate_mode,  # type: ignore[arg-type]
         regime_history_bars=spec.regime_history_bars,

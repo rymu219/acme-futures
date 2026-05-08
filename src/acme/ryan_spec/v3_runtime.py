@@ -182,6 +182,12 @@ class V3Runtime:
         # thesis (stop / opposite_signal) only.
         enable_session_end_exit: bool = True,
         enable_time_stop: bool = True,
+        # v3.1 refinements (PR-G — additive, default-off keeps every
+        # existing variant bit-identical).
+        entry_atr_ceiling: float | None = None,
+        entry_hour_blacklist_ct: tuple[int, ...] = (),
+        enable_bar1_fast_fail: bool = False,
+        bar1_fast_fail_mae_mfe_ratio: float = 1.5,
         # v4 regime-aware engine. Default None = bare RyanSpecV3Engine (no
         # behavior change). When set, the runtime wraps the engine in a
         # V4GatedEngine that consults the classifier on every bar and gates
@@ -227,6 +233,10 @@ class V3Runtime:
             filter_pctile_short=filter_pctile_short,
             enable_session_end_exit=enable_session_end_exit,
             enable_time_stop=enable_time_stop,
+            entry_atr_ceiling=entry_atr_ceiling,
+            entry_hour_blacklist_ct=entry_hour_blacklist_ct,
+            enable_bar1_fast_fail=enable_bar1_fast_fail,
+            bar1_fast_fail_mae_mfe_ratio=bar1_fast_fail_mae_mfe_ratio,
         )
         if regime_classifier is None:
             self.engine = RyanSpecV3Engine(**engine_kwargs)

@@ -316,6 +316,8 @@ def _exit_dist_pill_html(exit_dist: dict[str, float]) -> str:
 
 
 KNOWN_VARIANTS = ("v3-canon", "v3-trail", "v3-min2bar", "v3-armor", "v3-pctile",
+                  "v3.1-canon", "v3.1-trail", "v3.1-min2bar", "v3.1-armor",
+                  "v3.1-pctile",
                   "v4-loose-shorts", "v4-trend-gate", "v4-overnight-bias",
                   "v4-vol-regime", "v4-trend-flip", "v5-mtf-anchor")
 

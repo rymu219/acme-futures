@@ -170,6 +170,25 @@ class RyanSpecV3Engine:
         # that's still on). Lets the thesis play out across an arbitrary
         # number of bars.
         enable_time_stop: bool = True,
+        # G. Refinements introduced for the v3.1 family (PR-G), sourced from
+        # the 2026-05-07 win-loss anatomy
+        # (docs/2026-05-07-v3-win-loss-anatomy.md). All default to off so
+        # every existing v3 / v4 / v5 variant is bit-identical.
+        # G1: skip entries when the bar's ATR exceeds this ceiling. The
+        # post-mortem found losses fired at median ATR 2.36-3.67 vs win
+        # ATR 2.02-2.27; a 2.5 ceiling cleanly separates the two cohorts.
+        entry_atr_ceiling: float | None = None,
+        # G2: skip entries when the bar's session-local hour matches one
+        # of these. Hours given as ints in the engine's `session_tz`
+        # (Central Time by default). Empty tuple = no hour gate.
+        entry_hour_blacklist_ct: tuple[int, ...] = (),
+        # G3: bar-1 fast-fail. When enabled, after the first held bar, if
+        # MAE > MFE × `bar1_fast_fail_mae_mfe_ratio`, exit immediately with
+        # reason `bar1_fast_fail`. The win-loss anatomy showed losses' MAE
+        # already dominates MFE by bar 1; this is the cleanest exit-side
+        # refinement available from the data.
+        enable_bar1_fast_fail: bool = False,
+        bar1_fast_fail_mae_mfe_ratio: float = 1.5,
     ) -> None:
         self._bb = Bollinger(period=bb_period, num_std=bb_std)
         self._atr = ATR(period=atr_period)
@@ -196,6 +215,12 @@ class RyanSpecV3Engine:
         )
         self._enable_session_end_exit = enable_session_end_exit
         self._enable_time_stop = enable_time_stop
+        # v3.1 refinements (PR-G, default-off keeps every v3/v4/v5 variant
+        # identical to before the safeguards landed).
+        self._entry_atr_ceiling = entry_atr_ceiling
+        self._entry_hour_blacklist_ct = frozenset(entry_hour_blacklist_ct)
+        self._enable_bar1_fast_fail = enable_bar1_fast_fail
+        self._bar1_fast_fail_mae_mfe_ratio = bar1_fast_fail_mae_mfe_ratio
         # cum_delta history for percentile filter (independent of _history maxlen)
         self._cum_delta_history: deque[int] = deque(maxlen=filter_pctile_window_bars)
 
@@ -309,6 +334,21 @@ class RyanSpecV3Engine:
         pos.max_adverse_excursion = max(
             pos.max_adverse_excursion, bar_mae_pts
         )
+
+        # G3 (v3.1): bar-1 fast-fail. The 2026-05-07 win-loss anatomy
+        # showed losses already have MAE > MFE × 1.5 by bar 1, while wins
+        # have MAE ≪ MFE. Cutting at bar 1 when this ratio is hit caps the
+        # realized loss without sacrificing winners. Default off; the v3.1
+        # variants opt in.
+        if (
+            self._enable_bar1_fast_fail
+            and pos.bars_held == 1
+            and pos.max_adverse_excursion
+                > pos.max_favorable_excursion * self._bar1_fast_fail_mae_mfe_ratio
+        ):
+            return Decision(
+                action="exit", reason="bar1_fast_fail", bar_ts=bar.t,
+            )
 
         # Trailing-stop ratchet (option A). Monotone — never loosens.
         # Applied BEFORE the stop check so the new stop applies this bar
@@ -428,6 +468,29 @@ class RyanSpecV3Engine:
                 return Decision(
                     action="none",
                     reason=f"filter_blocked cum_delta_in_dir={cum_delta_in_dir}",
+                    bar_ts=state.bar.t,
+                )
+
+        # G1 (v3.1): ATR ceiling. Skip entries when realized vol on the
+        # entry bar is above the ceiling — the win-loss anatomy showed
+        # losses cluster at high ATR. Default None = no gate.
+        if (self._entry_atr_ceiling is not None
+                and state.atr > self._entry_atr_ceiling):
+            return Decision(
+                action="none",
+                reason=(f"entry_atr_ceiling_blocked atr={state.atr:.2f} "
+                        f"ceiling={self._entry_atr_ceiling}"),
+                bar_ts=state.bar.t,
+            )
+
+        # G2 (v3.1): hour blacklist. Skip entries during configured CT hours.
+        # Empty set = no gate.
+        if self._entry_hour_blacklist_ct:
+            bar_hour = state.bar.t.astimezone(self._session_tz).hour
+            if bar_hour in self._entry_hour_blacklist_ct:
+                return Decision(
+                    action="none",
+                    reason=f"entry_hour_blacklist_blocked hour={bar_hour}",
                     bar_ts=state.bar.t,
                 )
 
