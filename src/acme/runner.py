@@ -9,13 +9,28 @@ is exiting too eagerly (88% of exits, vs OOS 53%). Rather than picking one
 fix, we ship four variant hypotheses alongside the canonical configuration
 and let live shadow data compare them:
 
-  - v3-canon    — control, OOS-validated config
-  - v3-trail    — trailing stop / let-winners-run (option A from the brief)
-  - v3-min2bar  — refuse opposite_signal exits before bar 2
-  - v3-armor    — suppress opposite_signal exits when MFE >= 2 ATR
-  - v3-pctile   — dynamic filter using 5th/95th percentile of recent cum_delta
+  - v3-canon       — control, OOS-validated config
+  - v3-trail       — trailing stop / let-winners-run (option A from the brief)
+  - v3-min2bar     — refuse opposite_signal exits before bar 2
+  - v3-armor       — suppress opposite_signal exits when MFE >= 2 ATR
+  - v3-pctile      — dynamic filter using 5th/95th percentile of recent cum_delta
+  - v4-loose-shorts — asymmetric pctile (5% longs, 12% shorts) — first short-bias
+                     variant, added 2026-05-07 after the fleet fired 1,063 longs
+                     vs 1 short over 4 days (see docs/2026-05-07-trading-day-analysis.md)
+  - v4-trend-gate  — v3-canon entries gated by an EMA(20) trend classifier;
+                     blocks counter-trend signals (skip-only, never inverts).
+                     S1 from the 2026-05-07 post-mortem; PR-B in the v4 plan.
+  - v4-overnight-bias — gates entries by Globex overnight direction (12-hour
+                     buffer). S3 from the post-mortem; PR-C.
+  - v4-vol-regime  — gates entries when realized vol is elevated + price is
+                     directional (high-vol day = trending). S4; PR-C.
+  - v4-trend-flip  — same EMA(20) trend classifier as v4-trend-gate, but
+                     INVERTS counter-trend entries instead of skipping. S2
+                     from the post-mortem; PR-D. Spicier than the gate
+                     variants — only ship after the classifier has been
+                     validated by the gate variants.
 
-All five share ONE ProjectXAdapter (SignalR fan-out at the broker layer
+All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
 tagged with its strategy_id; each has its own heartbeat / kill-switch row.
 
@@ -59,6 +74,20 @@ class _VariantSpec:
     filter_mode: str = "static"
     filter_pctile_window_bars: int = 60
     filter_pctile: float = 5.0
+    # Asymmetric short-side pctile. None → symmetric (use filter_pctile for
+    # both legs). Set to a wider value (e.g. 10) to make the short leg fire
+    # more often on a market like MES where cum_delta drifts negative.
+    filter_pctile_short: float | None = None
+    # v4 regime gate. None → bare v3 engine, no regime override. Otherwise a
+    # short string identifier resolved by `_resolve_classifier()` to a callable.
+    # Backward-compatible default: every existing v3 variant has this None and
+    # is unaffected by the wrapper.
+    regime_classifier_name: str | None = None
+    regime_gate_mode: str = "gate"
+    # Buffer depth for the regime classifier. 60 bars = ~2h is enough for the
+    # EMA(20)+10 trend classifier; deeper for vol-regime (needs 120-bar
+    # baseline) and overnight (needs ~360 bars to span Globex into RTH).
+    regime_history_bars: int = 60
     # Time-of-day exits. Defaults False across the fleet right now — see
     # 2026-05-06: user wants 24-hour shadow data with pure-thesis exits
     # (stop / opposite_signal only). Flip back to True per-variant if you
@@ -98,7 +127,98 @@ VARIANTS: list[_VariantSpec] = [
         filter_pctile_window_bars=60,
         filter_pctile=5.0,
     ),
+    # 2026-05-07 post-mortem (docs/2026-05-07-trading-day-analysis.md): the
+    # static filter is structurally long-biased on MES because cum_delta drifts
+    # negative — over 4 days the fleet fired 1,063 longs vs 1 short. This
+    # variant loosens the short leg to top 12% (vs the default 5%) so shorts
+    # actually qualify, while keeping the long leg at the canonical 5%. First
+    # of the v4 series (S5 from the post-mortem).
+    _VariantSpec(
+        strategy_id="v4-loose-shorts",
+        description="Asymmetric pctile: bottom 5% longs, top 12% shorts",
+        filter_mode="pctile",
+        filter_pctile_window_bars=60,
+        filter_pctile=5.0,
+        filter_pctile_short=12.0,
+    ),
+    # PR-B of the v4 plan (S1 from the post-mortem). Wraps v3-canon entry
+    # logic with an EMA-trend regime classifier; blocks counter-trend entries
+    # but does NOT flip them. On a strong-trend day like 2026-05-07 this would
+    # have skipped the catastrophic counter-trend longs entirely. Conservative
+    # — can only ever reduce trade count, never invert direction.
+    _VariantSpec(
+        strategy_id="v4-trend-gate",
+        description="EMA(20) trend gate: skip v3 entries that go against the recent regime",
+        regime_classifier_name="trend_ema",
+        regime_gate_mode="gate",
+    ),
+    # PR-C of the v4 plan (S3). Mechanizes "I knew today was a short day"
+    # by inferring the day's bias from the direction of the buffer window
+    # (~12 hours / 360 bars covers Globex overnight into the current RTH).
+    # Blocks counter-bias entries; same skip-only safety as v4-trend-gate.
+    _VariantSpec(
+        strategy_id="v4-overnight-bias",
+        description="Overnight Globex direction gate: skip v3 entries against the day's bias",
+        regime_classifier_name="overnight_bias",
+        regime_gate_mode="gate",
+        regime_history_bars=360,
+    ),
+    # PR-C of the v4 plan (S4). High realized vol typically coincides with
+    # directional days (today = +50% ATR vs the 5/5 baseline). When vol is
+    # elevated AND price is moving, treat the move as the regime; otherwise
+    # treat as chop. 120-bar baseline.
+    _VariantSpec(
+        strategy_id="v4-vol-regime",
+        description="High-vol regime gate: skip v3 counter-trend entries when vol expanded + directional",
+        regime_classifier_name="vol_regime",
+        regime_gate_mode="gate",
+        regime_history_bars=120,
+    ),
+    # PR-D of the v4 plan (S2 — the spicy one). Same EMA(20) trend
+    # classifier as v4-trend-gate, but instead of *skipping* counter-trend
+    # entries we *invert* them: long signal in trend_down → short entry,
+    # stop pivoted symmetrically. The thesis: at cum_delta extremes during
+    # a strong-trend day, the extreme is *continuation* not *exhaustion*.
+    # Highest upside if the regime classifier is reliable; active wrong-side
+    # trades if it misclassifies a chop day. Ride v4-trend-gate alongside
+    # as the safer cousin.
+    _VariantSpec(
+        strategy_id="v4-trend-flip",
+        description="EMA(20) trend flip: invert v3 entries that go against the recent regime",
+        regime_classifier_name="trend_ema",
+        regime_gate_mode="flip",
+    ),
 ]
+
+
+# Maps the short-string identifier in `_VariantSpec.regime_classifier_name`
+# to the actual callable. New classifiers (overnight, vol_regime, ...) added
+# in PR-C just append rows here. Keeping the registry centralised (rather
+# than embedding callables in the spec) keeps the spec dataclass simple
+# and human-readable.
+_CLASSIFIER_REGISTRY: dict[str, Any] = {}
+
+
+def _resolve_classifier(name: str | None) -> Any:
+    if name is None:
+        return None
+    if not _CLASSIFIER_REGISTRY:
+        # Lazy import: keep ryan_spec.* off the module-import path for env-
+        # less unit tests that import `acme.runner` to inspect VARIANTS.
+        from acme.ryan_spec.v4_regime import (
+            classify_overnight_bias,
+            classify_trend_ema,
+            classify_vol_regime,
+        )
+        _CLASSIFIER_REGISTRY["trend_ema"] = classify_trend_ema
+        _CLASSIFIER_REGISTRY["overnight_bias"] = classify_overnight_bias
+        _CLASSIFIER_REGISTRY["vol_regime"] = classify_vol_regime
+    if name not in _CLASSIFIER_REGISTRY:
+        raise SystemExit(
+            f"Unknown regime_classifier_name={name!r}. "
+            f"Known: {sorted(_CLASSIFIER_REGISTRY)}"
+        )
+    return _CLASSIFIER_REGISTRY[name]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -158,8 +278,12 @@ def _build_runtime(
         filter_mode=spec.filter_mode,  # type: ignore[arg-type]
         filter_pctile_window_bars=spec.filter_pctile_window_bars,
         filter_pctile=spec.filter_pctile,
+        filter_pctile_short=spec.filter_pctile_short,
         enable_session_end_exit=spec.enable_session_end_exit,
         enable_time_stop=spec.enable_time_stop,
+        regime_classifier=_resolve_classifier(spec.regime_classifier_name),
+        regime_gate_mode=spec.regime_gate_mode,  # type: ignore[arg-type]
+        regime_history_bars=spec.regime_history_bars,
     )
 
 

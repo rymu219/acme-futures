@@ -260,6 +260,67 @@ def test_pctile_filter_uses_percentile_when_warm():
     assert "filter_blocked" in d.reason
 
 
+# --- asymmetric short-side pctile (v4-loose-shorts) -----------------------
+
+def test_pctile_short_defaults_to_symmetric():
+    """When filter_pctile_short is unset, both legs use filter_pctile (the
+    pre-v4 behavior — backward compatible)."""
+    e = RyanSpecV3Engine(filter_mode="pctile",
+                         filter_pctile_window_bars=30,
+                         filter_pctile=10.0)
+    # Drive 40 bars with monotonically rising cum_delta so the rolling list is
+    # well-spaced and the percentile boundaries are unambiguous.
+    t = datetime(2026, 5, 5, 9, 0, tzinfo=CT)
+    for i in range(40):
+        e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4999.5, c=5000.0),
+                 bar_delta=0, cum_delta_session=i * 10)
+        t += timedelta(minutes=2)
+    # Long-side threshold uses 10th percentile (low tail).
+    long_thresh = e._compute_pctile_threshold("long")
+    # Short-side threshold uses 90th percentile (high tail) — symmetric default.
+    short_thresh = e._compute_pctile_threshold("short")
+    # Sanity: low tail < high tail and both inside the rolling-window range.
+    # The window holds the last 30 bars (i=10..39), so values are [100..390].
+    assert 100 <= long_thresh < short_thresh <= 390
+    # Symmetry check: on linearly-spaced data the 10th and 90th percentile
+    # values are equidistant from the midpoint, so long+short ≈ min+max.
+    assert abs((long_thresh + short_thresh) - (100 + 390)) < 1.0
+
+
+def test_pctile_short_loosened_makes_short_qualify_more_easily():
+    """v4-loose-shorts: filter_pctile_short=20 means the short threshold sits
+    at the 80th percentile instead of the 90th. Short-side block is therefore
+    LESS strict — values that would have been blocked at the 90th now pass."""
+    # Same data as above but with filter_pctile_short=20 → 80th-percentile cut.
+    e = RyanSpecV3Engine(filter_mode="pctile",
+                         filter_pctile_window_bars=30,
+                         filter_pctile=10.0,
+                         filter_pctile_short=20.0)
+    t = datetime(2026, 5, 5, 9, 0, tzinfo=CT)
+    for i in range(40):
+        e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4999.5, c=5000.0),
+                 bar_delta=0, cum_delta_session=i * 10)
+        t += timedelta(minutes=2)
+    long_thresh = e._compute_pctile_threshold("long")
+    short_thresh_loose = e._compute_pctile_threshold("short")
+    # Reference: an engine with the same data but symmetric (no _short override)
+    # would have its short threshold at the 90th percentile.
+    sym = RyanSpecV3Engine(filter_mode="pctile",
+                           filter_pctile_window_bars=30, filter_pctile=10.0)
+    t = datetime(2026, 5, 5, 9, 0, tzinfo=CT)
+    for i in range(40):
+        sym.on_bar(_bar(t, o=5000.0, h=5000.5, l=4999.5, c=5000.0),
+                   bar_delta=0, cum_delta_session=i * 10)
+        t += timedelta(minutes=2)
+    short_thresh_sym = sym._compute_pctile_threshold("short")
+    # Loosened (80th pctile) sits BELOW the symmetric 90th pctile reference.
+    # That makes the short-side block fire less often — values that were
+    # blocked at the 90th can now pass at the 80th.
+    assert short_thresh_loose < short_thresh_sym
+    # Long side untouched — still uses filter_pctile=10.
+    assert long_thresh < short_thresh_loose
+
+
 # --- MFE / MAE tracking (always-on observability, not a variant) ---------
 
 def test_mfe_and_mae_both_ratchet_independently():

@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import os
 import signal
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from datetime import time as dtime
@@ -37,7 +38,11 @@ from typing import Any, Literal
 import structlog
 from dotenv import load_dotenv
 
-from acme.broker.base import BracketSpec, BrokerAdapter
+from acme.broker.base import (
+    Bar,  # noqa: TC001  used as a runtime type hint string
+    BracketSpec,
+    BrokerAdapter,
+)
 from acme.contracts import MES
 from acme.db import Db
 from acme.ryan_spec.v3_engine import (
@@ -171,11 +176,24 @@ class V3Runtime:
         filter_mode: Literal["static", "pctile"] = "static",
         filter_pctile_window_bars: int = 60,
         filter_pctile: float = 5.0,
+        filter_pctile_short: float | None = None,
         # Time-of-day exits. Default True keeps OOS-validated behavior. Set
         # both False for 24-hour shadow runs where exits should be pure
         # thesis (stop / opposite_signal) only.
         enable_session_end_exit: bool = True,
         enable_time_stop: bool = True,
+        # v4 regime-aware engine. Default None = bare RyanSpecV3Engine (no
+        # behavior change). When set, the runtime wraps the engine in a
+        # V4GatedEngine that consults the classifier on every bar and gates
+        # entries by regime. Backward-compatible: every existing v3 variant
+        # leaves these as None and behaves identically to before PR #B.
+        regime_classifier: Callable[[Sequence[Bar]], str] | None = None,
+        regime_gate_mode: Literal["gate", "flip"] = "gate",
+        # How many bars the wrapper retains for regime classification.
+        # 60 (default) covers EMA(20) + 10-bar lookback. Variants that need
+        # deeper history (e.g. overnight bias = 360 bars ~= 12 h of 2-min
+        # bars; vol-regime baseline = 120 bars) override this per-variant.
+        regime_history_bars: int = 60,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -194,7 +212,7 @@ class V3Runtime:
         # trade → size-weighted (matches OOS exactly)
         thresh = (FILTER_THRESH_UNIT_WEIGHTED if delta_source == "quote"
                   else FILTER_THRESH_SIZE_WEIGHTED)
-        self.engine = RyanSpecV3Engine(
+        engine_kwargs = dict(
             filter_thresh=thresh,
             session_end_ct=session_end_ct,
             session_tz=session_tz,
@@ -206,9 +224,22 @@ class V3Runtime:
             filter_mode=filter_mode,
             filter_pctile_window_bars=filter_pctile_window_bars,
             filter_pctile=filter_pctile,
+            filter_pctile_short=filter_pctile_short,
             enable_session_end_exit=enable_session_end_exit,
             enable_time_stop=enable_time_stop,
         )
+        if regime_classifier is None:
+            self.engine = RyanSpecV3Engine(**engine_kwargs)
+        else:
+            # Wrap in v4 regime-aware engine. Same on_bar interface, so the
+            # rest of the runtime treats it identically.
+            from .v4_engine import V4GatedEngine
+            self.engine = V4GatedEngine(
+                classifier=regime_classifier,
+                gate_mode=regime_gate_mode,
+                regime_history_bars=regime_history_bars,
+                **engine_kwargs,
+            )
         self.builder = LiveBarDeltaBuilder(
             on_bar=self._on_closed_bar,
             session_open_ct=session_open_ct,
