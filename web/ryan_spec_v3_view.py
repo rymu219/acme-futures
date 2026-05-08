@@ -316,7 +316,8 @@ def _exit_dist_pill_html(exit_dist: dict[str, float]) -> str:
 
 
 KNOWN_VARIANTS = ("v3-canon", "v3-trail", "v3-min2bar", "v3-armor", "v3-pctile",
-                  "v4-loose-shorts", "v4-trend-gate")
+                  "v4-loose-shorts", "v4-trend-gate", "v4-overnight-bias",
+                  "v4-vol-regime")
 
 # Promotion-gate thresholds — kept in sync with src/acme/ryan_spec/v3_promotion.py.
 # Web has its own minimal requirements.txt (no pandas, no acme), so the gate

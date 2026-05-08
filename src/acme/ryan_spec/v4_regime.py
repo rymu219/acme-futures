@@ -113,3 +113,94 @@ def classify_trend_ema(
     if ratio < -slope_atr_threshold:
         return "trend_down"
     return "chop"
+
+
+# Tuned for a deep buffer (~12 hours of 2-min bars = 360) so the classifier
+# can see across the overnight Globex session into RTH. With a 60-bar buffer
+# (default) it degrades to a "last 2 hours direction" signal — still useful,
+# just not strictly overnight.
+DEFAULT_OVERNIGHT_THRESHOLD_ATR = 1.0
+DEFAULT_OVERNIGHT_MIN_BARS = 30
+
+
+def classify_overnight_bias(
+    bars: Sequence[Bar],
+    *,
+    threshold_atr: float = DEFAULT_OVERNIGHT_THRESHOLD_ATR,
+    min_bars: int = DEFAULT_OVERNIGHT_MIN_BARS,
+) -> Regime:
+    """Classify the day's bias from the direction of the supplied bar window.
+
+    Mechanizes the "I knew today was a short day" intuition by treating the
+    move from buffer-start to buffer-end as a proxy for the day's directional
+    pressure. With a 360-bar wrapper buffer (12 h), this spans the overnight
+    Globex session up to the most recent bar.
+
+    Compares (last close - first close) to recent average bar range. Above
+    `+threshold_atr` → trend_up; below `-threshold_atr` → trend_down; else
+    chop. Returns chop when fewer than `min_bars` are supplied (early
+    session warmup).
+    """
+    if len(bars) < min_bars:
+        return "chop"
+    move = bars[-1].c - bars[0].c
+    atr = _avg_range(bars[-DEFAULT_LOOKBACK_BARS:])
+    if atr <= 0:
+        return "chop"
+    ratio = move / atr
+    if ratio > threshold_atr:
+        return "trend_up"
+    if ratio < -threshold_atr:
+        return "trend_down"
+    return "chop"
+
+
+# Vol-regime: high realized vol typically coincides with directional days
+# (regardless of direction). This classifier requires BOTH a vol expansion
+# AND a directional confirmation — so it never returns "trend_up" purely
+# because vol is high and chop's range happened to drift up.
+DEFAULT_VOL_FAST_BARS = 30
+DEFAULT_VOL_BASELINE_BARS = 120
+DEFAULT_VOL_RATIO_THRESHOLD = 1.3
+
+
+def classify_vol_regime(
+    bars: Sequence[Bar],
+    *,
+    fast_bars: int = DEFAULT_VOL_FAST_BARS,
+    baseline_bars: int = DEFAULT_VOL_BASELINE_BARS,
+    vol_ratio_threshold: float = DEFAULT_VOL_RATIO_THRESHOLD,
+    slope_atr_threshold: float = DEFAULT_SLOPE_ATR_THRESHOLD,
+) -> Regime:
+    """High-vol-with-direction regime classifier.
+
+    Compute fast and baseline average bar range over the most-recent
+    `fast_bars` and `baseline_bars` respectively. If the ratio
+    fast / baseline exceeds `vol_ratio_threshold`, the market is in a
+    high-vol regime — typically directional. Then check the close-to-close
+    move over the fast window: if directional (above slope_atr_threshold
+    in some direction) return that direction, else fall through to chop.
+
+    Returns "chop" when:
+      - history < baseline_bars (warmup)
+      - vol ratio is not elevated (mean-reversion thesis still applies)
+      - vol is elevated but the move is sideways within the noise band
+    """
+    if len(bars) < baseline_bars:
+        return "chop"
+    fast_atr = _avg_range(bars[-fast_bars:])
+    baseline_atr = _avg_range(bars[-baseline_bars:])
+    if baseline_atr <= 0:
+        return "chop"
+    if fast_atr / baseline_atr < vol_ratio_threshold:
+        return "chop"
+    # Vol expanded — confirm with a directional move over the fast window.
+    move = bars[-1].c - bars[-fast_bars].c
+    if fast_atr <= 0:
+        return "chop"
+    ratio = move / fast_atr
+    if ratio > slope_atr_threshold:
+        return "trend_up"
+    if ratio < -slope_atr_threshold:
+        return "trend_down"
+    return "chop"

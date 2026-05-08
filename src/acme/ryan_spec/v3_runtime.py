@@ -189,6 +189,11 @@ class V3Runtime:
         # leaves these as None and behaves identically to before PR #B.
         regime_classifier: Callable[[Sequence[Bar]], str] | None = None,
         regime_gate_mode: Literal["gate", "flip"] = "gate",
+        # How many bars the wrapper retains for regime classification.
+        # 60 (default) covers EMA(20) + 10-bar lookback. Variants that need
+        # deeper history (e.g. overnight bias = 360 bars ~= 12 h of 2-min
+        # bars; vol-regime baseline = 120 bars) override this per-variant.
+        regime_history_bars: int = 60,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -232,6 +237,7 @@ class V3Runtime:
             self.engine = V4GatedEngine(
                 classifier=regime_classifier,
                 gate_mode=regime_gate_mode,
+                regime_history_bars=regime_history_bars,
                 **engine_kwargs,
             )
         self.builder = LiveBarDeltaBuilder(

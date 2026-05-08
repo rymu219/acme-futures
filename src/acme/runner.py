@@ -20,6 +20,10 @@ and let live shadow data compare them:
   - v4-trend-gate  — v3-canon entries gated by an EMA(20) trend classifier;
                      blocks counter-trend signals (skip-only, never inverts).
                      S1 from the 2026-05-07 post-mortem; PR-B in the v4 plan.
+  - v4-overnight-bias — gates entries by Globex overnight direction (12-hour
+                     buffer). S3 from the post-mortem; PR-C.
+  - v4-vol-regime  — gates entries when realized vol is elevated + price is
+                     directional (high-vol day = trending). S4; PR-C.
 
 All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
@@ -75,6 +79,10 @@ class _VariantSpec:
     # is unaffected by the wrapper.
     regime_classifier_name: str | None = None
     regime_gate_mode: str = "gate"
+    # Buffer depth for the regime classifier. 60 bars = ~2h is enough for the
+    # EMA(20)+10 trend classifier; deeper for vol-regime (needs 120-bar
+    # baseline) and overnight (needs ~360 bars to span Globex into RTH).
+    regime_history_bars: int = 60
     # Time-of-day exits. Defaults False across the fleet right now — see
     # 2026-05-06: user wants 24-hour shadow data with pure-thesis exits
     # (stop / opposite_signal only). Flip back to True per-variant if you
@@ -139,6 +147,28 @@ VARIANTS: list[_VariantSpec] = [
         regime_classifier_name="trend_ema",
         regime_gate_mode="gate",
     ),
+    # PR-C of the v4 plan (S3). Mechanizes "I knew today was a short day"
+    # by inferring the day's bias from the direction of the buffer window
+    # (~12 hours / 360 bars covers Globex overnight into the current RTH).
+    # Blocks counter-bias entries; same skip-only safety as v4-trend-gate.
+    _VariantSpec(
+        strategy_id="v4-overnight-bias",
+        description="Overnight Globex direction gate: skip v3 entries against the day's bias",
+        regime_classifier_name="overnight_bias",
+        regime_gate_mode="gate",
+        regime_history_bars=360,
+    ),
+    # PR-C of the v4 plan (S4). High realized vol typically coincides with
+    # directional days (today = +50% ATR vs the 5/5 baseline). When vol is
+    # elevated AND price is moving, treat the move as the regime; otherwise
+    # treat as chop. 120-bar baseline.
+    _VariantSpec(
+        strategy_id="v4-vol-regime",
+        description="High-vol regime gate: skip v3 counter-trend entries when vol expanded + directional",
+        regime_classifier_name="vol_regime",
+        regime_gate_mode="gate",
+        regime_history_bars=120,
+    ),
 ]
 
 
@@ -156,8 +186,14 @@ def _resolve_classifier(name: str | None) -> Any:
     if not _CLASSIFIER_REGISTRY:
         # Lazy import: keep ryan_spec.* off the module-import path for env-
         # less unit tests that import `acme.runner` to inspect VARIANTS.
-        from acme.ryan_spec.v4_regime import classify_trend_ema
+        from acme.ryan_spec.v4_regime import (
+            classify_overnight_bias,
+            classify_trend_ema,
+            classify_vol_regime,
+        )
         _CLASSIFIER_REGISTRY["trend_ema"] = classify_trend_ema
+        _CLASSIFIER_REGISTRY["overnight_bias"] = classify_overnight_bias
+        _CLASSIFIER_REGISTRY["vol_regime"] = classify_vol_regime
     if name not in _CLASSIFIER_REGISTRY:
         raise SystemExit(
             f"Unknown regime_classifier_name={name!r}. "
@@ -228,6 +264,7 @@ def _build_runtime(
         enable_time_stop=spec.enable_time_stop,
         regime_classifier=_resolve_classifier(spec.regime_classifier_name),
         regime_gate_mode=spec.regime_gate_mode,  # type: ignore[arg-type]
+        regime_history_bars=spec.regime_history_bars,
     )
 
 
