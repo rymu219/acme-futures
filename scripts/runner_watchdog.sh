@@ -30,7 +30,13 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$WATCH_LOG"; }
 
 while true; do
     log "spawning runner"
-    nohup caffeinate -i uv run python -m acme.runner --dry-run \
+    # PYTHONUNBUFFERED=1 forces line-buffering on stdout/stderr so structured
+    # log lines hit RUNNER_LOG immediately. Without it, Python uses full
+    # buffering when stdout is redirected to a file and "tail -f" looks dead
+    # for minutes — we discovered this 2026-05-07 (PR-E) when 21 min of
+    # silent runner.out.log made it look like the runner was hung even
+    # though Supabase heartbeats showed it was processing bars.
+    PYTHONUNBUFFERED=1 nohup caffeinate -i uv run python -m acme.runner --dry-run \
         >> "$RUNNER_LOG" 2>&1 &
     RUNNER_PID=$!
     log "runner spawned with caffeinate PID $RUNNER_PID"
