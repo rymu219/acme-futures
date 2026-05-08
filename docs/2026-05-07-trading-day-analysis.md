@@ -164,3 +164,30 @@ S5 (`v4-symmetric-loosened`) can ship in parallel because it's purely a paramete
 2. Is `v3-armor`'s still-open trade going to be manually flattened, or let it ride to stop?
 3. Priority order: regime gate (S1) first, or symmetric filter loosen (S5) first?
 4. Are we OK adding 1-2 more variants to the live shadow runner, or do we want to rotate them into v3-armor's slot since it's the worst-performing?
+
+---
+
+## Addendum: PR-F — `v5-mtf-anchor` (added later same day)
+
+Source: a Reddit `r/algotrading` post about a multi-timeframe pivot-fade
+bot. Of the six variants we considered grafting from that system (full
+review at `~/.claude/plans/came-across-a-reddit-precious-emerson.md`),
+the only piece that translated cleanly to our flow signal was the
+**multi-timeframe anchoring** idea — gate v3 entries by a higher-TF
+trend rather than the same 2-min trend `v4-trend-gate` already uses.
+
+Implementation: a `_resample_bars` helper aggregates 2-min bars into
+30-min bars (factor=15), then `classify_higher_tf_alignment` runs the
+existing `classify_trend_ema` logic on the resampled series. No new
+trend-detection math; pure composition. `regime_history_bars=480`
+(deepest in the fleet) covers the EMA(20)+10-bar lookback at the
+slower cadence.
+
+Variant lineup is now 11: 5 v3 + 5 v4 + 1 v5.
+
+Skipped from the same review: vanilla pivot replication (re-learns the
+5/7 lesson in a new costume), broken-level flip (needs a level engine
+we don't have), level-quality scoring (same), honest-R "variant" (it's
+a methodology, not a strategy). Fleet-confluence sizing — when 6+
+variants fire same direction same minute — is a real follow-up
+candidate but lives at the runtime layer, not as a variant; deferred.

@@ -29,6 +29,11 @@ and let live shadow data compare them:
                      from the post-mortem; PR-D. Spicier than the gate
                      variants — only ship after the classifier has been
                      validated by the gate variants.
+  - v5-mtf-anchor  — EMA(20) trend gate on 30-min bars resampled from our
+                     2-min input. PR-F (follow-up to the v4 plan, sourced
+                     from the Reddit-system review). Sees through 2-min
+                     wiggle that the v4 trend classifier might over-react
+                     to.
 
 All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
@@ -188,6 +193,22 @@ VARIANTS: list[_VariantSpec] = [
         regime_classifier_name="trend_ema",
         regime_gate_mode="flip",
     ),
+    # PR-F (followup, sourced from the Reddit S&R bot review at
+    # docs/2026-05-07-trading-day-analysis.md). Same EMA(20) trend gate as
+    # v4-trend-gate but applied to a higher timeframe — 30-min bars
+    # resampled from our 2-min input. A 2-min cum_delta extreme during a
+    # FLAT 30-min regime is "real" mean-reversion territory; the same
+    # extreme during a strong 30-min trend is the fade-into-trend trap.
+    # This variant catches the latter when the 2-min EMA is too twitchy
+    # to see it. regime_history_bars=480 covers EMA(20)+10 lookback on
+    # the resampled series (~16h of buffer).
+    _VariantSpec(
+        strategy_id="v5-mtf-anchor",
+        description="30-min EMA trend gate (resampled from 2-min): skip v3 entries against the higher-TF regime",
+        regime_classifier_name="higher_tf_alignment",
+        regime_gate_mode="gate",
+        regime_history_bars=480,
+    ),
 ]
 
 
@@ -206,6 +227,7 @@ def _resolve_classifier(name: str | None) -> Any:
         # Lazy import: keep ryan_spec.* off the module-import path for env-
         # less unit tests that import `acme.runner` to inspect VARIANTS.
         from acme.ryan_spec.v4_regime import (
+            classify_higher_tf_alignment,
             classify_overnight_bias,
             classify_trend_ema,
             classify_vol_regime,
@@ -213,6 +235,7 @@ def _resolve_classifier(name: str | None) -> Any:
         _CLASSIFIER_REGISTRY["trend_ema"] = classify_trend_ema
         _CLASSIFIER_REGISTRY["overnight_bias"] = classify_overnight_bias
         _CLASSIFIER_REGISTRY["vol_regime"] = classify_vol_regime
+        _CLASSIFIER_REGISTRY["higher_tf_alignment"] = classify_higher_tf_alignment
     if name not in _CLASSIFIER_REGISTRY:
         raise SystemExit(
             f"Unknown regime_classifier_name={name!r}. "

@@ -155,6 +155,82 @@ def classify_overnight_bias(
     return "chop"
 
 
+# Higher-timeframe alignment: gate v3 entries by the EMA-trend regime of
+# a *higher* timeframe than the engine's 2-min input bars. Mechanical
+# steps: resample (factor=15 → 30-min bars), then run classify_trend_ema
+# on the resampled series.
+#
+# Why this matters: a 2-min cum_delta extreme during a flat 30-min regime
+# is the canonical "mean-reversion will work here" setup. The same 2-min
+# extreme during a strong 30-min trend is the canonical "fade gets run
+# over" setup that bit us on 2026-05-07. v4-trend-gate handles this at
+# the 2-min EMA level; v5-mtf-anchor handles it at a slower, less twitchy
+# timeframe — the Reddit-system review surfaced this as the only piece of
+# their multi-timeframe approach worth grafting onto our flow signal.
+DEFAULT_HTF_FACTOR = 15  # 30-min HTF bars from 2-min raw bars
+
+
+def _resample_bars(bars: Sequence[Bar], factor: int) -> list[Bar]:
+    """Aggregate every `factor` consecutive bars into one HTF bar (OHLCV).
+
+    open  = first bar's open
+    high  = max(highs)
+    low   = min(lows)
+    close = last bar's close
+    volume = sum(volumes)
+    timestamp = first bar's timestamp (anchor at the start of the bucket)
+
+    The trailing partial group (< factor bars) is intentionally dropped so
+    a half-formed HTF bar can't skew the trend slope.
+    """
+    if factor <= 0:
+        raise ValueError(f"factor must be positive, got {factor}")
+    out: list[Bar] = []
+    n_full = len(bars) // factor
+    for i in range(n_full):
+        chunk = bars[i * factor : (i + 1) * factor]
+        out.append(
+            Bar(
+                t=chunk[0].t,
+                o=chunk[0].o,
+                h=max(b.h for b in chunk),
+                l=min(b.l for b in chunk),
+                c=chunk[-1].c,
+                v=sum(b.v for b in chunk),
+            )
+        )
+    return out
+
+
+def classify_higher_tf_alignment(
+    bars: Sequence[Bar],
+    *,
+    htf_factor: int = DEFAULT_HTF_FACTOR,
+    period: int = DEFAULT_EMA_PERIOD,
+    lookback_bars: int = DEFAULT_LOOKBACK_BARS,
+    slope_atr_threshold: float = DEFAULT_SLOPE_ATR_THRESHOLD,
+) -> Regime:
+    """Resample raw bars to a higher timeframe, then apply EMA-trend logic.
+
+    Composition: `_resample_bars(bars, htf_factor)` then
+    `classify_trend_ema(...)` on the resampled series. Returns 'chop'
+    when the resampled history is too short (the inner classifier handles
+    the warmup branch).
+
+    The variant `v5-mtf-anchor` uses this with the default factor (30-min
+    HTF), running the same EMA(20) trend rule we already trust at 2-min,
+    but at a less twitchy cadence so a single ambiguous fast bar can't
+    flip the gate state.
+    """
+    htf_bars = _resample_bars(bars, htf_factor)
+    return classify_trend_ema(
+        htf_bars,
+        period=period,
+        lookback_bars=lookback_bars,
+        slope_atr_threshold=slope_atr_threshold,
+    )
+
+
 # Vol-regime: high realized vol typically coincides with directional days
 # (regardless of direction). This classifier requires BOTH a vol expansion
 # AND a directional confirmation — so it never returns "trend_up" purely
