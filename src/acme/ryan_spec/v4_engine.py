@@ -13,8 +13,13 @@ Action modes:
 
     "flip" — *invert* counter-regime entries instead of dropping them. Long
              signal in "trend_down" becomes a short with the same entry.
-             Reserved for PR-D once gate-mode has shown the classifier is
-             reliable; not yet implemented here.
+             The thesis: when the v3 filter detects a cum_delta extreme
+             during a trend day, that extreme is *continuation*, not
+             exhaustion — so trade with the trend. Higher upside than gate
+             mode, but also active wrong-side trades when the regime
+             classifier misclassifies a chop day. Ship gate-mode first
+             (PR-B/C); only graduate to flip-mode after gate variants
+             have shown the classifier is reliable.
 
 This wrapper holds its own bar history (the v3 engine's `_history` deque is
 sized for BB+1, too small for an EMA(20)+lookback regime calc). Same
@@ -59,10 +64,6 @@ class V4GatedEngine:
         regime_history_bars: int = DEFAULT_REGIME_HISTORY,
         **engine_kwargs: Any,
     ) -> None:
-        if gate_mode == "flip":
-            raise NotImplementedError(
-                "flip mode is reserved for PR-D — not yet implemented"
-            )
         self._engine = RyanSpecV3Engine(**engine_kwargs)
         self._classifier = classifier
         self._gate_mode: GateMode = gate_mode
@@ -125,17 +126,40 @@ class V4GatedEngine:
         if regime == "chop":
             return decision
         # Counter-regime: regime says trend_up but decision is short, or
-        # regime says trend_down but decision is long. Block.
+        # regime says trend_down but decision is long.
         counter = (
             (regime == "trend_up" and decision.direction == "short")
             or (regime == "trend_down" and decision.direction == "long")
         )
         if not counter:
             return decision
-        # Replace the enter decision with a `none` carrying a self-describing
-        # reason — visible in the trade log / dashboard.
+        if self._gate_mode == "gate":
+            # Replace the enter decision with a `none` carrying a self-
+            # describing reason — visible in the trade log / dashboard.
+            return Decision(
+                action="none",
+                reason=f"regime_gate_blocked_{regime}_{decision.direction}",
+                bar_ts=decision.bar_ts,
+            )
+        # gate_mode == "flip" — invert the entry direction. The flip pivots
+        # `stop_price` symmetrically around `entry_price` so the new stop
+        # sits the same ATR distance on the OPPOSITE side. cum_delta and
+        # ATR at entry are properties of the bar we entered on, so they
+        # carry through unchanged.
+        new_direction = "short" if decision.direction == "long" else "long"
+        new_stop = None
+        if (
+            decision.entry_price is not None
+            and decision.stop_price is not None
+        ):
+            new_stop = 2.0 * decision.entry_price - decision.stop_price
         return Decision(
-            action="none",
-            reason=f"regime_gate_blocked_{regime}_{decision.direction}",
+            action="enter",
+            direction=new_direction,
+            reason=f"regime_flip_{decision.direction}_to_{new_direction}_in_{regime}",
+            entry_price=decision.entry_price,
+            stop_price=new_stop,
             bar_ts=decision.bar_ts,
+            cum_delta_at_entry=decision.cum_delta_at_entry,
+            atr_at_entry=decision.atr_at_entry,
         )

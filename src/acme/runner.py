@@ -24,6 +24,11 @@ and let live shadow data compare them:
                      buffer). S3 from the post-mortem; PR-C.
   - v4-vol-regime  — gates entries when realized vol is elevated + price is
                      directional (high-vol day = trending). S4; PR-C.
+  - v4-trend-flip  — same EMA(20) trend classifier as v4-trend-gate, but
+                     INVERTS counter-trend entries instead of skipping. S2
+                     from the post-mortem; PR-D. Spicier than the gate
+                     variants — only ship after the classifier has been
+                     validated by the gate variants.
 
 All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
@@ -168,6 +173,20 @@ VARIANTS: list[_VariantSpec] = [
         regime_classifier_name="vol_regime",
         regime_gate_mode="gate",
         regime_history_bars=120,
+    ),
+    # PR-D of the v4 plan (S2 — the spicy one). Same EMA(20) trend
+    # classifier as v4-trend-gate, but instead of *skipping* counter-trend
+    # entries we *invert* them: long signal in trend_down → short entry,
+    # stop pivoted symmetrically. The thesis: at cum_delta extremes during
+    # a strong-trend day, the extreme is *continuation* not *exhaustion*.
+    # Highest upside if the regime classifier is reliable; active wrong-side
+    # trades if it misclassifies a chop day. Ride v4-trend-gate alongside
+    # as the safer cousin.
+    _VariantSpec(
+        strategy_id="v4-trend-flip",
+        description="EMA(20) trend flip: invert v3 entries that go against the recent regime",
+        regime_classifier_name="trend_ema",
+        regime_gate_mode="flip",
     ),
 ]
 

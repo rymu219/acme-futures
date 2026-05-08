@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from acme.broker.base import Bar
-from acme.ryan_spec.v3_engine import RyanSpecV3Engine
+from acme.ryan_spec.v3_engine import Decision, RyanSpecV3Engine
 from acme.ryan_spec.v4_engine import V4GatedEngine
 from acme.ryan_spec.v4_regime import Regime
 
@@ -123,14 +123,68 @@ def test_classifier_called_with_recent_bars():
     assert seen_lengths[-1] == 7
 
 
-def test_flip_mode_not_yet_implemented():
-    """Flip mode is reserved for PR-D. Constructing it raises immediately
-    so no caller silently gets a half-baked behavior."""
-    with pytest.raises(NotImplementedError):
-        V4GatedEngine(
-            classifier=lambda _b: "chop",  # type: ignore[arg-type,return-value]
-            gate_mode="flip",
-        )
+# --- flip mode (PR-D) ---------------------------------------------------
+
+def test_flip_mode_inverts_long_to_short_in_trend_down():
+    """flip mode + trend_down regime + long entry → short entry, stop
+    pivoted to the opposite side of entry, all other fields preserved."""
+    e = V4GatedEngine(classifier=lambda _bars: "trend_down", gate_mode="flip")
+    t = _flat_warmup(e)
+    decision, _ = _trigger_long(e, t)
+    assert decision.action == "enter"
+    assert decision.direction == "short"
+    # Stop pivots symmetrically: new_stop = 2*entry - old_stop.
+    # _trigger_long entry is the bar B close, stop is at entry - stop_atr_mult * atr.
+    # We don't know exact values but we can verify the symmetry property.
+    assert decision.entry_price is not None
+    assert decision.stop_price is not None
+    # Stop is now ABOVE entry (short position).
+    assert decision.stop_price > decision.entry_price
+    # Reason captures the flip context for debugging.
+    assert "regime_flip_long_to_short" in decision.reason
+    assert "trend_down" in decision.reason
+
+
+def test_flip_mode_passes_aligned_entries_unchanged():
+    """flip mode but the entry is ALIGNED with the regime (long in
+    trend_up) → no flip, decision passes through identical."""
+    e = V4GatedEngine(classifier=lambda _bars: "trend_up", gate_mode="flip")
+    t = _flat_warmup(e)
+    decision, _ = _trigger_long(e, t)
+    assert decision.action == "enter"
+    assert decision.direction == "long"
+    # No flip reason in the message.
+    assert "regime_flip" not in decision.reason
+
+
+def test_flip_mode_chop_regime_no_override():
+    """Chop regime never flips, just like gate mode never blocks in chop."""
+    e = V4GatedEngine(classifier=lambda _bars: "chop", gate_mode="flip")
+    t = _flat_warmup(e)
+    decision, _ = _trigger_long(e, t)
+    assert decision.action == "enter"
+    assert decision.direction == "long"
+
+
+def test_flip_stop_symmetry():
+    """Verify stop_price pivots exactly 2*entry - old_stop. Construct a
+    handcrafted Decision and pipe it through _apply_gate."""
+    e = V4GatedEngine(classifier=lambda _bars: "trend_down", gate_mode="flip")
+    e._last_regime = "trend_down"
+    fake = Decision(
+        action="enter", direction="long", reason="oos_v3_signal",
+        entry_price=100.0, stop_price=98.0,
+        bar_ts=datetime(2026, 5, 7, 9, 0, tzinfo=CT),
+        cum_delta_at_entry=-2500, atr_at_entry=1.33,
+    )
+    flipped = e._apply_gate(fake)
+    assert flipped.direction == "short"
+    assert flipped.entry_price == 100.0
+    # 2*100 - 98 = 102
+    assert flipped.stop_price == 102.0
+    # Carries through.
+    assert flipped.cum_delta_at_entry == -2500
+    assert flipped.atr_at_entry == 1.33
 
 
 # --- short-side gating (forward-looking; the live fleet rarely shorts but
