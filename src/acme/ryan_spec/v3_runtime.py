@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import os
 import signal
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from datetime import time as dtime
@@ -37,7 +38,11 @@ from typing import Any, Literal
 import structlog
 from dotenv import load_dotenv
 
-from acme.broker.base import BracketSpec, BrokerAdapter
+from acme.broker.base import (
+    Bar,  # noqa: TC001  used as a runtime type hint string
+    BracketSpec,
+    BrokerAdapter,
+)
 from acme.contracts import MES
 from acme.db import Db
 from acme.ryan_spec.v3_engine import (
@@ -177,6 +182,13 @@ class V3Runtime:
         # thesis (stop / opposite_signal) only.
         enable_session_end_exit: bool = True,
         enable_time_stop: bool = True,
+        # v4 regime-aware engine. Default None = bare RyanSpecV3Engine (no
+        # behavior change). When set, the runtime wraps the engine in a
+        # V4GatedEngine that consults the classifier on every bar and gates
+        # entries by regime. Backward-compatible: every existing v3 variant
+        # leaves these as None and behaves identically to before PR #B.
+        regime_classifier: Callable[[Sequence[Bar]], str] | None = None,
+        regime_gate_mode: Literal["gate", "flip"] = "gate",
     ) -> None:
         self.broker = broker
         self.db = db
@@ -195,7 +207,7 @@ class V3Runtime:
         # trade → size-weighted (matches OOS exactly)
         thresh = (FILTER_THRESH_UNIT_WEIGHTED if delta_source == "quote"
                   else FILTER_THRESH_SIZE_WEIGHTED)
-        self.engine = RyanSpecV3Engine(
+        engine_kwargs = dict(
             filter_thresh=thresh,
             session_end_ct=session_end_ct,
             session_tz=session_tz,
@@ -211,6 +223,17 @@ class V3Runtime:
             enable_session_end_exit=enable_session_end_exit,
             enable_time_stop=enable_time_stop,
         )
+        if regime_classifier is None:
+            self.engine = RyanSpecV3Engine(**engine_kwargs)
+        else:
+            # Wrap in v4 regime-aware engine. Same on_bar interface, so the
+            # rest of the runtime treats it identically.
+            from .v4_engine import V4GatedEngine
+            self.engine = V4GatedEngine(
+                classifier=regime_classifier,
+                gate_mode=regime_gate_mode,
+                **engine_kwargs,
+            )
         self.builder = LiveBarDeltaBuilder(
             on_bar=self._on_closed_bar,
             session_open_ct=session_open_ct,

@@ -17,6 +17,9 @@ and let live shadow data compare them:
   - v4-loose-shorts — asymmetric pctile (5% longs, 12% shorts) — first short-bias
                      variant, added 2026-05-07 after the fleet fired 1,063 longs
                      vs 1 short over 4 days (see docs/2026-05-07-trading-day-analysis.md)
+  - v4-trend-gate  — v3-canon entries gated by an EMA(20) trend classifier;
+                     blocks counter-trend signals (skip-only, never inverts).
+                     S1 from the 2026-05-07 post-mortem; PR-B in the v4 plan.
 
 All variants share ONE ProjectXAdapter (SignalR fan-out at the broker layer
 lets them all consume the same market hub connection). Each writes trades
@@ -66,6 +69,12 @@ class _VariantSpec:
     # both legs). Set to a wider value (e.g. 10) to make the short leg fire
     # more often on a market like MES where cum_delta drifts negative.
     filter_pctile_short: float | None = None
+    # v4 regime gate. None → bare v3 engine, no regime override. Otherwise a
+    # short string identifier resolved by `_resolve_classifier()` to a callable.
+    # Backward-compatible default: every existing v3 variant has this None and
+    # is unaffected by the wrapper.
+    regime_classifier_name: str | None = None
+    regime_gate_mode: str = "gate"
     # Time-of-day exits. Defaults False across the fleet right now — see
     # 2026-05-06: user wants 24-hour shadow data with pure-thesis exits
     # (stop / opposite_signal only). Flip back to True per-variant if you
@@ -119,7 +128,42 @@ VARIANTS: list[_VariantSpec] = [
         filter_pctile=5.0,
         filter_pctile_short=12.0,
     ),
+    # PR-B of the v4 plan (S1 from the post-mortem). Wraps v3-canon entry
+    # logic with an EMA-trend regime classifier; blocks counter-trend entries
+    # but does NOT flip them. On a strong-trend day like 2026-05-07 this would
+    # have skipped the catastrophic counter-trend longs entirely. Conservative
+    # — can only ever reduce trade count, never invert direction.
+    _VariantSpec(
+        strategy_id="v4-trend-gate",
+        description="EMA(20) trend gate: skip v3 entries that go against the recent regime",
+        regime_classifier_name="trend_ema",
+        regime_gate_mode="gate",
+    ),
 ]
+
+
+# Maps the short-string identifier in `_VariantSpec.regime_classifier_name`
+# to the actual callable. New classifiers (overnight, vol_regime, ...) added
+# in PR-C just append rows here. Keeping the registry centralised (rather
+# than embedding callables in the spec) keeps the spec dataclass simple
+# and human-readable.
+_CLASSIFIER_REGISTRY: dict[str, Any] = {}
+
+
+def _resolve_classifier(name: str | None) -> Any:
+    if name is None:
+        return None
+    if not _CLASSIFIER_REGISTRY:
+        # Lazy import: keep ryan_spec.* off the module-import path for env-
+        # less unit tests that import `acme.runner` to inspect VARIANTS.
+        from acme.ryan_spec.v4_regime import classify_trend_ema
+        _CLASSIFIER_REGISTRY["trend_ema"] = classify_trend_ema
+    if name not in _CLASSIFIER_REGISTRY:
+        raise SystemExit(
+            f"Unknown regime_classifier_name={name!r}. "
+            f"Known: {sorted(_CLASSIFIER_REGISTRY)}"
+        )
+    return _CLASSIFIER_REGISTRY[name]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -182,6 +226,8 @@ def _build_runtime(
         filter_pctile_short=spec.filter_pctile_short,
         enable_session_end_exit=spec.enable_session_end_exit,
         enable_time_stop=spec.enable_time_stop,
+        regime_classifier=_resolve_classifier(spec.regime_classifier_name),
+        regime_gate_mode=spec.regime_gate_mode,  # type: ignore[arg-type]
     )
 
 
