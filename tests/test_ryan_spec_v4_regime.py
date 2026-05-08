@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from acme.broker.base import Bar
 from acme.ryan_spec.v4_regime import (
     _ema,
+    _resample_bars,
+    classify_higher_tf_alignment,
     classify_overnight_bias,
     classify_trend_ema,
     classify_vol_regime,
@@ -186,3 +188,85 @@ def test_vol_chop_when_expanded_but_directionless():
     bars = _series_with_vol_step(direction=0, fast_atr=2.0)
     assert classify_vol_regime(bars, fast_bars=30, baseline_bars=120,
                                vol_ratio_threshold=1.3) == "chop"
+
+
+# --- _resample_bars + classify_higher_tf_alignment (PR-F) ----------------
+
+def test_resample_bars_ohlcv_correctness():
+    """Each HTF bar's OHLCV is computed from its raw-bar group correctly.
+    open=first, high=max, low=min, close=last, volume=sum."""
+    t0 = datetime(2026, 5, 7, 9, 0, tzinfo=CT)
+    raw = []
+    for i in range(10):
+        # Vary OHLCV deterministically so we can assert exact resample math.
+        raw.append(Bar(
+            t=t0 + timedelta(minutes=2 * i),
+            o=100.0 + i,
+            h=105.0 + i,
+            l=95.0 + i,
+            c=101.0 + i,
+            v=10 + i,
+        ))
+    htf = _resample_bars(raw, factor=5)
+    assert len(htf) == 2
+    # First HTF bar: bars 0-4
+    first = htf[0]
+    assert first.o == 100.0  # first.o
+    assert first.h == 109.0  # max of [105..109]
+    assert first.l == 95.0   # min of [95..99]
+    assert first.c == 105.0  # last bar's close (101+4)
+    assert first.v == sum(10 + i for i in range(5))
+    # Second HTF bar: bars 5-9
+    second = htf[1]
+    assert second.o == 105.0
+    assert second.h == 114.0
+    assert second.l == 100.0
+    assert second.c == 110.0
+    assert second.v == sum(10 + i for i in range(5, 10))
+
+
+def test_resample_drops_partial_trailing_group():
+    """N raw bars at factor F → N // F HTF bars; trailing < F bars dropped."""
+    raw = _series([100.0] * 32)
+    htf = _resample_bars(raw, factor=10)
+    assert len(htf) == 3  # 32 // 10 = 3, the trailing 2 bars are discarded
+
+
+def test_resample_zero_factor_raises():
+    """Sanity: factor must be positive."""
+    import pytest
+    with pytest.raises(ValueError):
+        _resample_bars(_series([100.0] * 5), factor=0)
+
+
+def test_higher_tf_alignment_chop_on_warmup():
+    """Insufficient raw bars → chop (the inner classify_trend_ema's
+    warmup branch fires after resampling)."""
+    bars = _series([100.0] * 100)  # at factor=15 → 6 HTF bars, < 30 needed
+    assert classify_higher_tf_alignment(bars) == "chop"
+
+
+def test_higher_tf_alignment_trend_up_on_rising_htf():
+    """450 raw bars resampled to 30 HTF bars rising linearly → trend_up."""
+    closes = [100.0 + i * 0.05 for i in range(450)]
+    bars = _series(closes, atr=1.0)
+    assert classify_higher_tf_alignment(bars) == "trend_up"
+
+
+def test_higher_tf_alignment_trend_down_on_falling_htf():
+    closes = [100.0 - i * 0.05 for i in range(450)]
+    bars = _series(closes, atr=1.0)
+    assert classify_higher_tf_alignment(bars) == "trend_down"
+
+
+def test_higher_tf_alignment_chop_on_lower_tf_noise_higher_tf_flat():
+    """Killer-feature test: 2-min noise within ATR but no net 30-min drift
+    → chop. This is the *whole point* of the variant — it sees through
+    short-timeframe wiggle that v4-trend-gate might over-react to."""
+    # Sawtooth pattern: alternates ±0.4 each bar so the 2-min EMA sees
+    # significant local moves, but consecutive bars cancel out so the
+    # 30-min resampled close is near-flat.
+    closes = [100.0 + (0.4 if i % 2 else -0.4) for i in range(450)]
+    bars = _series(closes, atr=1.0)
+    # The 30-min EMA slope should sit inside the noise band → chop.
+    assert classify_higher_tf_alignment(bars) == "chop"
