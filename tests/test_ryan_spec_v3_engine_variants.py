@@ -321,6 +321,125 @@ def test_pctile_short_loosened_makes_short_qualify_more_easily():
     assert long_thresh < short_thresh_loose
 
 
+# --- v3.1 safeguards (PR-G) ---------------------------------------------
+
+def test_entry_atr_ceiling_blocks_high_vol_entries():
+    """When entry_atr_ceiling is set, entries above the ceiling are skipped
+    even though every other condition would have produced an enter decision."""
+    e = RyanSpecV3Engine(entry_atr_ceiling=2.5)
+    # Warm up with WIDE bars so ATR climbs above 2.5
+    t = datetime(2026, 5, 5, 9, 0, tzinfo=CT)
+    for _ in range(22):
+        e.on_bar(_bar(t, o=5000.0, h=5004.0, l=4996.0, c=5000.0),
+                 bar_delta=0, cum_delta_session=0)
+        t += timedelta(minutes=2)
+    # Drive entry trigger
+    e.on_bar(_bar(t, o=5000.0, h=5004.0, l=4995.0, c=4998.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4998.0, h=5002.0, l=4995.0, c=5001.0),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "none"
+    assert "entry_atr_ceiling_blocked" in d.reason
+
+
+def test_entry_atr_ceiling_default_off_lets_high_vol_through():
+    """Default ceiling=None preserves canonical behavior — high-ATR entries fire."""
+    e = RyanSpecV3Engine()  # ceiling=None
+    t = datetime(2026, 5, 5, 9, 0, tzinfo=CT)
+    for _ in range(22):
+        e.on_bar(_bar(t, o=5000.0, h=5004.0, l=4996.0, c=5000.0),
+                 bar_delta=0, cum_delta_session=0)
+        t += timedelta(minutes=2)
+    e.on_bar(_bar(t, o=5000.0, h=5004.0, l=4995.0, c=4998.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4998.0, h=5002.0, l=4995.0, c=5001.0),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "enter"
+
+
+def test_entry_hour_blacklist_blocks_configured_hours():
+    """When the entry bar's CT hour is in the blacklist, the entry is skipped."""
+    # Engine session_tz defaults to CT; this engine's CT happens to be UTC-6
+    # in our test fixture (no DST). Build a setup where the entry bar lands
+    # at 11:00 CT — a blacklisted hour.
+    e = RyanSpecV3Engine(entry_hour_blacklist_ct=(6, 7, 8, 11, 12))
+    # Warmup at 09:00 CT, then advance into 11:00 territory.
+    t = _flat_warmup(e, start_ct=datetime(2026, 5, 5, 10, 30, tzinfo=CT))
+    # After 22 warmup bars at 2-min cadence, t is at 11:14 CT — in blacklist.
+    e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4998.5, c=4999.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4999.0, h=5001.0, l=4998.5, c=5000.5),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "none"
+    assert "entry_hour_blacklist_blocked" in d.reason
+
+
+def test_entry_hour_blacklist_off_by_default():
+    """Default empty tuple preserves canonical behavior."""
+    e = RyanSpecV3Engine()
+    t = _flat_warmup(e, start_ct=datetime(2026, 5, 5, 10, 30, tzinfo=CT))
+    e.on_bar(_bar(t, o=5000.0, h=5000.5, l=4998.5, c=4999.0),
+             bar_delta=-200, cum_delta_session=-2500)
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=4999.0, h=5001.0, l=4998.5, c=5000.5),
+                 bar_delta=-100, cum_delta_session=-2600)
+    assert d.action == "enter"
+
+
+def test_bar1_fast_fail_exits_when_mae_dominates_mfe():
+    """At bar 1, if MAE > MFE × 1.5, the fast-fail rule exits with reason
+    `bar1_fast_fail`. This is the v3.1 refinement that caps loss size on
+    trades that go against immediately."""
+    e = RyanSpecV3Engine(enable_bar1_fast_fail=True,
+                         bar1_fast_fail_mae_mfe_ratio=1.5)
+    t = _flat_warmup(e)
+    t, atr = _open_long(e, t)
+    entry = e.position.entry_fill
+    # Bar 1 of the held position: minimal favorable, large adverse move.
+    # MFE = 0.2 (high just barely above entry); MAE = 1.5 (low well below).
+    # 1.5 > 0.2 × 1.5 = 0.3 → fast-fail triggers.
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=entry, h=entry + 0.2, l=entry - 1.5,
+                      c=entry - 1.0),
+                 bar_delta=0, cum_delta_session=-2700)
+    assert d.action == "exit"
+    assert d.reason == "bar1_fast_fail"
+
+
+def test_bar1_fast_fail_does_not_trigger_when_favorable():
+    """If MFE dominates by bar 1 (the winners-look-like-this profile), the
+    fast-fail rule must NOT fire."""
+    e = RyanSpecV3Engine(enable_bar1_fast_fail=True)
+    t = _flat_warmup(e)
+    t, atr = _open_long(e, t)
+    entry = e.position.entry_fill
+    # MFE = 1.5 (price went up); MAE = 0.2 (small dip). Wins-like.
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=entry, h=entry + 1.5, l=entry - 0.2,
+                      c=entry + 1.0),
+                 bar_delta=0, cum_delta_session=-2700)
+    # Should NOT exit on fast-fail. May still hold or hit other exits;
+    # critically, the reason should not be bar1_fast_fail.
+    assert d.reason != "bar1_fast_fail"
+
+
+def test_bar1_fast_fail_off_by_default():
+    """Default off — even an obvious bar-1 loss should not trigger the
+    fast-fail exit on a vanilla canon engine."""
+    e = RyanSpecV3Engine()
+    t = _flat_warmup(e)
+    t, atr = _open_long(e, t)
+    entry = e.position.entry_fill
+    t += timedelta(minutes=2)
+    d = e.on_bar(_bar(t, o=entry, h=entry + 0.2, l=entry - 1.5,
+                      c=entry - 1.0),
+                 bar_delta=0, cum_delta_session=-2700)
+    assert d.reason != "bar1_fast_fail"
+
+
 # --- MFE / MAE tracking (always-on observability, not a variant) ---------
 
 def test_mfe_and_mae_both_ratchet_independently():

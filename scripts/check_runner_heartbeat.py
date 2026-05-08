@@ -35,10 +35,11 @@ from supabase import create_client  # noqa: E402
 
 MAX_STALE_SEC = int(os.environ.get("ACME_HEARTBEAT_MAX_STALE_SEC", "300"))
 
-# Matches any vN-... service id (v3-canon, v4-trend-gate, hypothetical v5-foo).
-# Pulled to a regex because PostgREST's `like` only takes one pattern and we
-# want a single round-trip; we filter client-side for simplicity.
-_SERVICE_PREFIX_RE = re.compile(r"^v\d+-")
+# Matches any vN-... or vN.M-... service id (v3-canon, v3.1-canon,
+# v4-trend-gate, hypothetical v5-foo). Pulled to a regex because
+# PostgREST's `like` only takes one pattern and we want a single
+# round-trip; we filter client-side for simplicity.
+_SERVICE_PREFIX_RE = re.compile(r"^v\d+(\.\d+)?-")
 
 
 def main() -> int:
