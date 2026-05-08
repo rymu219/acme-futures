@@ -1,16 +1,22 @@
 """Heartbeat-staleness probe used by the watchdog.
 
 Reads SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY from the project .env, queries
-the runtime_heartbeats table, and exits 0 if any v3-* heartbeat is fresh
+the runtime_heartbeats table, and exits 0 if any v{N}-* heartbeat is fresh
 (< MAX_STALE_SEC), exit 1 if all are stale (or table is empty).
 
 Watchdog calls this on a timer; if it returns 1, the runner is hung even
 if its log doesn't show signalrcore zombie spam (e.g. Mac sleep, ProjectX
 auth expiry, whatever).
+
+The service prefix filter matches any `v<digit>-` strategy id so future
+v5/v6 variants automatically count without re-deploying the watchdog
+(2026-05-07 PR-E: was previously hardcoded to `v3-` and missed all 5
+v4 variants when they shipped).
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +35,11 @@ from supabase import create_client  # noqa: E402
 
 MAX_STALE_SEC = int(os.environ.get("ACME_HEARTBEAT_MAX_STALE_SEC", "300"))
 
+# Matches any vN-... service id (v3-canon, v4-trend-gate, hypothetical v5-foo).
+# Pulled to a regex because PostgREST's `like` only takes one pattern and we
+# want a single round-trip; we filter client-side for simplicity.
+_SERVICE_PREFIX_RE = re.compile(r"^v\d+-")
+
 
 def main() -> int:
     url = os.environ.get("SUPABASE_URL")
@@ -41,13 +52,16 @@ def main() -> int:
         res = (
             sb.table("runtime_heartbeats")
             .select("service,ts")
-            .like("service", "v3-%")
             .execute()
         )
     except Exception as e:
         print(f"supabase query failed: {e}", file=sys.stderr)
         return 2  # don't kill on a transient supabase blip
-    rows = res.data or []
+    # Filter client-side to any vN-* service. Catches v3, v4, and future
+    # generations without needing a code change here.
+    all_rows = res.data or []
+    rows = [r for r in all_rows
+            if r.get("service") and _SERVICE_PREFIX_RE.match(r["service"])]
     if not rows:
         print("no v3 heartbeats found")
         return 1
