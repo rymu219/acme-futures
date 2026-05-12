@@ -239,6 +239,56 @@ class Conductor:
 
                 await self._process_bar(bar, tf, contract_id, starting_balance, state)
 
+                # Per-strategy heartbeat — one row per active strategy per
+                # bar. Lets the UI / watchdog detect a stale runner without
+                # depending on broker_events (which only fires on closed
+                # trades — could be silent for hours during slow markets).
+                self._write_fleet_heartbeats(bar, contract_id)
+
+    def _write_fleet_heartbeats(self, bar, contract_id: str) -> None:
+        """Upsert one row in runtime_heartbeats per active strategy.
+
+        position_state is derived from the per-strategy phantom position
+        in dry-run (each strategy can have its own open position even
+        though the broker-level position is single). In live mode, every
+        strategy mirrors the conductor's broker position state.
+        """
+        if self.db is None:
+            return
+        is_short = self.position < 0
+        is_long = self.position > 0
+        for rec in self.registry.list_active():
+            if rec.instance is None:
+                continue
+            if self.dry_run:
+                phantom = self.dry_run_position_per_strategy.get(rec.name, 0)
+                if phantom > 0:
+                    pos_state = "long"
+                elif phantom < 0:
+                    pos_state = "short"
+                else:
+                    pos_state = "flat"
+            else:
+                pos_state = "long" if is_long else ("short" if is_short else "flat")
+            try:
+                self.db.write_heartbeat(
+                    rec.name,
+                    last_bar_ts=bar.t,
+                    auth_ok=True,
+                    consecutive_errors=0,
+                    position_state=pos_state,
+                    extra={
+                        "contract_id": contract_id,
+                        "mode": "paper" if self.dry_run else "live",
+                        "broker": type(self.broker).__name__,
+                        "lifecycle": rec.state,
+                        "timeframe_minutes": rec.instance.timeframe_minutes,
+                    },
+                )
+            except Exception as e:
+                log.warning("fleet_heartbeat_write_failed",
+                            strategy=rec.name, error=str(e))
+
     async def _process_bar(
         self,
         bar,
