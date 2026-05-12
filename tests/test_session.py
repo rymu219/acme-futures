@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 
 from acme.broker.base import Bar
 from acme.risk import TOPSTEP_50K, DailyState
-from acme.strategies.session import SessionConfig, SessionStrategy
+from acme.strategies.session import AUDIT_WINDOWS, SessionConfig, SessionStrategy
 
 
 def _state():
@@ -115,7 +115,8 @@ def test_entry_on_up_bias_inside_window():
 
 
 def test_no_entry_outside_window():
-    s = SessionStrategy()
+    # Opt into audit windows for the windowing test — default is no gating.
+    s = SessionStrategy(SessionConfig(time_windows=AUDIT_WINDOWS))
     state = _state()
     # Same ascending sequence but the "current" bar is outside any window.
     pre_window_start = T_OUTSIDE - timedelta(minutes=2 * 50)
@@ -180,7 +181,8 @@ def test_shorts_enabled_via_config():
 
 
 def test_window_close_exit_fires():
-    s = SessionStrategy()
+    # Window-close exit is only meaningful when windows are set.
+    s = SessionStrategy(SessionConfig(time_windows=AUDIT_WINDOWS))
     state = _state()
     pre_window_start = T_WINDOW_OPEN - timedelta(minutes=2 * 50)
     for b in _build_uptrend_bars(pre_window_start, n=50):

@@ -690,14 +690,18 @@ def _render_html(sb, *, token: str | None = None) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(token: str | None = Query(default=None)):
+def home(token: str | None = Query(default=None),
+         bucket: str = Query(default="all")):
     """Main page: new-fleet dashboard (IGNITION / SESSION / REGIME /
     BOUNDARY in SHADOW). The 16-variant v3 dashboard is preserved as
-    a read-only archive at /v3-archive."""
+    a read-only archive at /v3-archive.
+
+    `bucket` filters strategy cards / bars-held / recent trades by
+    entry-hour bucket (CT). See fleet_view.TIME_BUCKETS for keys."""
     _check_token(token)
     sb = _client()
     from fleet_view import render_overview as render_new_fleet
-    return render_new_fleet(sb, token=token)
+    return render_new_fleet(sb, token=token, bucket=bucket)
 
 
 @app.get("/v3-archive", response_class=HTMLResponse)

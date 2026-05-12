@@ -58,22 +58,29 @@ class IgnitionTimeWindow:
         return cls(time(start_hour, 0), time(end_hour, 0))
 
 
-# Audit §2 winners. NOT the Pine indicator's defaults — those put the
-# afternoon prime window over 13:00 CT, which the audit shows is the
-# single worst hour in the fleet's 7d history.
-DEFAULT_TIME_WINDOWS: tuple[IgnitionTimeWindow, ...] = (
+# Audit §2 winners — kept as a named constant so callers can opt in
+# explicitly via `IgnitionConfig(time_windows=AUDIT_WINDOWS)` if they
+# want to restrict trading to those hours. NOT applied by default
+# (lifted 2026-05-11) — the strategy now trades any hour and the UI
+# does the time-bucket slicing.
+AUDIT_WINDOWS: tuple[IgnitionTimeWindow, ...] = (
     IgnitionTimeWindow.from_hours(3, 5),    # 03:00–05:00 CT — Euro session
     IgnitionTimeWindow.from_hours(8, 9),    # 08:00–09:00 CT — US RTH open
 )
+# Back-compat alias for callers still importing the old name.
+DEFAULT_TIME_WINDOWS: tuple[IgnitionTimeWindow, ...] = ()
 
 
 @dataclass
 class IgnitionConfig:
-    """IGNITION configuration. Defaults are audit-driven."""
+    """IGNITION configuration. Time gating is OFF by default — the
+    strategy fires any hour and the UI's bucket selector handles
+    time-of-day analysis."""
     # Entry filter
     go_no_go: GoNoGoConfig = field(default_factory=GoNoGoConfig)
-    # Time windows the strategy is allowed to fire in (US/Central)
-    time_windows: tuple[IgnitionTimeWindow, ...] = DEFAULT_TIME_WINDOWS
+    # Time windows the strategy is allowed to fire in (US/Central).
+    # Empty tuple () means no time gating — the strategy fires any hour.
+    time_windows: tuple[IgnitionTimeWindow, ...] = ()
     # Exit policy
     min_bars_before_opposite_exit: int = 2   # audit §3 fix
     atr_period: int = 4                       # match PULSE Pine atrLen default
@@ -137,6 +144,10 @@ class IgnitionStrategy:
     # ───────────────────────── helpers ─────────────────────────
 
     def _in_window(self, ts: datetime) -> bool:
+        # Empty windows = no gating (fires any hour). The UI does
+        # time-bucket slicing instead of strategy-level filtering.
+        if not self.config.time_windows:
+            return True
         return any(w.contains(ts) for w in self.config.time_windows)
 
     def _update_bars_held(self, current_position: int) -> None:

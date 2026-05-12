@@ -18,7 +18,7 @@ import pytest
 from acme.broker.base import Bar
 from acme.risk import TOPSTEP_50K, DailyState
 from acme.strategies.go_no_go import GoNoGoConfig
-from acme.strategies.ignition import IgnitionConfig, IgnitionStrategy
+from acme.strategies.ignition import AUDIT_WINDOWS, IgnitionConfig, IgnitionStrategy
 
 
 def _state():
@@ -112,9 +112,11 @@ def test_entry_fires_inside_window_with_healthy_uptrend():
 
 
 def test_no_entry_outside_time_window():
-    s = IgnitionStrategy()
+    # Opt into the audit windows explicitly — default is no gating now.
+    cfg = IgnitionConfig(time_windows=AUDIT_WINDOWS)
+    s = IgnitionStrategy(config=cfg)
     state = _state()
-    # Same healthy ramp but at 13:00 CT — outside every default window.
+    # Healthy ramp at 13:00 CT — outside every audit window.
     bars = _warmup_then_setup(T_OUT_WINDOW, up=True)
     last_sig = None
     for b in bars:
@@ -122,6 +124,21 @@ def test_no_entry_outside_time_window():
                             current_position=0, current_balance_unrealized=50_000)
     # Either None or size=0 (risk-blocked) — but never a tradeable buy
     assert last_sig is None or last_sig.size == 0
+
+
+def test_default_config_fires_outside_audit_windows():
+    """With time gating lifted by default, a healthy setup outside the
+    audit windows should still produce an entry."""
+    s = IgnitionStrategy()   # default config: time_windows=()
+    state = _state()
+    bars = _warmup_then_setup(T_OUT_WINDOW, up=True)
+    last_sig = None
+    for b in bars:
+        last_sig = s.on_bar(b, state=state, profile=TOPSTEP_50K,
+                            current_position=0, current_balance_unrealized=50_000)
+    assert last_sig is not None
+    assert last_sig.side == "buy"
+    assert last_sig.size > 0
 
 
 def test_long_only_by_default():

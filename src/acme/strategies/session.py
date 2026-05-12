@@ -38,12 +38,16 @@ from acme.strategies.params import ParameterSpec
 CT = ZoneInfo("America/Chicago")
 
 
-# Audit §2 winners (same as IGNITION). Pine's 13:30–15:00 CT explicitly
-# rejected — audit §2 showed it's the worst 2-hour window in the fleet.
-DEFAULT_SESSION_WINDOWS: tuple[IgnitionTimeWindow, ...] = (
+# Audit §2 winners — kept as a named constant so callers can opt in
+# explicitly via `SessionConfig(time_windows=AUDIT_WINDOWS)`. NOT
+# applied by default (lifted 2026-05-11). With empty windows SESSION
+# fires whenever overnight bias is clear, regardless of clock — and
+# the UI bucket selector lets you slice the resulting performance.
+AUDIT_WINDOWS: tuple[IgnitionTimeWindow, ...] = (
     IgnitionTimeWindow.from_hours(3, 5),
     IgnitionTimeWindow.from_hours(8, 9),
 )
+DEFAULT_SESSION_WINDOWS: tuple[IgnitionTimeWindow, ...] = ()
 
 
 # 12 hours of 2-min bars = 360 bars; spans Globex into RTH. Matches
@@ -53,7 +57,10 @@ DEFAULT_BIAS_BUFFER_BARS = 360
 
 @dataclass
 class SessionConfig:
-    time_windows: tuple[IgnitionTimeWindow, ...] = DEFAULT_SESSION_WINDOWS
+    # Empty tuple means no time gating — fires whenever overnight bias
+    # is clear, any hour. Set via AUDIT_WINDOWS to opt back into the
+    # audit's best-hour gating.
+    time_windows: tuple[IgnitionTimeWindow, ...] = ()
     bias_buffer_bars: int = DEFAULT_BIAS_BUFFER_BARS
     bias_threshold_atr: float = DEFAULT_OVERNIGHT_THRESHOLD_ATR
     bias_min_bars: int = DEFAULT_OVERNIGHT_MIN_BARS
@@ -111,6 +118,8 @@ class SessionStrategy:
     # ───────────────────────── helpers ─────────────────────────
 
     def _in_window(self, ts: datetime) -> bool:
+        if not self.config.time_windows:
+            return True       # no gating — fires any hour
         return any(w.contains(ts) for w in self.config.time_windows)
 
     # ───────────────────────── on_bar ──────────────────────────

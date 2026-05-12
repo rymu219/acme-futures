@@ -38,6 +38,52 @@ FLEET = ["ignition", "session", "regime", "boundary"]
 PILOT_THRESHOLD = 0.55
 LIVE_THRESHOLD = 0.65
 
+
+# Time-of-day buckets for the UI filter. Keys map to a set of hours
+# (CT). 'all' is the default and means no filter. Order matters — used
+# as the chip render order at the top of the page.
+TIME_BUCKETS: dict[str, dict] = {
+    "all":            {"label": "All hours",         "hours": None},
+    "audit_winners":  {"label": "Audit winners",     "hours": {3, 4, 8, 9, 17}},
+    "audit_losers":   {"label": "Audit losers",      "hours": {11, 12, 13, 14, 15}},
+    "europe":         {"label": "Europe 03–05",      "hours": {3, 4}},
+    "rth_am":         {"label": "RTH AM 08–09",      "hours": {8, 9}},
+    "rth_lunch":      {"label": "RTH lunch 10–12",   "hours": {10, 11, 12}},
+    "rth_pm":         {"label": "RTH PM 13–15",      "hours": {13, 14, 15}},
+    "overnight":      {"label": "Overnight 18–07",
+                        "hours": {18, 19, 20, 21, 22, 23, 0, 1, 2, 5, 6, 7}},
+}
+
+
+def _bucket_hours(bucket: str | None) -> set[int] | None:
+    """Returns the hour set for a bucket, or None for 'all' / unknown."""
+    if not bucket or bucket == "all":
+        return None
+    b = TIME_BUCKETS.get(bucket)
+    if not b:
+        return None
+    return b["hours"]
+
+
+def _filter_closes_by_bucket(
+    closes: list[dict[str, Any]], bucket: str | None
+) -> list[dict[str, Any]]:
+    hours = _bucket_hours(bucket)
+    if hours is None:
+        return closes
+    out = []
+    for c in closes:
+        ts = c.get("occurred_at")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(CT)
+        except Exception:
+            continue
+        if d.hour in hours:
+            out.append(c)
+    return out
+
 # Heartbeat staleness — same conventions as the v3 view.
 HB_LIVE_MAX_S = 300        # 5 min (new fleet's 2-min bar + buffer)
 HB_OFFLINE_MIN_S = 900     # 15 min
@@ -295,10 +341,87 @@ def _strategy_metrics(name: str, strategies: dict, snaps: dict) -> dict[str, Any
     }
 
 
-def _render_strategy_cards(strategies: dict, snaps: dict) -> str:
+def _compute_metrics_from_closes(
+    closes: list[dict], strategy: str,
+) -> dict[str, Any]:
+    """On-the-fly metrics for a strategy from a (possibly bucket-filtered)
+    list of dry_run_close events. Used when the bucket selector is
+    non-default; avoids the snapshot-vs-bucket mismatch.
+
+    Returns the subset of metrics computable cheaply from closes:
+    n_trades, net_pnl, win_rate, profit_factor. PF / Sharpe / MaxDD
+    that require equity-curve walking are left to the snapshot path."""
+    n = 0
+    net = 0.0
+    wins = 0
+    gross_win = 0.0
+    gross_loss = 0.0
+    for c in closes:
+        if c.get("strategy") != strategy:
+            continue
+        raw = c.get("raw") or {}
+        pnl = float(raw.get("net_pnl") or 0)
+        n += 1
+        net += pnl
+        if pnl > 0:
+            gross_win += pnl
+            wins += 1
+        elif pnl < 0:
+            gross_loss += -pnl
+    if n == 0:
+        return {"n_trades": 0, "net_pnl": 0.0, "win_rate": 0.0,
+                "profit_factor": None}
+    return {
+        "n_trades": n,
+        "net_pnl": net,
+        "win_rate": wins / n,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (
+            float("inf") if gross_win > 0 else None
+        ),
+    }
+
+
+def _render_bucket_selector(current: str, token: str | None) -> str:
+    """Chips at the top — clicking one re-renders the page filtered by
+    that hour set."""
+    token_q = f"&token={token}" if token else ""
+    chips = []
+    for key, b in TIME_BUCKETS.items():
+        active = (key == current) or (current == "all" and key == "all")
+        bg = "#0891b2" if active else "rgba(255,255,255,0.06)"
+        color = "white" if active else "var(--dim-1)"
+        chips.append(
+            f"<a class='bucket-chip' "
+            f"style='background:{bg};color:{color};' "
+            f"href='/?bucket={key}{token_q}'>{b['label']}</a>"
+        )
+    return f"""
+  <section class="bucket-bar">
+    <span class="dim mini">filter by hour bucket (CT):</span>
+    {''.join(chips)}
+  </section>
+"""
+
+
+def _render_strategy_cards(strategies: dict, snaps: dict,
+                            closes_in_bucket: list[dict] | None = None,
+                            bucket: str = "all") -> str:
     cards = []
+    use_bucket = (bucket != "all" and closes_in_bucket is not None)
     for name in FLEET:
         m = _strategy_metrics(name, strategies, snaps)
+        if use_bucket:
+            # Replace the snapshot-derived metrics with bucket-filtered
+            # ones. State / score stay from the strategies-row source of
+            # truth — those are lifecycle-level, not bucket-level.
+            bm = _compute_metrics_from_closes(closes_in_bucket, name)
+            m["n_trades"] = bm["n_trades"]
+            m["net_pnl"] = bm["net_pnl"]
+            m["win_rate"] = bm["win_rate"]
+            m["pf"] = bm["profit_factor"]
+            # Sharpe / MaxDD can't be recomputed cheaply from closes;
+            # leave the snapshot values in but they'll look stale for
+            # bucket views — caller can ignore.
         state_bg = _STATE_BG.get(m["state"], "#334155")
         pnl_color = (
             "#16a34a" if m["net_pnl"] > 0
@@ -326,9 +449,14 @@ def _render_strategy_cards(strategies: dict, snaps: dict) -> str:
       </div>
     </div>
 """)
+    label = TIME_BUCKETS.get(bucket, {}).get("label", "All hours")
+    title_suffix = (
+        f"<span class='dim mini'> · filtered to {label}</span>"
+        if use_bucket else "<span class='dim mini'> · latest snapshot</span>"
+    )
     return f"""
   <section class="card">
-    <div class="card-title">Strategy Performance (latest snapshot)</div>
+    <div class="card-title">Strategy Performance{title_suffix}</div>
     <div class="strat-grid">{''.join(cards)}</div>
   </section>
 """
@@ -403,8 +531,11 @@ def _bucket_closes_by_hour(closes: list[dict]) -> dict[int, dict[str, float]]:
     return dict(out)
 
 
-def _render_hour_heatmap(closes: list[dict]) -> str:
+def _render_hour_heatmap(closes: list[dict], selected_bucket: str = "all") -> str:
+    """Always shows all 24 hours. The selected bucket gets a stronger
+    border treatment so you can see which hours your filter covers."""
     buckets = _bucket_closes_by_hour(closes)
+    selected_hours = _bucket_hours(selected_bucket) or set()
     if not buckets:
         return """
   <section class="card">
@@ -436,16 +567,19 @@ def _render_hour_heatmap(closes: list[dict]) -> str:
             bg = f"rgba(220,38,38,{0.10 + 0.60*intensity:.2f})"
         else:
             bg = "transparent"
-        # Audit-winning hours get a green border accent
+        # Audit-winning hours get a green border accent; selected bucket
+        # gets a yellow halo (rendered as a wider border via box-shadow).
         win_hours = {3, 4, 8, 9, 17}
         loss_hours = {11, 12, 13, 14, 15}
         border = "#16a34a" if h in win_hours else (
             "#dc2626" if h in loss_hours else "transparent")
+        halo = ("box-shadow: 0 0 0 2px #fbbf24 inset;"
+                if h in selected_hours else "")
         n_cell = int(v["n"])
         pnl_cell = v["net_pnl"]
         title = f"{h:02d}:00 CT — n={n_cell} net=${pnl_cell:.2f}"
         cells.append(
-            f"<div class='hh-cell' style='background:{bg};border-color:{border};' "
+            f"<div class='hh-cell' style='background:{bg};border-color:{border};{halo}' "
             f"title='{title}'>"
             f"<div class='hh-hour'>{h:02d}</div>"
             f"<div class='hh-pnl mono'>{_money(pnl_cell)}</div>"
@@ -729,6 +863,16 @@ body {
 .bh-label { line-height: 1.1; height: 24px; }
 .bh-warn { margin-top: 6px; font-weight: 600; }
 
+.bucket-bar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+              margin-bottom: 14px; }
+.bucket-bar > span:first-child { margin-right: 4px; }
+.bucket-chip {
+  padding: 4px 10px; border-radius: 999px; font-size: 11px;
+  text-decoration: none; font-weight: 600; border: 1px solid var(--border);
+  transition: background 0.15s;
+}
+.bucket-chip:hover { background: rgba(255,255,255,0.10) !important; }
+
 .recent { width: 100%; border-collapse: collapse; font-size: 12px; }
 .recent th { text-align: left; padding: 4px 8px; color: var(--dim-1);
              border-bottom: 1px solid var(--border); font-weight: 600; }
@@ -736,21 +880,35 @@ body {
 """
 
 
-def render_overview(sb, *, token: str | None = None) -> str:
-    """Main entry — renders the full HTML page."""
+def render_overview(sb, *, token: str | None = None,
+                    bucket: str = "all") -> str:
+    """Main entry — renders the full HTML page.
+
+    `bucket` is one of TIME_BUCKETS keys ('all' default). When set to a
+    specific bucket, strategy cards / bars-held / recent trades are
+    filtered to closes whose entry-hour CT falls in that bucket's hour
+    set. The hour heatmap always shows all 24 hours (the discovery
+    surface) but highlights the selected bucket with a yellow halo.
+    """
+    if bucket not in TIME_BUCKETS:
+        bucket = "all"
     heartbeats = _fetch_heartbeats(sb)
     strategies = _fetch_strategies(sb)
     snaps = _fetch_perf_snapshots(sb)
-    closes = _fetch_recent_closes(sb)
+    closes_all = _fetch_recent_closes(sb)
+    closes_filtered = _filter_closes_by_bucket(closes_all, bucket)
 
     body = (
         _render_header(heartbeats)
+        + _render_bucket_selector(bucket, token)
         + _render_position_panel(heartbeats)
-        + _render_strategy_cards(strategies, snaps)
+        + _render_strategy_cards(strategies, snaps,
+                                  closes_in_bucket=closes_filtered,
+                                  bucket=bucket)
         + _render_promotion_gate(strategies)
-        + _render_hour_heatmap(closes)
-        + _render_bars_held(closes)
-        + _render_recent_trades(closes)
+        + _render_hour_heatmap(closes_all, selected_bucket=bucket)
+        + _render_bars_held(closes_filtered)
+        + _render_recent_trades(closes_filtered)
     )
     token_q = f"?token={token}" if token else ""
     return f"""<!doctype html>
