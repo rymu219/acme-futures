@@ -542,3 +542,57 @@ the SESSION-as-9:30-to-3:00 framing in the original plan. Whether
 specifically — independent of variant — is the practical question for
 the SESSION strategy and is best answered with the per-hour
 profit-factor column above.
+
+
+---
+
+## §3 Hold-time analysis
+
+[`docs/v3_audit/hold_time.csv`](docs/v3_audit/hold_time.csv) (variant + fleet detail)
+
+Buckets: 1, 2, 3, 4–6, 7–10, 11+ bars (each bar = 2 min).
+
+### Fleet, by bars-held bucket
+
+| bars held | n | net P&L | WR | PF | avg/trade |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2941 | $-12,458.70 | 18.1% | 0.19 | $-4.24 |
+| 2 | 667 | $509.35 | 54.0% | 1.34 | $0.76 |
+| 3 | 422 | $1,959.60 | 59.2% | 3.96 | $4.64 |
+| 4-6 | 415 | $4,142.00 | 83.4% | 13.02 | $9.98 |
+| 7-10 | 154 | $2,538.45 | 94.2% | 36.60 | $16.48 |
+| 11+ | 71 | $1,237.80 | 64.8% | 4.36 | $17.43 |
+
+### 1-bar opposite-signal hypothesis
+
+| Cohort | n | Net P&L | WR | PF |
+|---|---:|---:|---:|---:|
+| 1-bar `opposite_signal` exits | 2,366 | $-8,858.70 | 16.5% | 0.18 |
+| ≥2-bar `opposite_signal` exits | 1,617 | $+10,541.85 | 68.3% | 6.14 |
+
+The 1-bar churn hypothesis is **confirmed** at the fleet level.
+
+### Counterfactual: strict 2-bar minimum hold (upper bound)
+
+| Metric | Actual | If 1-bar opp-sig exits skipped |
+|---|---:|---:|
+| Fleet net P&L | $-2,086.20 | $+6,772.50 |
+
+Upper bound — assumes the bar-2 outcome would have been P&L-neutral.
+Real bar-2 outcome depends on what the price did next. A proper
+estimate would replay each skipped trade against the bars; the CSV
+captures the data needed for that follow-up.
+
+### Variant pair test: v3-canon vs v3-min2bar
+
+`v3-min2bar` is the only variant whose engine enables a strict 2-bar
+minimum hold (`min_bars_before_opposite_exit = 2`). v3-canon is the
+control.
+
+| Variant | n | Net P&L | PF | WR |
+|---|---:|---:|---:|---:|
+| v3-canon | 626 | $-230.85 | 0.91 | 34.2% |
+| v3-min2bar | 434 | $-88.95 | 0.96 | 42.4% |
+
+The min-hold variant is **better** on net P&L despite
+fewer trades. This corroborates the fleet 1-bar finding above.
