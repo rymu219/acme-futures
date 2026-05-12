@@ -812,3 +812,59 @@ This rollup matches each cluster to the trades settled inside its
 The cluster-size column maps to the hypothesis: the larger the
 cluster, the more correlated the bet, the more swing in either
 direction.
+
+
+---
+
+## §7 Drawdown analysis
+
+[`docs/v3_audit/drawdowns.csv`](docs/v3_audit/drawdowns.csv)
+
+Per-variant maximum drawdown in dollar terms, with the trade slice that
+caused it. "Ongoing" = the variant has not yet recovered to its prior
+peak as of the audit window's end.
+
+| variant | MDD ($) | MDD (% peak) | peak (CT) | trough (CT) | duration (d) | n DD | WR DD | WR life | regime | ongoing |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| v3-trail | $599.45 | 585.4% | 2026-05-06 05:52:01.502015-05:00 | 2026-05-11 20:32:05.544444-05:00 | 5.610000 | 500 | 35.0% | 35.5% | vol-expansion-chop | no |
+| v3-armor | $578.60 | 331.7% | 2026-05-06 03:42:01.307479-05:00 | 2026-05-11 20:32:03.634068-05:00 | 5.700000 | 122 | 19.7% | 22.4% | vol-expansion-chop | no |
+| v3-canon | $497.20 | 218.5% | 2026-05-06 05:52:00.804452-05:00 | 2026-05-07 18:34:01.641387-05:00 | 1.530000 | 170 | 24.7% | 34.1% | vol-expansion-chop | no |
+| v4-trend-flip | $495.80 | 465.8% | 2026-05-08 07:28:04.561327-05:00 | 2026-05-11 08:22:05.509567-05:00 | 3.040000 | 145 | 29.0% | 33.9% | chop | no |
+| v3-pctile | $474.90 | 236.6% | 2026-05-06 05:52:01.840448-05:00 | 2026-05-07 18:34:02.003698-05:00 | 1.530000 | 156 | 24.4% | 32.6% | vol-expansion-chop | no |
+| v3-min2bar | $430.05 | 189.1% | 2026-05-06 10:00:01.448791-05:00 | 2026-05-07 17:40:02.217481-05:00 | 1.320000 | 108 | 33.3% | 42.4% | vol-expansion-trending-down | no |
+| v4-loose-shorts | $284.90 | 178.8% | 2026-05-08 10:46:05.383426-05:00 | 2026-05-11 20:32:05.922132-05:00 | 3.410000 | 183 | 30.6% | 35.9% | chop | no |
+| v3.1-canon | $217.45 | 277.9% | 2026-05-08 04:18:02.694764-05:00 | 2026-05-11 20:32:06.721903-05:00 (ongoing) | 3.680000 | 117 | 28.2% | 34.8% | chop | yes |
+| v3.1-pctile | $205.35 | 240.2% | 2026-05-10 19:30:06.054203-05:00 | 2026-05-11 20:32:07.101493-05:00 (ongoing) | 1.040000 | 89 | 25.8% | 34.7% | chop | yes |
+| v5-mtf-anchor | $199.65 | 103.6% | 2026-05-11 12:42:04.389707-05:00 | 2026-05-11 20:32:06.340031-05:00 | 0.330000 | 38 | 15.8% | 36.5% | trending-down | no |
+| v4-vol-regime | $199.65 | 89.9% | 2026-05-11 12:42:05.187361-05:00 | 2026-05-11 20:32:07.482670-05:00 (ongoing) | 0.330000 | 38 | 15.8% | 37.2% | trending-down | yes |
+| v3.1-trail | $181.20 | 197.3% | 2026-05-10 19:30:03.990507-05:00 | 2026-05-11 20:32:02.854076-05:00 (ongoing) | 1.040000 | 92 | 29.3% | 39.9% | chop | yes |
+| v3.1-min2bar | $177.30 | 158.4% | 2026-05-10 22:40:01.947655-05:00 | 2026-05-11 20:32:04.785507-05:00 (ongoing) | 0.910000 | 65 | 29.2% | 41.7% | chop | yes |
+| v4-overnight-bias | $175.45 | 56.9% | 2026-05-11 12:42:05.981725-05:00 | 2026-05-11 19:16:04.957973-05:00 (ongoing) | 0.270000 | 32 | 15.6% | 38.2% | trending-down | yes |
+| v4-trend-gate | $165.40 | 106.9% | 2026-05-08 07:28:04.153911-05:00 | 2026-05-11 08:22:04.707298-05:00 | 3.040000 | 123 | 33.3% | 36.0% | chop | no |
+| v3.1-armor | $73.85 | 665.3% | 2026-05-07 22:44:04.950916-05:00 | 2026-05-11 20:32:05.160693-05:00 (ongoing) | 3.910000 | 19 | 15.8% | 20.0% | trending-down | yes |
+
+**Variants still in their max-drawdown:** v3.1-canon, v3.1-pctile, v4-vol-regime, v3.1-trail, v3.1-min2bar, v4-overnight-bias, v3.1-armor
+
+**Largest WR collapse during DD:** `v4-overnight-bias` —
+lifetime WR 38.2% vs WR during DD
+15.6%.
+
+**Most stable WR during DD:** `v3-trail` —
+lifetime WR 35.5% vs DD WR
+35.0%.
+
+### Regime distribution during max-drawdowns
+
+- `chop` — 7 variants
+- `vol-expansion-chop` — 4 variants
+- `trending-down` — 4 variants
+- `vol-expansion-trending-down` — 1 variants
+
+Regime label is a coarse proxy: derived from average ATR-at-entry and
+average (exit - entry) price move across the DD slice. It's not from a
+calibrated regime classifier.
+
+**Concentration test:** if all DDs land in the same regime label, the
+fleet has a regime-specific weakness that REGIME's switching logic
+could address. If DDs span every regime, the entry signal itself
+needs fixing, not just regime gating.
