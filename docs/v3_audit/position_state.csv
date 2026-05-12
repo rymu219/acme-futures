@@ -1,0 +1,2 @@
+strategy_id,heartbeat_state,heartbeat_ts_ct,heartbeat_age_min,auth_ok,consecutive_errors,open_trade_count,latest_entry_ts_ct,latest_entry_price,latest_direction,stop_price,atr_at_entry,cum_delta_at_entry,variant_exit_rules
+v4-trend-flip,short,2026-05-11 20:38:00 CT,0,True,0,2,2026-05-11 20:32:04 CT,7425.0,short,7428.515185504393,2.3434570029286337,-5033,"opposite_signal, stop"

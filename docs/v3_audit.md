@@ -1,0 +1,405 @@
+# v3 multi-variant runtime — forensic performance audit
+
+Read-only audit of `ryan_spec_v3_trades` (paper mode) over the live window
+**2026-05-04 07:54 CT → 2026-05-11 20:30 CT** (~7.5 days, 4,752 trades, 16
+variants on a shared `LiveBarDeltaBuilder`).
+
+Plan: [`.claude/plans/good-phantom-mode-means-compressed-fox.md`](.claude/plans/good-phantom-mode-means-compressed-fox.md).
+Scripts: [`scripts/v3_audit/`](scripts/v3_audit/).
+
+---
+
+## Executive summary (v0 — refines as Sections 1–9 land)
+
+Each answer carries the section that will finalize it.
+
+### 1. Active operational risks? — yes, one (data-integrity, not loss-of-capital)
+
+**10 trade rows in `ryan_spec_v3_trades` are stuck in the "open" state from
+2026-05-07 22:08 CT (four days ago)**, even though their variants' heartbeats
+report `position_state = "flat"`. Variants affected:
+`v3-armor, v3-min2bar, v3-pctile, v3-trail, v4-loose-shorts, v4-overnight-bias,
+v4-trend-flip, v4-trend-gate, v4-vol-regime, v5-mtf-anchor`. Entry price
+$7,374.50 (one outlier at $7,374.75) — the same anchor referenced in the
+prompt.
+
+The runtime crashed or hit a reconciliation gap on 2026-05-07 22:08; the
+trade rows never received their exit info. The runtime itself is flat
+(only `v4-trend-flip` currently holds a position — see §0.3). **No
+phantom losses are accruing in the runtime**, but every read path that
+filters `exit_ts IS NULL` will be wrong until these rows are reconciled.
+The dashboard's "11+ variants LONG at $7,374.50" framing is reading those
+orphaned rows, not actual positions.
+
+There are precedents in the trade log: 5 rows with `exit_reason =
+manual_cleanup_2026_05_06_signalr_drop`, 5 with
+`manual_cleanup_2026_05_06`, 1 with `manual_cleanup_2026_05_05`. This kind
+of reconciliation gap has happened before and is handled by manual
+cleanup. Recommend the same here once you've decided whether you want a
+real exit price computed against the bars or just a flagging exit reason.
+
+**HALT does not block exits.** [§0.2](#02-halt-and-200--what-the-dashboard-labels-actually-mean)
+proves this from the code. The "HALT" badges on the dashboard are
+**paper-promotion verdicts**, not position locks.
+
+**The "/200" in `303/200` is the promotion-gate trade threshold**, not a
+position cap. The actual MES position cap is 50 contracts
+([`src/acme/risk.py:60`](src/acme/risk.py:60)) and no variant is anywhere
+near it (1 contract per variant in dry-run).
+
+### 2. Verified edge vs tail-driven? — *[v0 from 7d net P&L only, refine in §5]*
+
+Three variants have positive net P&L in the prompt's 7d snapshot:
+`v4-overnight-bias` (+$133.05), `v4-vol-regime` (+$33.15),
+`v4-trend-gate` (+$33.75), `v5-mtf-anchor` (+$3.70). All four use the
+regime-gating wrapper (`regime_classifier_name` set in
+[`src/acme/runner.py:223-280`](src/acme/runner.py:223)). The pattern is
+strong: every variant **without** a regime gate or v3.1 safeguards lost
+money in this window. Whether the gating represents verified edge or
+just smaller exposure to losing clusters will be settled by §5
+(top-N-removal) and §6 (cluster outcomes).
+
+### 3. When does v3 make money? — *[v0 from anchor-position analysis only, refine in §2]*
+
+The anchor cluster fired at **2026-05-07 22:08 CT** — Globex overnight,
+deep negative `cum_delta = -2,417` for a LONG entry. That entry context
+(extreme negative delta at the bottom of an overnight move) is the
+canonical setup the static -670 cum_delta filter was designed to fire
+on. The fact that 9 variants fired in 3 seconds confirms this. Whether
+22:08 CT overnight is *systematically* profitable or just gives big MFE
+swings that don't close cleanly waits for §2 (hour-of-day buckets).
+
+### 4. Correlation reality — *[v0 from cluster count, refine in §6]*
+
+**495 cluster events** (≥3 variants, same direction, within 5-minute
+window) in 7 days. **131 of those (26%) involved 11+ variants** — i.e.
+near-fleet-wide entries. The cluster phenomenon is not occasional: it
+dominates how the fleet trades. The architectural root cause is
+confirmed: all 16 variants share one `LiveBarDeltaBuilder`
+([`src/acme/runner.py:75`](src/acme/runner.py:75)). They differ only in
+exit rules, entry filters, and regime gates — never in the underlying
+signal source.
+
+Three variants consistently abstain from large clusters:
+`v4-trend-gate`, `v4-overnight-bias`, `v4-trend-flip`. The regime classifiers
+they wrap are the only mechanism currently filtering shared-signal
+correlation.
+
+### 5. 2-bar minimum hold? — *[v0 from variant pair only, refine in §3]*
+
+`v3-canon` (no min-hold, PF 0.91 over 627 trades) vs `v3-min2bar`
+(min-hold 2 bars, PF 0.96 over 437 trades). The min-hold variant has a
+better PF but fewer trades. Not enough to draw a fleet-wide conclusion;
+§3's hold-time bucket analysis will quantify the per-trade impact.
+
+### 6. Surviving insights for IGNITION / SESSION / REGIME / BOUNDARY — *[v0, refine in §9]*
+
+- **SESSION**: hour-of-day signal is unanalyzed yet (§2). The anchor
+  cluster was 22:08 CT (overnight). Most retail futures wisdom says
+  overnight ≠ tradeable — but the data may say otherwise.
+- **REGIME**: v4-overnight-bias and v4-trend-gate together represent two
+  independent regime classifiers and *both* are net-positive in 7d. This
+  is the strongest pre-audit evidence that REGIME's design has a real
+  basis. v4-trend-flip (the spicy inversion variant) lost money
+  (-$311.60) — flipping signals is harder than gating them.
+- **IGNITION**: nothing in the v3 fleet uses PULSE / ECI. v3.1's
+  `bar1_fast_fail` is a proxy for the same idea (cut bar-1 if MFE
+  inverts to MAE) but isn't the same mechanism. PULSE/ECI needs to come
+  from outside the repo before IGNITION can be built.
+- **BOUNDARY**: no level data (PDH / PDL / ONH / ONL / ORH / ORL) is in
+  the schema. New infrastructure required as called out in the plan.
+
+---
+
+## §0 Operational triage
+
+### 0.1 DB shape
+
+| Metric | Value |
+|---|---|
+| `ryan_spec_v3_trades` rows (mode=paper) | **4,752** |
+| Time range | 2026-05-04 07:54 CT → 2026-05-11 20:30 CT |
+| Distinct `strategy_id` | 16 — all present in `acme.runner.VARIANTS` |
+| Distinct `exit_reason` | 10 |
+| `runtime_heartbeats` services | 16 — 15 `flat`, 1 `short` |
+
+Exit-reason distribution (paper mode, 7.5d):
+
+| Exit reason | Count | % |
+|---|---:|---:|
+| `opposite_signal` | 3,976 | 83.7% |
+| `stop` | 458 | 9.6% |
+| `bar1_fast_fail` | 183 | 3.9% |
+| `broker_error` | 53 | 1.1% |
+| `session_end` | 44 | 0.9% |
+| `(open)` | 26 | 0.5% |
+| `manual_cleanup_2026_05_06` | 5 | 0.1% |
+| `manual_cleanup_2026_05_06_signalr_drop` | 5 | 0.1% |
+| `manual_cleanup_2026_05_05` | 1 | <0.1% |
+| `time_stop` | 1 | <0.1% |
+
+Trade volume per variant (7.5d, sorted):
+
+| Variant | Trades |
+|---|---:|
+| v3-canon | 680 |
+| v3-trail | 544 |
+| v3-pctile | 478 |
+| v3-min2bar | 437 |
+| v5-mtf-anchor | 311 |
+| v4-vol-regime | 310 |
+| v4-overnight-bias | 302 |
+| v4-trend-flip | 290 |
+| v4-loose-shorts | 276 |
+| v4-trend-gate | 251 |
+| v3.1-trail | 183 |
+| v3.1-canon | 181 |
+| v3.1-pctile | 173 |
+| v3.1-min2bar | 164 |
+| v3-armor | 150 |
+| v3.1-armor | 22 |
+
+`v3.1-armor` (22 trades) will carry the `[low_sample]` tag throughout the
+audit per the plan's `MIN_TRADES_FOR_INFERENCE = 30` rule.
+
+### 0.2 HALT and "/200" — what the dashboard labels actually mean
+
+The dashboard's `HALT` and `LONG 303/200 ⚠ over cap` labels are
+**not** runtime states. Both come from a single Streamlit view at
+[`web/ryan_spec_v3_view.py`](web/ryan_spec_v3_view.py) and refer to the
+**paper-week promotion gate**, not to live positions.
+
+**HALT** is a `Verdict` from
+[`src/acme/ryan_spec/v3_promotion.py:19`](src/acme/ryan_spec/v3_promotion.py:19):
+
+```
+Verdict = "PROMOTE_LIVE" | "EXTEND_PAPER" | "HALT" | "INVESTIGATE"
+```
+
+The gate logic at `evaluate_paper_promotion()`
+([`v3_promotion.py:40`](src/acme/ryan_spec/v3_promotion.py:40)) returns:
+- `HALT` if paper PF < 1.5 (the floor)
+- `HALT` if avg slippage > 1.5 ticks
+- `INVESTIGATE` if opposite-signal exit % < 40%
+- `PROMOTE_LIVE` if all gates pass
+- `EXTEND_PAPER` if fewer than 200 settled trades
+
+**HALT does not call any exit code path.** It just means "do not promote
+to live trading." Paper trades continue normally for HALTed variants.
+v3-canon and v3-trail are HALTed in your snapshot because their PFs
+(0.91 and 0.79 in your dashboard's 7d window) are below the 1.5 floor.
+
+**The "/200" in `LONG 303/200`** is the **settled-trade promotion gate
+threshold** at
+[`web/ryan_spec_v3_view.py:328`](web/ryan_spec_v3_view.py:328):
+
+```python
+GATE_MIN_SETTLED = 200
+```
+
+…rendered by `_gate_progress_html()`
+([`web/ryan_spec_v3_view.py:401`](web/ryan_spec_v3_view.py:401)):
+> "Compact progress bar: filled track + N/target label. Used to make
+> the bare `83/200` text on each panel an at-a-glance promotion-gate
+> progress indicator."
+
+So `LONG 303/200` reads as: "currently LONG, has 303 settled trades vs
+the 200-trade promotion gate." There is **no cap breach** — 303 is the
+trade count, not the contract count. The actual MES position cap is **50
+contracts**, set in
+[`src/acme/risk.py:60`](src/acme/risk.py:60), and in dry-run every
+variant is at 1 contract.
+
+**What actually blocks runtime activity:**
+- The risk profile blocks new entries that would exceed 50 MES contracts
+  ([`risk.py:132`](src/acme/risk.py:132)).
+- The runtime self-halt at
+  [`v3_runtime.py:424`](src/acme/ryan_spec/v3_runtime.py:424) sets
+  `paused=true` after `max_consecutive_errors` broker failures. This
+  blocks **new entries** only; existing positions can still exit.
+- Manual `runtime_config.paused = true` via the kill-switch table.
+
+None of these are currently active. The runtime is healthy.
+
+### 0.3 Position-state table — current live state
+
+[`docs/v3_audit/position_state.csv`](docs/v3_audit/position_state.csv)
+
+Only **one** variant has a non-flat heartbeat right now:
+
+| Variant | State | HB age | Open trade | Entry | Stop | ATR | Exit rules |
+|---|---|---|---|---|---|---|---|
+| `v4-trend-flip` | short | 0m | 2026-05-11 20:32 CT @ 7425.0 | 7425.0 | 7428.52 | 2.34 | opposite_signal, stop |
+
+All 15 other variants report `position_state = flat`. **The dashboard
+snapshot in your prompt showed 11+ variants LONG — that snapshot is
+reading the orphaned trade rows from 2026-05-07, not current runtime
+state.** See §0.4.
+
+### 0.4 The "anchor LONG" — orphaned trade rows, not held positions
+
+[`docs/v3_audit/anchor_position.csv`](docs/v3_audit/anchor_position.csv)
+
+Ten trade rows show `exit_ts IS NULL` with entry price within ±$0.50 of
+$7,374.50:
+
+| Variant | Entry time | Entry | Direction | `cum_delta_at_entry` | ATR | Regime gate |
+|---|---|---:|---|---:|---:|---|
+| v3-min2bar | 2026-05-07 22:04:01 CT | 7374.75 | long | -2,268 | 1.85 | — |
+| v3-trail | 2026-05-07 22:08:01 CT | 7374.50 | long | -2,417 | 1.63 | — |
+| v4-trend-gate | 2026-05-07 22:08:01 CT | 7374.50 | long | -2,417 | 1.63 | trend_ema |
+| v4-loose-shorts | 2026-05-07 22:08:02 CT | 7374.50 | long | -2,417 | 1.63 | — |
+| v4-trend-flip | 2026-05-07 22:08:02 CT | 7374.50 | long | -2,417 | 1.63 | trend_ema |
+| v4-overnight-bias | 2026-05-07 22:08:02 CT | 7374.50 | long | -2,417 | 1.63 | overnight_bias |
+| v5-mtf-anchor | 2026-05-07 22:08:03 CT | 7374.50 | long | -2,417 | 1.63 | higher_tf_alignment |
+| v3-armor | 2026-05-07 22:08:03 CT | 7374.50 | long | -2,417 | 1.63 | — |
+| v4-vol-regime | 2026-05-07 22:08:03 CT | 7374.50 | long | -2,417 | 1.63 | vol_regime |
+| v3-pctile | 2026-05-07 22:08:04 CT | 7374.50 | long | -2,417 | 1.63 | — |
+
+Nine of these landed inside a 3-second window at 22:08:01–04 — a
+9-variant cluster firing on the same bar. The same cluster also caught
+all four regime-gated variants (`v4-trend-gate`, `v4-trend-flip`,
+`v4-overnight-bias`, `v4-vol-regime`, plus `v5-mtf-anchor`) — meaning
+on 2026-05-07 22:08 CT, every regime classifier read the regime as
+**aligned with the LONG entry**. That's plausible: deep negative
+cum_delta during a strong-down overnight can read as a "trend-down
+exhaustion" → fade signal that all four classifiers agreed with.
+
+Notable absentees from the cluster:
+- `v3-canon` — the static -670 filter would have fired here too, so its
+  absence suggests it was already in a position from an earlier entry
+  (it cannot stack).
+- The entire **v3.1-*** family. The v3.1 ATR-ceiling is 2.5 (this trade
+  was at ATR 1.63 so the ceiling wouldn't have blocked it), and the
+  hour blacklist is (6,7,8,11,12) CT, which doesn't include 22 CT. So
+  v3.1 *should have fired*. The fact that it didn't suggests the v3.1
+  family wasn't yet running on 2026-05-07 — the migration that adds
+  v3.1 variants ran later.
+
+**These rows are not actively held positions.** Heartbeats report `flat`
+for all 10 variants. The runtime crashed, restarted, or hit a
+reconciliation gap on 2026-05-07 22:08 — the in-memory position state
+was reset to flat but the DB rows never received their exit info.
+
+**Recommendation (manual operator action, not auto-fix):** mark these 10
+rows with `exit_reason = 'manual_cleanup_2026_05_11_audit'`,
+`exit_ts = NULL → some chosen ts`, and either:
+- (a) compute `exit_price` from the Databento bars at the crash time
+  and write real P&L, or
+- (b) set `exit_price = entry_price`, `pnl_dollars = 0` (treat as
+  voided trades), per the pattern in the existing
+  `manual_cleanup_*` rows.
+
+I am not executing this cleanup — it's a write to production data and
+the plan says read-only until you say go.
+
+### 0.5 `bar1_fast_fail` — definition and frequency
+
+[`docs/v3_audit/bar1_fast_fail.csv`](docs/v3_audit/bar1_fast_fail.csv)
+
+Defined at
+[`src/acme/ryan_spec/v3_engine.py:343`](src/acme/ryan_spec/v3_engine.py:343):
+
+> Exit a bar-1 position when `MAE > MFE × bar1_fast_fail_mae_mfe_ratio`
+> (default ratio 1.5). Opt-in via `enable_bar1_fast_fail`; only the
+> v3.1-* variants enable it
+> ([`runner.py:166,176,184,192,202`](src/acme/runner.py:166)). Added in
+> PR-G after the 2026-05-07 win-loss anatomy showed losses had MAE ≫ MFE
+> by bar 1 while wins did not.
+
+Per-variant trigger rate (7d):
+
+| Variant | Enabled | Trades | `bar1_fast_fail` exits | % |
+|---|:-:|---:|---:|---:|
+| v3.1-armor | yes | 22 | 7 | 31.8% **[low_sample]** |
+| v3.1-min2bar | yes | 164 | 42 | 25.6% |
+| v3.1-pctile | yes | 173 | 44 | 25.4% |
+| v3.1-canon | yes | 181 | 45 | 24.9% |
+| v3.1-trail | yes | 183 | 45 | 24.6% |
+| (all non-v3.1 variants) | no | — | 0 | 0% |
+
+≈25% trigger rate across the v3.1 family. Whether the cut prevents
+losses or kills future winners is a §3 (hold-time) question.
+
+### 0.6 Cluster confirmation
+
+[`docs/v3_audit/cluster_event_log.csv`](docs/v3_audit/cluster_event_log.csv)
+
+Definition: ≥3 distinct `strategy_id` opening positions in the same
+direction within a 5-minute window. Non-overlapping windows (each entry
+consumed by at most one cluster).
+
+**Last 7 days:**
+
+| Cluster size | Event count | % |
+|---|---:|---:|
+| 3–5 variants | 253 | 51% |
+| 6–10 variants | 111 | 22% |
+| **11+ variants** | **131** | **26%** |
+| **Total** | **495** | **100%** |
+
+**Target-day cluster events (2026-05-11, after 18:00 CT):** the
+dashboard times you cited (19:44, 19:54, 20:00, 20:06 CT) correspond to
+clusters at 19:46, 19:56, 20:02, 20:08 CT in `entry_ts` (the 2-minute
+bar offset — dashboard reads `bar_ts`, the bar open; trade rows fill at
+`bar_ts + ~2min`).
+
+Every evening cluster on 2026-05-11 has the **same 13-variant LONG
+signature**:
+`v3-armor, v3-canon, v3-min2bar, v3-pctile, v3-trail, v3.1-armor,
+v3.1-canon, v3.1-min2bar, v3.1-pctile, v3.1-trail, v4-loose-shorts,
+v4-vol-regime, v5-mtf-anchor`.
+
+The **three variants consistently absent**: `v4-trend-gate`,
+`v4-overnight-bias`, `v4-trend-flip`. All three wrap the trend / overnight
+classifiers. Either they classified today's overnight as DOWN (so they
+blocked or flipped the LONG signal) or they had already entered earlier
+and couldn't stack.
+
+`v4-trend-flip` did enter SHORT at 20:32 CT today (see §0.3) — confirming
+it inverted the same LONG signal the others fired on. This is the
+designed-in differentiation working in real time.
+
+| Time (entry_ts CT) | Direction | # variants | Notes |
+|---|---|---:|---|
+| 2026-05-11 18:22:01 | long | 14 | first evening cluster; includes v4-overnight-bias |
+| 2026-05-11 18:30:00 | long | 12 | v4-loose-shorts dropped |
+| 2026-05-11 18:40:04 | long | 16 | **whole fleet LONG** |
+| 2026-05-11 18:50:01 | long | 16 | whole fleet again |
+| 2026-05-11 19:00:00 | long | 14 | trend-flip & trend-gate dropped |
+| 2026-05-11 19:08:02 | long | 14 | |
+| 2026-05-11 19:16:00 | long | 14 | |
+| 2026-05-11 19:26:02 | long | 13 | overnight-bias drops out for the rest of the night |
+| **2026-05-11 19:46:02** | **long** | **13** | matches dashboard's "19:44" |
+| **2026-05-11 19:56:00** | **long** | **13** | matches dashboard's "19:54" |
+| **2026-05-11 20:02:00** | **long** | **13** | matches dashboard's "20:00" |
+| **2026-05-11 20:08:02** | **long** | **13** | matches dashboard's "20:06" |
+| 2026-05-11 20:32:02 | long | 13 | most recent; same 13 variants |
+
+This is the cluster-failure phenomenon you wanted measured. 13 variants
+firing the same direction within 5 seconds, every 6–10 minutes for two
+straight hours.
+
+### 0.7 Surfacing rule check
+
+The plan says: "if Section 0 reveals anything actively dangerous, the
+audit pauses." Nothing dangerous is happening in the runtime right now:
+
+- HALT does not block exits.
+- The runtime self-halt isn't active.
+- The 50-contract risk cap isn't near being hit.
+- The only currently-held position (v4-trend-flip short @ $7,425) has a
+  stop at $7,428.52 — risk is bounded.
+- The orphaned trade rows from 2026-05-07 are a data-integrity issue,
+  not a loss-of-capital issue (dry-run + heartbeats are flat).
+
+So **§§1–9 can proceed once you approve**.
+
+---
+
+## §§1–9 — pending your approval
+
+Each section will run as a separate script under `scripts/v3_audit/`,
+write its CSV to `docs/v3_audit/`, and append a section to this file.
+Order and contents exactly as specified in the original prompt — no
+additions, no omissions.
