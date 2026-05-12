@@ -56,6 +56,15 @@ while true; do
                 log "ZOMBIE-A signalr (closed=$closed activity=$activity); killing"
                 pkill -9 -P "$RUNNER_PID" 2>/dev/null || true
                 kill -9 "$RUNNER_PID" 2>/dev/null || true
+                # Defense in depth — kill ANY surviving python subprocess
+                # in the acme.fleet_runner chain. The watchdog's $! is
+                # caffeinate's PID; uv run + python subprocesses can
+                # outlive a kill of the caffeinate wrapper, accumulating
+                # zombie runners that steal the SignalR session
+                # (see 2026-05-11 incident: 4 orphan runners → broker
+                # session hogged → bars never completed → heartbeats
+                # silent → false-positive zombie kill).
+                pkill -9 -f "acme.fleet_runner" 2>/dev/null || true
                 sleep 2
                 break
             fi
