@@ -1061,3 +1061,63 @@ honest-to-the-signal exit policy.
 
 The signal source is finding real moves. The exit policy is destroying
 them. Fix the exit first.
+
+
+---
+
+## Post-script — Phase 1 unwind executed (2026-05-11 21:25 CT)
+
+User approved Part 2, picked "Force-flatten via watchdog cycle."
+Executed:
+
+1. **LaunchAgent stopped** by the user via `launchctl unload`. Heartbeat
+   updates ceased — verified by 10-second poll showing zero ts changes
+   across all 16 services.
+
+2. **All open trade rows reconciled** via [`scripts/force_flatten_v3.py`](../scripts/force_flatten_v3.py):
+   - 13 rows tagged `manual_close_2026_05_11_unwind` (variants whose
+     heartbeat state was non-flat at agent-stop). Exit price $7,425.50
+     (current-market proxy from the most recent entry across the fleet
+     in the past hour). Computed P&L per row.
+   - 8 rows tagged `manual_cleanup_2026_05_11_audit` (heartbeat flat —
+     newly orphaned from the post-21:06 cluster). Exit price = entry
+     price; -$1.40 commission each.
+   - **0 open rows remaining.**
+
+3. **Force-close P&L by variant:**
+
+   | Variant | n closed | Total locked-in |
+   |---|---:|---:|
+   | v3-armor | 5 | +$999.25 |
+   | v3-min2bar | 3 | +$580.80 |
+   | v3-canon | 2 | +$353.45 |
+   | v3-pctile | 1 | +$282.35 |
+   | v3-trail | 1 | +$282.35 |
+   | v4-loose-shorts | 1 | +$131.10 |
+   | (8 commission-only orphans) | 8 | -$11.20 |
+   | **Total** | **21** | **+$2,618.10** |
+
+   The §1 audit snapshot showed the fleet at -$2,197 settled. With
+   these realised gains added, the actual 7d outcome is roughly
+   **+$420 net**.
+
+### Implications for the audit's conclusions
+
+The headline §3 finding ("min-2-bar hold flips the fleet positive") is
+unchanged — the 1-bar churn problem is real and load-bearing for the
+new fleet. But the audit's verdict on v3-armor specifically needs an
+asterisk:
+
+- v3-armor's reported -$394 settled loss was BEFORE the unrealised
+  longs from 2026-05-07/08 paid off. With the force-close P&L added,
+  v3-armor's 7d net is roughly +$605, not -$394. The armor rule
+  (refuse opposite_signal exits when MFE ≥ 2 ATR) *did* generate
+  positive expectancy when the runner held trades long enough for the
+  reversion-to-mean signals to be wrong.
+
+This doesn't change the architectural conclusion — v3-armor's 17 trade
+"variants" are still one strategy under a shared mux, the cluster
+correlation is still extreme, the 1-bar churn fix still dominates.
+But the next iteration of IGNITION/SESSION/REGIME should not assume
+let-winners-run is unprofitable per se; the audit window just hadn't
+realised the gains yet.
