@@ -726,3 +726,89 @@ At the fleet level over the 7d window:
 This is paper P&L for the *entire fleet running simultaneously*; the
 real-money 50K rule applies to one strategy. The per-variant max_day
 column is the relevant view for sizing the future fleet.
+
+
+---
+
+## §6 Inter-variant correlation and cluster outcomes
+
+[`docs/v3_audit/correlation_matrix.csv`](docs/v3_audit/correlation_matrix.csv)
+· [`docs/v3_audit/cluster_outcomes.csv`](docs/v3_audit/cluster_outcomes.csv)
+
+### Pairwise daily-P&L correlation
+
+Variants with `r ≥ 0.7` are functionally one strategy
+for diversification purposes.
+
+**Pairs at or above r = 0.7** (32):
+
+- `v3.1-canon` ↔ `v3.1-pctile` → r = +1.00
+- `v3.1-pctile` ↔ `v3.1-trail` → r = +0.99
+- `v3.1-canon` ↔ `v3.1-min2bar` → r = +0.99
+- `v3.1-min2bar` ↔ `v3.1-pctile` → r = +0.99
+- `v3.1-armor` ↔ `v4-loose-shorts` → r = +0.98
+- `v3.1-pctile` ↔ `v4-loose-shorts` → r = +0.98
+- `v3-canon` ↔ `v3-min2bar` → r = +0.98
+- `v3.1-canon` ↔ `v3.1-trail` → r = +0.98
+- `v3.1-min2bar` ↔ `v3.1-trail` → r = +0.98
+- `v3-canon` ↔ `v3-trail` → r = +0.97
+- `v3.1-trail` ↔ `v4-loose-shorts` → r = +0.97
+- `v3.1-canon` ↔ `v4-loose-shorts` → r = +0.97
+- `v3-armor` ↔ `v3-canon` → r = +0.97
+- `v3.1-armor` ↔ `v3.1-trail` → r = +0.96
+- `v3.1-armor` ↔ `v3.1-pctile` → r = +0.96
+- `v3-armor` ↔ `v3-trail` → r = +0.96
+- `v3-canon` ↔ `v3-pctile` → r = +0.95
+- `v3.1-min2bar` ↔ `v4-loose-shorts` → r = +0.95
+- `v3-min2bar` ↔ `v3-pctile` → r = +0.95
+- `v3.1-armor` ↔ `v3.1-canon` → r = +0.94
+- `v3-armor` ↔ `v3-min2bar` → r = +0.93
+- `v3-armor` ↔ `v3-pctile` → r = +0.93
+- `v4-vol-regime` ↔ `v5-mtf-anchor` → r = +0.92
+- `v3-min2bar` ↔ `v3-trail` → r = +0.92
+- `v3.1-armor` ↔ `v3.1-min2bar` → r = +0.91
+- `v3-pctile` ↔ `v3-trail` → r = +0.91
+- `v4-trend-flip` ↔ `v4-trend-gate` → r = +0.85
+- `v3.1-min2bar` ↔ `v4-vol-regime` → r = +0.83
+- `v3.1-canon` ↔ `v4-vol-regime` → r = +0.79
+- `v3.1-trail` ↔ `v4-vol-regime` → r = +0.78
+- `v3.1-pctile` ↔ `v4-vol-regime` → r = +0.76
+- `v4-trend-gate` ↔ `v5-mtf-anchor` → r = +0.76
+
+### Full matrix
+
+| variant | v3-armor | v3-canon | v3-min2bar | v3-pctile | v3-trail | v3.1-armor | v3.1-canon | v3.1-min2bar | v3.1-pctile | v3.1-trail | v4-loose-shorts | v4-overnight-bias | v4-trend-flip | v4-trend-gate | v4-vol-regime | v5-mtf-anchor |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| v3-armor | +1.00 | +0.97 | +0.93 | +0.93 | +0.96 | +0.08 | -0.17 | -0.23 | -0.13 | -0.04 | -0.10 | +0.05 | -0.23 | -0.39 | -0.18 | -0.19 |
+| v3-canon | +0.97 | +1.00 | +0.98 | +0.95 | +0.97 | +0.21 | +0.00 | -0.06 | +0.03 | +0.12 | +0.04 | +0.04 | -0.12 | -0.27 | +0.01 | +0.01 |
+| v3-min2bar | +0.93 | +0.98 | +1.00 | +0.95 | +0.92 | +0.20 | +0.00 | -0.05 | +0.04 | +0.12 | +0.04 | +0.10 | -0.16 | -0.27 | +0.02 | -0.00 |
+| v3-pctile | +0.93 | +0.95 | +0.95 | +1.00 | +0.91 | +0.41 | +0.17 | +0.12 | +0.22 | +0.31 | +0.25 | +0.30 | -0.37 | -0.46 | +0.08 | -0.04 |
+| v3-trail | +0.96 | +0.97 | +0.92 | +0.91 | +1.00 | +0.14 | -0.04 | -0.10 | -0.02 | +0.07 | -0.04 | +0.04 | -0.04 | -0.15 | +0.06 | +0.09 |
+| v3.1-armor | +0.08 | +0.21 | +0.20 | +0.41 | +0.14 | +1.00 | +0.94 | +0.91 | +0.96 | +0.96 | +0.98 | +0.44 | -0.28 | -0.32 | +0.60 | +0.35 |
+| v3.1-canon | -0.17 | +0.00 | +0.00 | +0.17 | -0.04 | +0.94 | +1.00 | +0.99 | +1.00 | +0.98 | +0.97 | +0.39 | -0.05 | -0.01 | +0.79 | +0.59 |
+| v3.1-min2bar | -0.23 | -0.06 | -0.05 | +0.12 | -0.10 | +0.91 | +0.99 | +1.00 | +0.99 | +0.98 | +0.95 | +0.48 | -0.09 | +0.03 | +0.83 | +0.61 |
+| v3.1-pctile | -0.13 | +0.03 | +0.04 | +0.22 | -0.02 | +0.96 | +1.00 | +0.99 | +1.00 | +0.99 | +0.98 | +0.46 | -0.15 | -0.09 | +0.76 | +0.53 |
+| v3.1-trail | -0.04 | +0.12 | +0.12 | +0.31 | +0.07 | +0.96 | +0.98 | +0.98 | +0.99 | +1.00 | +0.97 | +0.54 | -0.20 | -0.12 | +0.78 | +0.54 |
+| v4-loose-shorts | -0.10 | +0.04 | +0.04 | +0.25 | -0.04 | +0.98 | +0.97 | +0.95 | +0.98 | +0.97 | +1.00 | +0.46 | -0.27 | -0.26 | +0.63 | +0.37 |
+| v4-overnight-bias | +0.05 | +0.04 | +0.10 | +0.30 | +0.04 | +0.44 | +0.39 | +0.48 | +0.46 | +0.54 | +0.46 | +1.00 | -0.73 | -0.32 | +0.43 | +0.10 |
+| v4-trend-flip | -0.23 | -0.12 | -0.16 | -0.37 | -0.04 | -0.28 | -0.05 | -0.09 | -0.15 | -0.20 | -0.27 | -0.73 | +1.00 | +0.85 | +0.23 | +0.58 |
+| v4-trend-gate | -0.39 | -0.27 | -0.27 | -0.46 | -0.15 | -0.32 | -0.01 | +0.03 | -0.09 | -0.12 | -0.26 | -0.32 | +0.85 | +1.00 | +0.49 | +0.76 |
+| v4-vol-regime | -0.18 | +0.01 | +0.02 | +0.08 | +0.06 | +0.60 | +0.79 | +0.83 | +0.76 | +0.78 | +0.63 | +0.43 | +0.23 | +0.49 | +1.00 | +0.92 |
+| v5-mtf-anchor | -0.19 | +0.01 | -0.00 | -0.04 | +0.09 | +0.35 | +0.59 | +0.61 | +0.53 | +0.54 | +0.37 | +0.10 | +0.58 | +0.76 | +0.92 | +1.00 |
+
+
+### Cluster outcomes — what happens when ≥3 variants fire same direction
+
+The §0.6 cluster log identified 495 non-overlapping cluster events.
+This rollup matches each cluster to the trades settled inside its
+5-minute window and aggregates P&L.
+
+| cluster size | n clusters | total cluster P&L | avg / cluster | avg matched trades | mean WR |
+| --- | --- | --- | --- | --- | --- |
+| 11+ | 131 | $-2,317.45 | $-17.69 | 20.2 | 34.5% |
+| 3-5 | 253 | $-1,050.10 | $-4.15 | 4.9 | 35.2% |
+| 6-10 | 111 | $+21.65 | $+0.20 | 13.3 | 41.0% |
+
+The cluster-size column maps to the hypothesis: the larger the
+cluster, the more correlated the bet, the more swing in either
+direction.
