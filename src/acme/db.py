@@ -251,7 +251,22 @@ class Db:
     # ---------- ryan_spec_v3 paper/live trades ----------
 
     def insert_ryan_spec_v3_trade(self, row: dict[str, Any]) -> int | None:
-        """Insert one open trade row; returns its id on success."""
+        """Insert one open trade row; returns its id on success.
+
+        ARCHIVE NOTE (2026-05-11): the v3 multi-variant runtime is retired.
+        The only legitimate callers now are cleanup / force-flatten
+        scripts that write `manual_*` exit_reasons. Any other call site
+        is unexpected — a structured warning is emitted to make
+        accidental writes easy to spot in the runner log.
+        """
+        reason = row.get("exit_reason") or ""
+        if not reason.startswith("manual_"):
+            log.warning(
+                "ryan_spec_v3_trades_unexpected_write",
+                strategy_id=row.get("strategy_id"),
+                exit_reason=reason or "(open)",
+                note="v3 is archived; new writes should be cleanup/force-flatten only",
+            )
         try:
             res = self.client.table("ryan_spec_v3_trades").insert(row).execute()
             data = res.data or []
@@ -263,7 +278,20 @@ class Db:
     def update_ryan_spec_v3_trade(
         self, trade_id: int, fields: dict[str, Any]
     ) -> None:
-        """Patch fields on an existing v3 trade row (used to fill in exit info)."""
+        """Patch fields on an existing v3 trade row.
+
+        ARCHIVE NOTE (2026-05-11): same caveat as insert. Updates that
+        change `exit_reason` to a `manual_*` value are expected (cleanup
+        flow). Any other field-level update is unexpected.
+        """
+        reason = fields.get("exit_reason") or ""
+        if reason and not reason.startswith("manual_"):
+            log.warning(
+                "ryan_spec_v3_trades_unexpected_update",
+                trade_id=trade_id,
+                exit_reason=reason,
+                note="v3 is archived; new updates should be cleanup/force-flatten only",
+            )
         try:
             self.client.table("ryan_spec_v3_trades").update(fields).eq(
                 "id", trade_id
