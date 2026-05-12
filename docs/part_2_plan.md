@@ -140,11 +140,46 @@ After Phases 2-5 are in SHADOW and accumulating data for ≥8 hours.
 | Stealth Umbrella source | You linked it but didn't paste the script. Behavior-tracking is a separate concern from signal generation | When you paste it |
 | Bar-data retention | BOUNDARY needs Databento bars at 2-min cached locally. Confirm the existing cache covers 90+ days | Before Phase 5 |
 
-## What I'm doing right now (Phase 2a only)
+## Status
 
-1. Port PULSE core math to `src/acme/strategies/pulse_features.py`.
-2. Test coverage for the math.
-3. Commit. Stop.
-4. Report back.
+| Phase | Status | Commit |
+|---|---|---|
+| Phase 1 — v3 unwind | **done** (21 rows force-closed, +$2,618 locked, agent stopped) | da18211 |
+| Phase 1 leftover — archive code, strip write paths | **gated** (user approval) | — |
+| Phase 2a — PULSE core math | **done** | 6933dad |
+| Phase 2b — PULSE gate stack (HTF, vol regime, zones, pullback, exhaustion, lockout) | **done** | (Phase 2b commit) |
+| Phase 2c — IGNITION strategy | **done** (GO/NO-GO entry + min-2-bar hold + ATR stop, SHADOW lifecycle) | (Phase 2c commit) |
+| Phase 3 — SESSION | pending | — |
+| Phase 4 — REGIME | pending | — |
+| Phase 5 — BOUNDARY (incl. levels infra) | pending | — |
+| Phase 6 — Warden | pending | — |
+| New LaunchAgent for the new fleet | pending | — |
 
-No conductor wiring, no live registration, no destruction.
+### Phase 2c decisions (already executed)
+
+- **Entry filter**: GO/NO-GO Box's 4 binary gates ([`go_no_go.py`](../src/acme/strategies/go_no_go.py)).
+  PULSE features (`pulse_features.py`) and gates (`pulse_gates.py`)
+  remain as a feature library available to future strategies and to
+  Warden for diagnostics. Rationale: audit §3 said simpler entry +
+  disciplined exit wins; layering PULSE on top would repeat the v3.1
+  pattern that didn't help.
+- **Min-2-bar hold lives in the strategy**, not the conductor. IGNITION
+  self-suppresses opposite signals before bar 2.
+  ([`ignition.py`](../src/acme/strategies/ignition.py)).
+- **Time windows**: 03:00–05:00 CT and 08:00–09:00 CT only — from audit §2.
+  Pine's 13:00–14:15 CT window is dropped (worst hour in fleet).
+- **Direction**: long-only by default (audit §4 — short edge unproven).
+  Configurable.
+
+## What's next (gated on user)
+
+1. Phase 3 — SESSION (the strategy whose ONLY entry signal is the time
+   window itself + cum-delta extreme, no extra gates). The simplest of
+   the four.
+2. Phase 4 — REGIME (compression deadband + expansion follow).
+3. Phase 5 — BOUNDARY (new infra for level tables, historical retag, then
+   the strategy).
+4. New LaunchAgent for the new fleet (after some / all of the strategies
+   are in SHADOW).
+5. v3 code archive + write-path strip (still destructive, still gated).
+
