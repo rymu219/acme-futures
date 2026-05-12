@@ -449,3 +449,96 @@ fleet net P&L **$-2,179.50**, fleet PF **0.88**.
 the system's defining behavior. Whether that's a feature or a bug is
 the central §3 question (1-bar churn) and §6 question (correlated
 exits causing correlated whipsaws).
+
+
+---
+
+## §2 Time-of-day (US Central)
+
+[`docs/v3_audit/time_buckets.csv`](docs/v3_audit/time_buckets.csv) (variant × hour)
+· [`docs/v3_audit/time_buckets_fleet.csv`](docs/v3_audit/time_buckets_fleet.csv) (fleet × hour)
+
+Hours are entry hour (CT) of each settled trade.
+
+### Fleet, by entry hour
+
+| hour | n | net P&L | WR | PF | avg/trade |
+| --- | --- | --- | --- | --- | --- |
+| 00:00 CT | 276 | $-230.70 | 28.3% | 0.66 | $-0.84 |
+| 01:00 CT | 236 | $124.80 | 55.1% | 1.20 | $0.53 |
+| 02:00 CT | 321 | $50.30 | 38.6% | 1.07 | $0.16 |
+| 03:00 CT | 345 | $818.50 | 44.9% | 1.98 | $2.37 |
+| 04:00 CT | 221 | $555.30 | 55.2% | 2.02 | $2.51 |
+| 05:00 CT | 226 | $115.55 | 34.5% | 1.21 | $0.51 |
+| 06:00 CT | 161 | $-421.45 | 31.1% | 0.44 | $-2.62 |
+| 07:00 CT | 184 | $171.20 | 33.2% | 1.14 | $0.93 |
+| 08:00 CT | 126 | $395.55 | 29.4% | 1.57 | $3.14 |
+| 09:00 CT | 165 | $583.80 | 56.4% | 1.73 | $3.54 |
+| 10:00 CT | 239 | $-35.10 | 42.7% | 0.97 | $-0.15 |
+| 11:00 CT | 180 | $-1,067.25 | 22.2% | 0.23 | $-5.93 |
+| 12:00 CT | 183 | $-281.85 | 39.9% | 0.74 | $-1.54 |
+| 13:00 CT | 281 | $-1,335.45 | 14.2% | 0.30 | $-4.75 |
+| 14:00 CT | 223 | $-471.10 | 33.2% | 0.51 | $-2.11 |
+| 15:00 CT | 208 | $-1,048.10 | 24.0% | 0.24 | $-5.04 |
+| 17:00 CT | 53 | $494.40 | 24.5% | 3.47 | $9.33 |
+| 18:00 CT | 93 | $54.90 | 35.5% | 1.30 | $0.59 |
+| 19:00 CT | 165 | $-541.75 | 28.5% | 0.31 | $-3.28 |
+| 20:00 CT | 116 | $-34.95 | 34.5% | 0.93 | $-0.30 |
+| 21:00 CT | 136 | $-140.20 | 27.9% | 0.49 | $-1.03 |
+| 22:00 CT | 202 | $297.35 | 55.9% | 2.07 | $1.47 |
+| 23:00 CT | 341 | $-139.95 | 25.8% | 0.83 | $-0.41 |
+
+### Best & worst 2-hour windows (fleet-aggregate)
+
+**Best:**
+- 03:00–05:00 CT → $+1,373.80
+- 08:00–10:00 CT → $+979.35
+- 02:00–04:00 CT → $+868.80
+
+**Worst:**
+- 13:00–15:00 CT → $-1,806.55
+- 12:00–14:00 CT → $-1,617.30
+- 14:00–16:00 CT → $-1,519.20
+
+### Variant-level best/worst hour (n ≥ 5 trades per hour, variant n ≥ 30)
+
+| variant | best_hour | worst_hour |
+| --- | --- | --- |
+| v3-armor | 03:00 CT ($+201.50, n=5) | 11:00 CT ($-112.55, n=9) |
+| v3-canon | 03:00 CT ($+115.35, n=37) | 11:00 CT ($-162.80, n=29) |
+| v3-min2bar | 03:00 CT ($+194.15, n=28) | 11:00 CT ($-179.95, n=16) |
+| v3-pctile | 03:00 CT ($+118.30, n=31) | 11:00 CT ($-166.65, n=22) |
+| v3-trail | 09:00 CT ($+107.65, n=23) | 13:00 CT ($-145.85, n=28) |
+| v3.1-canon | 04:00 CT ($+45.35, n=12) | 13:00 CT ($-77.85, n=13) |
+| v3.1-min2bar | 04:00 CT ($+58.55, n=11) | 13:00 CT ($-74.50, n=10) |
+| v3.1-pctile | 04:00 CT ($+45.35, n=12) | 13:00 CT ($-77.85, n=13) |
+| v3.1-trail | 01:00 CT ($+45.90, n=13) | 13:00 CT ($-72.85, n=13) |
+| v4-loose-shorts | 07:00 CT ($+56.60, n=12) | 13:00 CT ($-105.95, n=21) |
+| v4-overnight-bias | 07:00 CT ($+121.60, n=12) | 13:00 CT ($-105.95, n=21) |
+| v4-trend-flip | 08:00 CT ($+81.35, n=7) | 10:00 CT ($-103.85, n=18) |
+| v4-trend-gate | 08:00 CT ($+87.05, n=6) | 15:00 CT ($-70.35, n=13) |
+| v4-vol-regime | 08:00 CT ($+81.90, n=8) | 13:00 CT ($-105.95, n=21) |
+| v5-mtf-anchor | 08:00 CT ($+81.90, n=8) | 13:00 CT ($-105.95, n=21) |
+
+### SESSION-window assessment
+
+The plan's draft SESSION windows are **8:30–10:00 CT** (morning) and
+**13:30–15:00 CT** (afternoon). Mapping those to my 1-hour entry buckets:
+
+| Window | Hours included | n trades | Net P&L |
+|---|---|---:|---:|
+| Morning RTH (8:30–10:00) | 08, 09, 10 CT | 530 | $+944.25 |
+| Afternoon RTH (13:30–15:00) | 13, 14 CT | 504 | $-1,806.55 |
+| Full RTH (8–15 CT) | 08–14 CT | 1,397 | $-2,211.40 |
+| Overnight (18–07 CT) | 18–23 + 00–06 CT | 2,839 | $+507.70 |
+
+**Interpretation:** the fleet's P&L is concentrated in the overnight
+hours (where 84% of `opposite_signal` exits also live, per §1). The
+draft SESSION windows captured only a small slice of fleet activity —
+the fleet trades almost continuously, and the bulk of its losses
+accumulate outside the morning/afternoon RTH windows. This challenges
+the SESSION-as-9:30-to-3:00 framing in the original plan. Whether
+*positive* edge lives in the morning or afternoon RTH windows
+specifically — independent of variant — is the practical question for
+the SESSION strategy and is best answered with the per-hour
+profit-factor column above.
