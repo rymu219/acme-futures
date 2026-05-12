@@ -154,8 +154,40 @@ After Phases 2-5 are in SHADOW and accumulating data for ≥8 hours.
 | Phase 5 — BOUNDARY (incl. levels infra + exhaustion detector) | **done** (SHADOW) |
 | Phase 5b — historical retag script | **written**, but blocked: Databento cache ends 2026-04-30 vs trades from 2026-05-04. Refresh cache to enable retroactive validation. Not blocking — BOUNDARY validates via live SHADOW data instead. |
 | Strategy registration (Supabase `strategies` table) | **done** (`scripts/register_new_fleet.py --execute`) |
-| New LaunchAgent + runner for the new fleet | **pending** — biggest remaining piece |
+| New runner module ([`acme.fleet_runner`](../src/acme/fleet_runner.py)) | **done** — wires the 4 strategies through the classic Conductor |
+| New watchdog ([`scripts/fleet_runner_watchdog.sh`](../scripts/fleet_runner_watchdog.sh)) | **done** — same two-layer supervision pattern as v3 |
+| New LaunchAgent plist ([`launchd/com.acme-futures.fleet-runner.plist`](../launchd/com.acme-futures.fleet-runner.plist)) | **done** — install with `launchctl load` |
+| Heartbeat probe override ([`scripts/check_runner_heartbeat.py`](../scripts/check_runner_heartbeat.py)) | **done** — `HEARTBEAT_SERVICE_REGEX` env-var override; v3 default preserved |
+| Install + load the new LaunchAgent (`cp launchd/com.acme-futures.fleet-runner.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.acme-futures.fleet-runner.plist`) | **pending** (user runs) |
 | Phase 6 — Warden | pending |
+
+## Running the new fleet
+
+```bash
+# install + start the new LaunchAgent (one-time)
+cp launchd/com.acme-futures.fleet-runner.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.acme-futures.fleet-runner.plist
+
+# verify it's running
+launchctl list | grep fleet-runner   # PID should be non-zero
+tail logs/fleet_runner.out.log       # structured runner logs
+tail logs/fleet_watchdog.log         # watchdog supervision log
+uv run python scripts/latest_trade.py   # most recent trade row across all variants
+```
+
+## Architecture summary
+
+- One `ProjectXAdapter` SignalR mux (single TopstepX session, as required).
+- One `Conductor` instance — the classic conductor's `FlatFirstFSM`
+  arbitrates a single position across the 4 strategies. This is the
+  architectural answer to v3's cluster-correlation problem (audit §6):
+  16 variants couldn't all hold positions simultaneously without
+  pyramiding because they shared the same position state via the broker;
+  the new fleet enforces that constraint explicitly via one position.
+- Per-strategy phantom positions tracked separately in dry-run for
+  attribution (`conductor.dry_run_open[name]`).
+- Heartbeats keyed by strategy name. The watchdog's heartbeat probe
+  uses `HEARTBEAT_SERVICE_REGEX='^(ignition|session|regime|boundary)$'`.
 
 ### Phase 2c decisions (already executed)
 
