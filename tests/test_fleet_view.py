@@ -10,9 +10,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
 
 from fleet_view import (  # noqa: E402
     FLEET,
+    TIME_BUCKETS,
     _bucket_closes_by_hour,
+    _bucket_hours,
+    _compute_metrics_from_closes,
+    _filter_closes_by_bucket,
     _heartbeat_status,
     _render_bars_held,
+    _render_bucket_selector,
     _render_header,
     _render_hour_heatmap,
     _render_position_panel,
@@ -236,6 +241,89 @@ def test_render_overview_with_empty_data():
     html = render_overview(sb, token="t")
     assert "Acme Futures" in html
     assert "v3 archive" in html  # footer link present
+
+
+# ════════════ time-bucket filter ═══════════════════════════════════
+
+
+def test_bucket_hours_all_returns_none():
+    assert _bucket_hours("all") is None
+    assert _bucket_hours(None) is None
+    assert _bucket_hours("unknown_key") is None
+
+
+def test_bucket_hours_audit_winners():
+    h = _bucket_hours("audit_winners")
+    assert h == {3, 4, 8, 9, 17}
+
+
+def test_filter_closes_by_bucket_keeps_matching():
+    # 5 closes — one at each of these CT hours: 03, 09, 13, 17, 22.
+    # CT is UTC-5 in May.
+    closes = [
+        _close(strategy="ignition", hours_ago=h_offset)
+        for h_offset in (1, 2, 3, 4, 5)
+    ]
+    # Manually fix occurred_at to land each in a specific CT hour
+    from datetime import UTC, datetime
+    base = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)  # 07:00 CT
+    target_hours = [3, 9, 13, 17, 22]
+    for c, ct_hour in zip(closes, target_hours):
+        # CT hour h → UTC h+5 (CDT)
+        c["occurred_at"] = datetime(2026, 5, 15, (ct_hour + 5) % 24,
+                                     30, tzinfo=UTC).isoformat()
+    audit_winners = _filter_closes_by_bucket(closes, "audit_winners")
+    # 03 CT and 09 CT and 17 CT → 3 hits
+    assert len(audit_winners) == 3
+    rth_pm = _filter_closes_by_bucket(closes, "rth_pm")
+    # 13 CT → 1 hit
+    assert len(rth_pm) == 1
+
+
+def test_filter_closes_passthrough_on_all():
+    closes = [_close() for _ in range(5)]
+    assert _filter_closes_by_bucket(closes, "all") == closes
+    assert _filter_closes_by_bucket(closes, None) == closes
+
+
+def test_compute_metrics_from_closes_aggregates():
+    closes = [
+        _close(strategy="ignition", net_pnl=10),
+        _close(strategy="ignition", net_pnl=-5),
+        _close(strategy="ignition", net_pnl=20),
+        _close(strategy="session", net_pnl=100),
+    ]
+    m = _compute_metrics_from_closes(closes, "ignition")
+    assert m["n_trades"] == 3
+    assert m["net_pnl"] == 25
+    # 2 wins of 3 = 0.667 WR
+    assert abs(m["win_rate"] - 2/3) < 1e-6
+    # gross_win=30, gross_loss=5 → PF=6
+    assert m["profit_factor"] == 6
+
+
+def test_compute_metrics_empty():
+    m = _compute_metrics_from_closes([], "ignition")
+    assert m["n_trades"] == 0
+    assert m["profit_factor"] is None
+
+
+def test_bucket_selector_marks_current():
+    html = _render_bucket_selector("audit_winners", token="t")
+    assert "Audit winners" in html
+    # The active chip uses #0891b2 background
+    assert "#0891b2" in html
+
+
+def test_render_overview_with_bucket_filter():
+    """End-to-end: passing bucket='audit_winners' should label the
+    strategy-card title with the filter name."""
+    hbs = [_hb(n) for n in FLEET]
+    closes = [_close(strategy=n) for n in FLEET]
+    sb = _FakeSupabase(heartbeats=hbs, closes=closes,
+                       strategies=[], snaps={})
+    html = render_overview(sb, token="t", bucket="audit_winners")
+    assert "Audit winners" in html
 
 
 def test_render_overview_with_full_data():
