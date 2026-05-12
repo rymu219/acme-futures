@@ -39,12 +39,18 @@ DEFAULT_TREND_BUFFER_BARS = 60
 
 @dataclass
 class RegimeConfig:
-    # Vol regime thresholds (from PULSE Pine defaults). high → expansion;
-    # low → compression; in-between → normal (also skipped).
+    # Vol regime thresholds. After the 2026-05-12 overnight tuning pass:
+    # - vol_high_ratio bumped 1.5 → 2.0 to require *real* expansion, not
+    #   noise blips on thin-market days
+    # - min_high_atr_pts 1.0 floor added so 2× of tiny absolute ATR
+    #   doesn't qualify (the actual problem in the overnight whipsaw
+    #   data: ratio fired but stop distance of 1.5×0.5pt was too small
+    #   to survive mean reversion → PF 0.22 on bar-1 stops)
     atr_period: int = 4
     atr_avg_period: int = 20
-    vol_high_ratio: float = 1.5     # vol/avg > this → expansion
+    vol_high_ratio: float = 2.0     # vol/avg > this → expansion (was 1.5)
     vol_low_ratio: float = 0.8      # vol/avg < this → compression
+    vol_min_high_atr_pts: float = 1.0   # require ATR >= 1.0 pt absolute
     # Trend classifier buffer
     trend_buffer_bars: int = DEFAULT_TREND_BUFFER_BARS
     trend_lookback_bars: int = DEFAULT_LOOKBACK_BARS
@@ -100,6 +106,7 @@ class RegimeStrategy:
             atr_avg_period=self.config.atr_avg_period,
             high_ratio=self.config.vol_high_ratio,
             low_ratio=self.config.vol_low_ratio,
+            min_high_atr=self.config.vol_min_high_atr_pts,
         )
         self._atr = ATR(self.config.atr_period)
         self._trend_buffer: deque[Bar] = deque(maxlen=self.config.trend_buffer_bars)

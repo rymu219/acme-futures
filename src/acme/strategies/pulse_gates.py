@@ -59,6 +59,12 @@ class VolRegimeClassifier:
     """ATR ratio classifier from the Pine indicator's Vol Regime block.
 
     high if ATR / SMA(ATR, atr_avg_period) > high_ratio
+            AND ATR >= min_high_atr (absolute floor — prevents 'high'
+            classification when expansion is huge in ratio terms but
+            tiny in absolute points; the 2026-05-12 overnight session
+            showed REGIME whipsawing because thin-market ATR of ~0.5pt
+            crossed the 1.5× ratio threshold but stop distance of
+            1.5×0.5pt = 3 ticks was too tight to survive any reversion)
     low  if ATR / SMA(ATR, atr_avg_period) < low_ratio
     normal otherwise
     """
@@ -67,6 +73,7 @@ class VolRegimeClassifier:
         self, *, atr_period: int = 4, atr_avg_period: int = 20,
         high_ratio: float = 1.5, low_ratio: float = 0.8,
         high_proj_mult: float = 1.25, low_gate_adjust: float = 0.07,
+        min_high_atr: float = 0.0,
     ) -> None:
         self._atr = ATR(atr_period)
         self._atr_sma = SMA(atr_avg_period)
@@ -74,6 +81,7 @@ class VolRegimeClassifier:
         self._low_ratio = low_ratio
         self._high_proj_mult = high_proj_mult
         self._low_gate_adjust = low_gate_adjust
+        self._min_high_atr = min_high_atr
 
     @property
     def is_warm(self) -> bool:
@@ -90,7 +98,7 @@ class VolRegimeClassifier:
             return None
         ratio = atr / atr_avg
         label: VolRegimeLabel
-        if ratio > self._high_ratio:
+        if ratio > self._high_ratio and atr >= self._min_high_atr:
             label = "high"
         elif ratio < self._low_ratio:
             label = "low"

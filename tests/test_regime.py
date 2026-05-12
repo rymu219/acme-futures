@@ -70,8 +70,13 @@ def test_no_entry_in_quiet_market():
 
 
 def test_entry_on_vol_expansion_plus_trend_up():
-    """Quiet warm-up → vol expansion + steady up-ramp → buy entry."""
-    s = RegimeStrategy()
+    """Quiet warm-up → vol expansion + steady up-ramp → buy entry.
+
+    Uses synthetic data with tiny absolute price ranges; the live
+    defaults (vol_min_high_atr_pts=1.0) would filter these out, so we
+    opt into looser thresholds to exercise the entry-decision logic
+    independently of the absolute-ATR floor."""
+    s = RegimeStrategy(RegimeConfig(vol_high_ratio=1.5, vol_min_high_atr_pts=0.0))
     state = _state()
     t = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     # 40 flat bars (warms ATR + ATR-SMA at low base value)
@@ -118,7 +123,8 @@ def test_long_only_by_default_blocks_short_trend():
 
 
 def test_shorts_enabled_via_config():
-    cfg = RegimeConfig(allow_shorts=True, allow_longs=False)
+    cfg = RegimeConfig(allow_shorts=True, allow_longs=False,
+                       vol_high_ratio=1.5, vol_min_high_atr_pts=0.0)
     s = RegimeStrategy(config=cfg)
     state = _state()
     t = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
@@ -147,7 +153,9 @@ def test_exit_when_vol_normalises():
     cfg = RegimeConfig(min_bars_before_opposite_exit=2,
                        exit_on_vol_normalization=True,
                        # smaller risk to ensure size=1 trades
-                       risk_dollars_per_trade=200.0)
+                       risk_dollars_per_trade=200.0,
+                       # synthetic-data thresholds (see entry test above)
+                       vol_high_ratio=1.5, vol_min_high_atr_pts=0.0)
     s = RegimeStrategy(config=cfg)
     state = _state()
     t = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
