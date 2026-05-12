@@ -50,7 +50,10 @@ class RegimeConfig:
     atr_avg_period: int = 20
     vol_high_ratio: float = 2.0     # vol/avg > this → expansion (was 1.5)
     vol_low_ratio: float = 0.8      # vol/avg < this → compression
-    vol_min_high_atr_pts: float = 1.0   # require ATR >= 1.0 pt absolute
+    # Absolute ATR floor. 1.0 was over-correction (zero fires post-tune
+    # 2026-05-12); 0.5 lets REAL small expansions through while still
+    # blocking the bar-1 whipsaw scenario (where ATR was ~0.15pt).
+    vol_min_high_atr_pts: float = 0.5
     # Trend classifier buffer
     trend_buffer_bars: int = DEFAULT_TREND_BUFFER_BARS
     trend_lookback_bars: int = DEFAULT_LOOKBACK_BARS

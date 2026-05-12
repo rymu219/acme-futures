@@ -185,65 +185,85 @@ class Conductor:
         aggregator = MultiTimeframeAggregator(timeframes=timeframes_sorted)
 
         async for q in self.broker.stream_quotes(contract_id):
-            price = q.last or q.bid or q.ask
-            if price is None:
-                continue
-            bars_by_tf = aggregator.add_tick(q.t, price)
-            if not bars_by_tf:
-                continue
-            for tf, bar in bars_by_tf.items():
-                # Phantom dry-run exits checked on every completed bar at any tf.
-                # Walk every strategy's bucket; positions opened by tf-1m strategies
-                # close against tf-1m bars (etc.), so the right thing is to attempt
-                # exits for every bucket on every bar — exits are gated by price.
-                if self.dry_run:
-                    for sname, open_positions in self.dry_run_open.items():
-                        if not open_positions:
-                            continue
-                        delta, closes = check_dry_run_exits(
-                            open_positions, bar, contract_id,
-                            self.contract.point_value, self.round_turn_fee, self.db,
+            try:
+                await self._handle_quote(
+                    q, aggregator, contract_id, starting_balance, state,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Per-quote exceptions should never tear down the live
+                # loop. The 2026-05-12 day analysis found the runner
+                # was exiting silently — likely an unhandled async
+                # exception from one strategy / one bar. Log loudly,
+                # keep going.
+                log.error("live_loop_iteration_failed", error=str(e),
+                          exc_info=True)
+
+    async def _handle_quote(
+        self, q, aggregator, contract_id: str,
+        starting_balance: float, state: DailyState,
+    ) -> None:
+        """Extracted from _live_loop so per-iteration exceptions get caught."""
+        price = q.last or q.bid or q.ask
+        if price is None:
+            return
+        bars_by_tf = aggregator.add_tick(q.t, price)
+        if not bars_by_tf:
+            return
+        for tf, bar in bars_by_tf.items():
+            # Phantom dry-run exits checked on every completed bar at any tf.
+            # Walk every strategy's bucket; positions opened by tf-1m strategies
+            # close against tf-1m bars (etc.), so the right thing is to attempt
+            # exits for every bucket on every bar — exits are gated by price.
+            if self.dry_run:
+                for sname, open_positions in self.dry_run_open.items():
+                    if not open_positions:
+                        continue
+                    delta, closes = check_dry_run_exits(
+                        open_positions, bar, contract_id,
+                        self.contract.point_value, self.round_turn_fee, self.db,
+                    )
+                    self.dry_run_position_per_strategy[sname] = (
+                        self.dry_run_position_per_strategy.get(sname, 0) + delta
+                    )
+                    # Feed every close into the per-strategy perf tracker.
+                    for cl in closes:
+                        self.perf.record_close(
+                            strategy=cl.strategy,
+                            net_pnl=cl.net_pnl,
+                            side=cl.side,
+                            outcome=cl.outcome,
+                            entry_price=cl.entry_price,
+                            exit_price=cl.exit_price,
+                            closed_at=cl.closed_at,
                         )
-                        self.dry_run_position_per_strategy[sname] = (
-                            self.dry_run_position_per_strategy.get(sname, 0) + delta
-                        )
-                        # Feed every close into the per-strategy perf tracker.
-                        for cl in closes:
-                            self.perf.record_close(
-                                strategy=cl.strategy,
-                                net_pnl=cl.net_pnl,
-                                side=cl.side,
-                                outcome=cl.outcome,
-                                entry_price=cl.entry_price,
+                        if cl.bar_event_id is not None:
+                            self._telemetry.log_outcome(
+                                cl.bar_event_id,
+                                exit_t=cl.closed_at,
                                 exit_price=cl.exit_price,
-                                closed_at=cl.closed_at,
+                                net_pnl=cl.net_pnl,
+                                outcome=cl.outcome,
                             )
-                            if cl.bar_event_id is not None:
-                                self._telemetry.log_outcome(
-                                    cl.bar_event_id,
-                                    exit_t=cl.closed_at,
-                                    exit_price=cl.exit_price,
-                                    net_pnl=cl.net_pnl,
-                                    outcome=cl.outcome,
-                                )
-                        # Push a fresh perf snapshot to Supabase on every closed trade
-                        # so the leaderboard moves in real-time.
-                        if closes and self.db is not None:
-                            try:
-                                write_snapshot(self.db, self.perf, self.registry)
-                            except Exception as e:
-                                log.error("perf_snapshot_on_close_failed", error=str(e))
+                    # Push a fresh perf snapshot to Supabase on every closed trade
+                    # so the leaderboard moves in real-time.
+                    if closes and self.db is not None:
+                        try:
+                            write_snapshot(self.db, self.perf, self.registry)
+                        except Exception as e:
+                            log.error("perf_snapshot_on_close_failed", error=str(e))
 
-                # Tick the flat-first FSM; if cooldown elapsed, we'll re-eval below.
-                self.flat_first.tick(datetime.now(UTC))
+            # Tick the flat-first FSM; if cooldown elapsed, we'll re-eval below.
+            self.flat_first.tick(datetime.now(UTC))
 
-                await self._process_bar(bar, tf, contract_id, starting_balance, state)
+            await self._process_bar(bar, tf, contract_id, starting_balance, state)
 
-                # Per-strategy heartbeat — one row per active strategy per
-                # bar. Lets the UI / watchdog detect a stale runner without
-                # depending on broker_events (which only fires on closed
-                # trades — could be silent for hours during slow markets).
-                self._write_fleet_heartbeats(bar, contract_id)
+            # Per-strategy heartbeat — one row per active strategy per
+            # bar. Lets the UI / watchdog detect a stale runner without
+            # depending on broker_events (which only fires on closed
+            # trades — could be silent for hours during slow markets).
+            self._write_fleet_heartbeats(bar, contract_id)
 
     def _write_fleet_heartbeats(self, bar, contract_id: str) -> None:
         """Upsert one row in runtime_heartbeats per active strategy.
