@@ -395,11 +395,57 @@ audit pauses." Nothing dangerous is happening in the runtime right now:
 
 So **§§1–9 can proceed once you approve**.
 
+
 ---
 
-## §§1–9 — pending your approval
+## §1 Per-variant performance
 
-Each section will run as a separate script under `scripts/v3_audit/`,
-write its CSV to `docs/v3_audit/`, and append a section to this file.
-Order and contents exactly as specified in the original prompt — no
-additions, no omissions.
+[`docs/v3_audit/variant_summary.csv`](docs/v3_audit/variant_summary.csv)
+· [`docs/v3_audit/variant_exit_distribution.csv`](docs/v3_audit/variant_exit_distribution.csv)
+
+Universe: settled paper trades only (open / orphaned rows excluded).
+16 variants, 4,675 settled trades,
+fleet net P&L **$-2,179.50**, fleet PF **0.88**.
+
+| strategy_id | n_trades | net_pnl | gross_win | gross_loss | profit_factor | win_rate | avg_win | avg_loss | win_loss_ratio | max_win | max_loss | max_drawdown_dollars | max_drawdown_pct_of_peak | sharpe_daily_annualized | avg_bars_held | mean_mfe_atr | mean_mae_atr |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| v4-overnight-bias | 301 | $133.05 | $1,190.75 | $1,057.70 | 1.13 | 38.2% | $10.35 | $-5.69 | 1.82 | $61.80 | $-30.70 | $175.45 | 56.9% | 14.18 | 2.38 | 1.02 | 0.65 |
+| v4-trend-gate | 250 | $33.75 | $913.25 | $879.50 | 1.04 | 36.0% | $10.15 | $-5.50 | 1.85 | $61.80 | $-30.70 | $165.40 | 106.9% | 4.46 | 2.34 | 1.00 | 0.60 |
+| v4-vol-regime | 309 | $22.45 | $1,144.50 | $1,122.05 | 1.02 | 37.2% | $9.95 | $-5.78 | 1.72 | $61.80 | $-30.70 | $199.65 | 89.9% | 2.10 | 2.27 | 0.99 | 0.64 |
+| v5-mtf-anchor | 310 | $-7.00 | $1,125.90 | $1,132.90 | 0.99 | 36.5% | $9.96 | $-5.75 | 1.73 | $61.80 | $-30.70 | $199.65 | 103.6% | -0.57 | 2.23 | 0.97 | 0.63 |
+| v3.1-armor [low_sample] | 20 | $-62.75 | $14.70 | $77.45 | 0.19 | 20.0% | $3.68 | $-4.84 | 0.76 | $9.30 | $-19.45 | $73.85 | 665.3% | -13.30 | 1.75 | 0.54 | 0.70 |
+| v3.1-min2bar | 163 | $-65.35 | $419.90 | $485.25 | 0.87 | 41.7% | $6.17 | $-5.11 | 1.21 | $53.05 | $-30.70 | $177.30 | 158.4% | -2.53 | 2.68 | 1.01 | 0.71 |
+| v3.1-trail | 183 | $-89.35 | $398.90 | $488.25 | 0.82 | 39.9% | $5.46 | $-4.44 | 1.23 | $55.55 | $-30.70 | $181.20 | 197.3% | -4.26 | 1.99 | 0.84 | 0.62 |
+| v3-min2bar | 433 | $-104.50 | $2,076.90 | $2,181.40 | 0.95 | 42.3% | $11.35 | $-8.73 | 1.30 | $126.80 | $-78.20 | $430.05 | 189.1% | -1.74 | 2.83 | 1.11 | 0.79 |
+| v3.1-pctile | 173 | $-119.85 | $386.75 | $506.60 | 0.76 | 34.7% | $6.45 | $-4.48 | 1.44 | $53.05 | $-30.70 | $205.35 | 240.2% | -4.93 | 2.17 | 0.94 | 0.64 |
+| v4-loose-shorts | 274 | $-125.55 | $826.40 | $951.95 | 0.87 | 35.8% | $8.43 | $-5.41 | 1.56 | $49.30 | $-30.70 | $284.90 | 178.8% | -6.26 | 2.09 | 0.95 | 0.63 |
+| v3.1-canon | 181 | $-139.20 | $389.65 | $528.85 | 0.74 | 34.8% | $6.18 | $-4.48 | 1.38 | $53.05 | $-30.70 | $217.45 | 277.9% | -5.49 | 2.09 | 0.94 | 0.62 |
+| v3-canon | 625 | $-246.40 | $2,377.15 | $2,623.55 | 0.91 | 34.1% | $11.16 | $-6.37 | 1.75 | $126.80 | $-38.20 | $497.20 | 218.5% | -3.97 | 2.06 | 0.94 | 0.63 |
+| v4-trend-flip | 289 | $-258.55 | $1,037.65 | $1,296.20 | 0.80 | 33.9% | $10.59 | $-6.79 | 1.56 | $61.80 | $-63.20 | $495.80 | 465.8% | -6.13 | 2.57 | 1.06 | 0.69 |
+| v3-pctile | 476 | $-267.10 | $1,699.00 | $1,966.10 | 0.86 | 32.6% | $10.96 | $-6.12 | 1.79 | $126.80 | $-38.20 | $474.90 | 236.6% | -4.63 | 2.15 | 0.96 | 0.64 |
+| v3-armor | 145 | $-404.15 | $420.10 | $824.25 | 0.51 | 22.1% | $13.13 | $-7.29 | 1.80 | $204.30 | $-31.95 | $578.60 | 331.7% | -8.65 | 4.52 | 0.95 | 0.71 |
+| v3-trail | 543 | $-479.00 | $1,821.15 | $2,300.15 | 0.79 | 35.5% | $9.44 | $-6.57 | 1.44 | $61.80 | $-38.20 | $599.45 | 585.4% | -7.81 | 1.76 | 0.79 | 0.60 |
+
+**Net winners (7d):** v4-overnight-bias, v4-trend-gate, v4-vol-regime
+**Net losers:** v5-mtf-anchor, v3.1-armor, v3.1-min2bar, v3.1-trail, v3-min2bar, v3.1-pctile, v4-loose-shorts, v3.1-canon, v3-canon, v4-trend-flip, v3-pctile, v3-armor, v3-trail
+
+**Best PF:** `v4-overnight-bias` at 1.13
+(301 trades).
+**Worst PF:** `v3.1-armor` at 0.19
+(20 trades).
+
+**Fleet exit-reason distribution (settled only):**
+
+- `opposite_signal` — 3,977 (85.1%)
+- `stop` — 459 (9.8%)
+- `bar1_fast_fail` — 183 (3.9%)
+- `session_end` — 44 (0.9%)
+- `manual_cleanup_2026_05_06` — 5 (0.1%)
+- `manual_cleanup_2026_05_06_signalr_drop` — 5 (0.1%)
+- `manual_cleanup_2026_05_05` — 1 (0.0%)
+- `time_stop` — 1 (0.0%)
+
+`opposite_signal` dominates at >80% across nearly every variant — this is
+the system's defining behavior. Whether that's a feature or a bug is
+the central §3 question (1-bar churn) and §6 question (correlated
+exits causing correlated whipsaws).
