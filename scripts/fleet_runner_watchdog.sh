@@ -38,7 +38,14 @@ while true; do
     RUNNER_PID=$!
     log "fleet_runner spawned with caffeinate PID $RUNNER_PID"
 
-    grace_until=$(($(date +%s) + 180))
+    # Grace period before heartbeat-staleness checks start. The new
+    # runner doesn't write its first heartbeat until the first 2-min
+    # bar completes, which can take up to ~3 min after spawn. Meanwhile
+    # the previous runner's heartbeats are aging out, so the probe sees
+    # only-stale rows and would false-positive kill. 360s gives the
+    # runner enough breathing room to write its first heartbeat before
+    # we start probing (2026-05-12 incident: 12-min false-kill cycle).
+    grace_until=$(($(date +%s) + 360))
     consecutive_stale=0
 
     while kill -0 "$RUNNER_PID" 2>/dev/null; do

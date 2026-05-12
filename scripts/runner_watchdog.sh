@@ -41,7 +41,12 @@ while true; do
     RUNNER_PID=$!
     log "runner spawned with caffeinate PID $RUNNER_PID"
 
-    grace_until=$(($(date +%s) + 180))  # 3 min warmup before we check heartbeats
+    # 6 min warmup before we check heartbeats. The first heartbeat
+    # doesn't write until the first 2-min bar completes; meanwhile
+    # the previous runner's heartbeats may already be stale. 180s
+    # was too aggressive and caused false-positive kills during
+    # warmup (2026-05-12 incident on fleet_runner).
+    grace_until=$(($(date +%s) + 360))
     consecutive_stale=0
 
     while kill -0 "$RUNNER_PID" 2>/dev/null; do
