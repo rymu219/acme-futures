@@ -57,6 +57,12 @@ while true; do
                 log "ZOMBIE-A signalr (closed=$closed activity=$activity); killing"
                 pkill -9 -P "$RUNNER_PID" 2>/dev/null || true
                 kill -9 "$RUNNER_PID" 2>/dev/null || true
+                # Defense in depth — kill any surviving python in the
+                # acme.runner chain. uv run + python subprocesses can
+                # outlive a kill of the caffeinate wrapper. The
+                # `--dry-run` suffix anchors the pattern so we don't
+                # accidentally match acme.fleet_runner (different module).
+                pkill -9 -f "acme.runner --dry-run" 2>/dev/null || true
                 sleep 2
                 break
             fi
