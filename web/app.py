@@ -701,7 +701,14 @@ def home(token: str | None = Query(default=None),
     _check_token(token)
     sb = _client()
     from fleet_view import render_overview as render_new_fleet
-    return render_new_fleet(sb, token=token, bucket=bucket)
+    html = render_new_fleet(sb, token=token, bucket=bucket)
+    # iOS Safari + some Android browsers cache HTML aggressively. The meta
+    # http-equiv refresh tag triggers GETs every 10s but the browser may
+    # serve from cache. no-store forces a fresh fetch each time.
+    return HTMLResponse(content=html, headers={
+        "Cache-Control": "no-store, must-revalidate",
+        "Pragma": "no-cache",
+    })
 
 
 @app.get("/v3-archive", response_class=HTMLResponse)
