@@ -61,6 +61,16 @@ class SessionConfig:
     # is clear, any hour. Set via AUDIT_WINDOWS to opt back into the
     # audit's best-hour gating.
     time_windows: tuple[IgnitionTimeWindow, ...] = ()
+    # Bias-decay guard. The overnight-bias classifier reads a 12h
+    # buffer; when intraday direction reverses (e.g. RTH rally fades
+    # after 15:00 CT), the classifier doesn't update fast enough and
+    # SESSION can repeatedly enter against the new direction.
+    # Suppress entries when the recent `bias_decay_lookback_bars`
+    # bars show a move opposing the bias by at least
+    # `bias_decay_atr_thresh` x ATR.
+    # 2026-05-12 incident: 5 consecutive 1-bar stops at 18:00 CT.
+    bias_decay_lookback_bars: int = 15        # 30 min of 2-min bars
+    bias_decay_atr_thresh: float = 0.5        # 0 disables the guard
     bias_buffer_bars: int = DEFAULT_BIAS_BUFFER_BARS
     bias_threshold_atr: float = DEFAULT_OVERNIGHT_THRESHOLD_ATR
     bias_min_bars: int = DEFAULT_OVERNIGHT_MIN_BARS
@@ -172,6 +182,12 @@ class SessionStrategy:
         if bias == "chop":
             return None
 
+        # Bias-decay guard: if the last N bars moved AGAINST the bias by
+        # more than `bias_decay_atr_thresh` x ATR, suppress. The slow
+        # 12h-window classifier hasn't caught up to an intraday flip yet.
+        if self._recent_move_opposes_bias(bias):
+            return None
+
         if bias == "trend_up" and self.config.allow_longs:
             side = "buy"
         elif bias == "trend_down" and self.config.allow_shorts:
@@ -185,6 +201,28 @@ class SessionStrategy:
             current_balance_unrealized=current_balance_unrealized,
             reason=f"session_entry_{bias}",
         )
+
+    def _recent_move_opposes_bias(self, bias: str) -> bool:
+        """True iff the last `bias_decay_lookback_bars` bars moved against
+        `bias` by at least `bias_decay_atr_thresh` × ATR."""
+        n = self.config.bias_decay_lookback_bars
+        thresh = self.config.bias_decay_atr_thresh
+        if n <= 0 or thresh <= 0:
+            return False
+        if len(self._buffer) <= n:
+            return False
+        atr_val = self._atr.value
+        if atr_val is None or atr_val <= 0:
+            return False
+        recent_move = self._buffer[-1].c - self._buffer[-1 - n].c
+        # Up-bias suppressed if recent move <= -thresh * ATR
+        # Down-bias suppressed if recent move >= +thresh * ATR
+        opposing_drop = atr_val * thresh
+        if bias == "trend_up" and recent_move <= -opposing_drop:
+            return True
+        if bias == "trend_down" and recent_move >= opposing_drop:
+            return True
+        return False
 
     # ───────────────────────── signal construction ──────────────
 

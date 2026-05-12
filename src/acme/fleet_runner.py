@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -90,31 +91,62 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _amain(dry_run: bool) -> None:
+    """Outer retry loop. SignalR connections can be closed by the server
+    (observed 2026-05-12: 47 silent runner exits in 12 hours). Rather
+    than let the python process exit, catch + log + retry the whole
+    conductor.run_forever() call. Backoff is bounded to avoid hammering
+    the broker; the watchdog supervises on top of this for catastrophic
+    failures."""
     from acme.broker.projectx import ProjectXAdapter
     from acme.telemetry import BarEventLogger
 
     config = load_config()
     db = Db()
-    broker = ProjectXAdapter()
-    registry = _build_registry(db)
+    registry_db = db   # capture once for clarity
 
-    active = [s.name for s in registry.list_active()]
-    log.info("fleet_runner_starting",
-             dry_run=dry_run, live=config.live, strategies=active)
-    if not dry_run and config.live:
-        log.warning("fleet_runner_live_mode_active")
+    backoff_s = 5
+    max_backoff_s = 60
+    attempt = 0
+    while True:
+        attempt += 1
+        broker = ProjectXAdapter()
+        registry = _build_registry(registry_db)
+        active = [s.name for s in registry.list_active()]
+        log.info("fleet_runner_starting",
+                 attempt=attempt, dry_run=dry_run, live=config.live,
+                 strategies=active)
+        if not dry_run and config.live:
+            log.warning("fleet_runner_live_mode_active")
 
-    conductor = Conductor(
-        broker=broker, db=db, config=config, registry=registry,
-        dry_run=dry_run,
-        telemetry=BarEventLogger(source="fleet_runner_live",
-                                  mode="full" if dry_run else "off"),
-    )
+        conductor = Conductor(
+            broker=broker, db=db, config=config, registry=registry,
+            dry_run=dry_run,
+            telemetry=BarEventLogger(source="fleet_runner_live",
+                                      mode="full" if dry_run else "off"),
+        )
 
-    try:
-        await conductor.run_forever()
-    finally:
-        await broker.aclose()
+        try:
+            await conductor.run_forever()
+            log.info("fleet_runner_run_forever_returned_normally",
+                     attempt=attempt)
+        except asyncio.CancelledError:
+            log.info("fleet_runner_cancelled", attempt=attempt)
+            await broker.aclose()
+            raise
+        except Exception as e:
+            log.error("fleet_runner_run_forever_raised",
+                      attempt=attempt, error=str(e), exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
+                await broker.aclose()
+
+        # Don't return — retry with exponential backoff. The watchdog
+        # is still supervising; if we keep crashing it'll kill the
+        # whole process eventually.
+        log.warning("fleet_runner_retry_scheduled",
+                    attempt=attempt, backoff_s=backoff_s)
+        await asyncio.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, max_backoff_s)
 
 
 def main() -> None:
