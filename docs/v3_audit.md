@@ -596,3 +596,80 @@ control.
 
 The min-hold variant is **better** on net P&L despite
 fewer trades. This corroborates the fleet 1-bar finding above.
+
+
+---
+
+## §4 Direction and instrument
+
+[`docs/v3_audit/direction_split.csv`](docs/v3_audit/direction_split.csv)
+
+Instrument is MES across all variants. Direction (long/short) is the
+only axis to split.
+
+### Fleet
+
+| Direction | n | Net P&L | PF |
+|---|---:|---:|---:|
+| long | 4,638 | $-1,837.35 | 0.90 |
+| short | 43 | $-248.85 | 0.40 |
+| **total** | **4,681** | **$-2,086.20** | |
+| % short | | 0.9% | |
+
+The fleet is **1% short**. The 2026-05-07 post-mortem
+noted the static cum-delta filter was structurally long-biased (1,063
+longs vs 1 short over 4 days); the v4 asymmetric and regime variants
+have moved the fleet partly off that bias.
+
+### Per-variant skew (sorted by % short)
+
+| variant | n longs | long net | n shorts | short net | % short |
+| --- | --- | --- | --- | --- | --- |
+| v4-trend-flip | 247 | $-0.40 | 42 | $-258.15 | 14.5% |
+| v3-pctile | 476 | $-260.85 | 1 | $+9.30 | 0.2% |
+| v3-canon | 626 | $-230.85 | 0 | $+0.00 | 0.0% |
+| v3-armor | 146 | $-388.60 | 0 | $+0.00 | 0.0% |
+| v3-trail | 543 | $-479.00 | 0 | $+0.00 | 0.0% |
+| v3.1-armor | 20 | $-62.75 | 0 | $+0.00 | 0.0% |
+| v3.1-canon | 181 | $-139.20 | 0 | $+0.00 | 0.0% |
+| v3-min2bar | 434 | $-88.95 | 0 | $+0.00 | 0.0% |
+| v3.1-min2bar | 163 | $-65.35 | 0 | $+0.00 | 0.0% |
+| v3.1-pctile | 173 | $-119.85 | 0 | $+0.00 | 0.0% |
+| v4-loose-shorts | 275 | $-110.00 | 0 | $+0.00 | 0.0% |
+| v3.1-trail | 183 | $-89.35 | 0 | $+0.00 | 0.0% |
+| v4-overnight-bias | 301 | $+133.05 | 0 | $+0.00 | 0.0% |
+| v4-trend-gate | 250 | $+33.75 | 0 | $+0.00 | 0.0% |
+| v4-vol-regime | 309 | $+22.45 | 0 | $+0.00 | 0.0% |
+| v5-mtf-anchor | 311 | $+8.55 | 0 | $+0.00 | 0.0% |
+
+### v4-loose-shorts deep-dive
+
+The "loose shorts" variant uses asymmetric percentile gating (top 12%
+short, bottom 5% long) specifically to fix the long-bias problem.
+
+| Direction | n | Net P&L | PF |
+|---|---:|---:|---:|
+| long | 275 | $-110.00 | 0.88 |
+| short | 0 | $+0.00 | 0.00 |
+
+**The asymmetric gate did not fire any shorts in this window.** The top-12%
+threshold required cum_delta to spike positive enough to qualify a
+short, and over the 7d window that didn't happen on MES. The 2026-05-07
+long-bias problem hasn't been fixed by `v4-loose-shorts`; the asymmetric
+gate just sits there.
+
+### v4-trend-flip (the only spicy inverter)
+
+Inverts counter-trend entries into following entries via the EMA(20)
+trend classifier. Its short trades are the trend-down classification
+flipping a LONG signal into a SHORT entry.
+
+| Direction | n | Net P&L |
+|---|---:|---:|
+| long | 247 | $-0.40 |
+| short | 42 | $-258.15 |
+
+The inverter is taking real shorts, but as §1 showed v4-trend-flip lost
+money overall in this window. The inversion direction *is* aligned with
+the regime call; the *exit policy* (which it inherits from the v3 base)
+still suffers the same 1-bar churn problem identified in §3.
