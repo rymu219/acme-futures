@@ -142,18 +142,20 @@ After Phases 2-5 are in SHADOW and accumulating data for ≥8 hours.
 
 ## Status
 
-| Phase | Status | Commit |
-|---|---|---|
-| Phase 1 — v3 unwind | **done** (21 rows force-closed, +$2,618 locked, agent stopped) | da18211 |
-| Phase 1 leftover — archive code, strip write paths | **gated** (user approval) | — |
-| Phase 2a — PULSE core math | **done** | 6933dad |
-| Phase 2b — PULSE gate stack (HTF, vol regime, zones, pullback, exhaustion, lockout) | **done** | (Phase 2b commit) |
-| Phase 2c — IGNITION strategy | **done** (GO/NO-GO entry + min-2-bar hold + ATR stop, SHADOW lifecycle) | (Phase 2c commit) |
-| Phase 3 — SESSION | pending | — |
-| Phase 4 — REGIME | pending | — |
-| Phase 5 — BOUNDARY (incl. levels infra) | pending | — |
-| Phase 6 — Warden | pending | — |
-| New LaunchAgent for the new fleet | pending | — |
+| Phase | Status |
+|---|---|
+| Phase 1 — v3 unwind | **done** (21 rows force-closed, +$2,618 locked, agent stopped) |
+| Phase 1 leftover — archive v3 code, strip write paths | gated (user approval) |
+| Phase 2a — PULSE core math | **done** |
+| Phase 2b — PULSE gate stack (HTF, vol regime, zones, pullback, exhaustion, lockout) | **done** |
+| Phase 2c — IGNITION strategy | **done** (SHADOW) |
+| Phase 3 — SESSION | **done** (SHADOW) |
+| Phase 4 — REGIME | **done** (SHADOW) |
+| Phase 5 — BOUNDARY (incl. levels infra + exhaustion detector) | **done** (SHADOW) |
+| Phase 5b — historical retag script | **written**, but blocked: Databento cache ends 2026-04-30 vs trades from 2026-05-04. Refresh cache to enable retroactive validation. Not blocking — BOUNDARY validates via live SHADOW data instead. |
+| Strategy registration (Supabase `strategies` table) | **done** (`scripts/register_new_fleet.py --execute`) |
+| New LaunchAgent + runner for the new fleet | **pending** — biggest remaining piece |
+| Phase 6 — Warden | pending |
 
 ### Phase 2c decisions (already executed)
 
