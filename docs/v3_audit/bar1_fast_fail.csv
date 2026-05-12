@@ -1,0 +1,17 @@
+strategy_id,bar1_fast_fail_enabled,trades_7d,bar1_fast_fail_exits_7d,pct_of_trades
+v3-armor,False,150,0,0.0
+v3-canon,False,627,0,0.0
+v3-min2bar,False,437,0,0.0
+v3-pctile,False,478,0,0.0
+v3-trail,False,544,0,0.0
+v3.1-armor,True,22,7,31.82
+v3.1-canon,True,181,45,24.86
+v3.1-min2bar,True,164,42,25.61
+v3.1-pctile,True,173,44,25.43
+v3.1-trail,True,183,45,24.59
+v4-loose-shorts,False,276,0,0.0
+v4-overnight-bias,False,302,0,0.0
+v4-trend-flip,False,290,0,0.0
+v4-trend-gate,False,251,0,0.0
+v4-vol-regime,False,310,0,0.0
+v5-mtf-anchor,False,311,0,0.0

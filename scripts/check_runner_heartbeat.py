@@ -39,7 +39,17 @@ MAX_STALE_SEC = int(os.environ.get("ACME_HEARTBEAT_MAX_STALE_SEC", "300"))
 # v4-trend-gate, hypothetical v5-foo). Pulled to a regex because
 # PostgREST's `like` only takes one pattern and we want a single
 # round-trip; we filter client-side for simplicity.
-_SERVICE_PREFIX_RE = re.compile(r"^v\d+(\.\d+)?-")
+#
+# The new-fleet runner (acme.fleet_runner) writes heartbeats keyed by
+# strategy name (ignition / session / regime / boundary), not by a
+# v\d-prefix. The watchdog wrapping it sets HEARTBEAT_SERVICE_REGEX
+# to a pattern that matches those names. Default is the v3-style
+# prefix to preserve the existing behavior for any consumer of this
+# script that doesn't set the env var.
+_DEFAULT_RE = r"^v\d+(\.\d+)?-"
+_SERVICE_PREFIX_RE = re.compile(
+    os.environ.get("HEARTBEAT_SERVICE_REGEX", _DEFAULT_RE)
+)
 
 
 def main() -> int:
@@ -64,7 +74,7 @@ def main() -> int:
     rows = [r for r in all_rows
             if r.get("service") and _SERVICE_PREFIX_RE.match(r["service"])]
     if not rows:
-        print("no v3 heartbeats found")
+        print(f"no heartbeats matched regex {_SERVICE_PREFIX_RE.pattern}")
         return 1
     now = datetime.now(UTC)
     cutoff = now - timedelta(seconds=MAX_STALE_SEC)

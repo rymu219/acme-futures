@@ -1,0 +1,11 @@
+strategy_id,entry_ts_ct,entry_price,direction,stop_price,atr_at_entry,cum_delta_at_entry,bar_ts_ct,trade_id,variant_exit_rules,regime_classifier,entry_atr_ceiling
+v3-min2bar,2026-05-07 22:04:01 CT,7374.75,long,7371.981505519772,1.845662986818704,-2268,2026-05-07 22:02:00 CT,1149,"opposite_signal, stop, min_bars_before_opp=2",(none),
+v3-trail,2026-05-07 22:08:01 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1158,"opposite_signal, stop, trailing_stop(be@1.0ATR, trail=1.0ATR)",(none),
+v4-trend-gate,2026-05-07 22:08:01 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1159,"opposite_signal, stop",trend_ema,
+v4-loose-shorts,2026-05-07 22:08:02 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1160,"opposite_signal, stop",(none),
+v4-trend-flip,2026-05-07 22:08:02 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1161,"opposite_signal, stop",trend_ema,
+v4-overnight-bias,2026-05-07 22:08:02 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1162,"opposite_signal, stop",overnight_bias,
+v5-mtf-anchor,2026-05-07 22:08:03 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1163,"opposite_signal, stop",higher_tf_alignment,
+v3-armor,2026-05-07 22:08:03 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1164,"opposite_signal, stop, armor(MFE≥2.0ATR)",(none),
+v4-vol-regime,2026-05-07 22:08:03 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1165,"opposite_signal, stop",vol_regime,
+v3-pctile,2026-05-07 22:08:04 CT,7374.5,long,7372.052096854872,1.6319354300855209,-2417,2026-05-07 22:06:00 CT,1166,"opposite_signal, stop",(none),
