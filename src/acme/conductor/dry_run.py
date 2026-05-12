@@ -89,6 +89,10 @@ def check_dry_run_exits(
             continue
         price_pnl = direction * (close_price - pos.entry_price) * point_value * pos.size
         net_pnl = price_pnl - round_turn_fee * pos.size
+        bars_held = max(
+            1,
+            int(round((bar.t - pos.entry_bar_t).total_seconds() / 60))
+        )
         if db:
             db.log_event(
                 "dry_run_close",
@@ -106,7 +110,9 @@ def check_dry_run_exits(
                     "fees": round(round_turn_fee * pos.size, 2),
                     "net_pnl": round(net_pnl, 2),
                     "entry_reason": pos.reason,
+                    "entry_bar_t": pos.entry_bar_t.isoformat(),
                     "bar_t": bar.t.isoformat(),
+                    "bars_held_minutes": bars_held,
                 },
             )
         log.info(

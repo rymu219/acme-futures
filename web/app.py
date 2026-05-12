@@ -690,16 +690,28 @@ def _render_html(sb, *, token: str | None = None) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(
+def home(token: str | None = Query(default=None)):
+    """Main page: new-fleet dashboard (IGNITION / SESSION / REGIME /
+    BOUNDARY in SHADOW). The 16-variant v3 dashboard is preserved as
+    a read-only archive at /v3-archive."""
+    _check_token(token)
+    sb = _client()
+    from fleet_view import render_overview as render_new_fleet
+    return render_new_fleet(sb, token=token)
+
+
+@app.get("/v3-archive", response_class=HTMLResponse)
+def v3_archive(
     token: str | None = Query(default=None),
     mode: str = Query(default="paper"),
     strategy_id: str | None = Query(default=None),
     trades_page: int = Query(default=1),
     trades_strategy: str | None = Query(default=None),
 ):
-    """Main page: v3 fleet overview when no `strategy_id` is given, or the
-    per-variant detail view when one is. The old conductor leaderboard
-    (_render_html) is preserved at /fleet but not linked from /."""
+    """16-variant v3 dashboard — read-only archive of the retired v3
+    multi-runtime. Useful for retrospective analysis of the audit
+    window (2026-05-04 → 2026-05-11). The v3 LaunchAgent is stopped;
+    no new trades will land here."""
     _check_token(token)
     if mode not in ("paper", "live", "shadow"):
         raise HTTPException(status_code=400, detail="invalid mode")
@@ -708,7 +720,6 @@ def home(
     sb = _client()
     from ryan_spec_v3_view import render as render_v3
     from ryan_spec_v3_view import render_overview as render_v3_overview
-
     if strategy_id:
         return render_v3(
             sb, mode=mode, token=token, strategy_id=strategy_id,
@@ -728,8 +739,8 @@ def ryan_spec_v3(
     trades_page: int = Query(default=1),
     trades_strategy: str | None = Query(default=None),
 ):
-    """Alias for backward compatibility with old links/bookmarks."""
-    return home(
+    """Legacy alias for the v3 archive. Old bookmarks land here."""
+    return v3_archive(
         token=token, mode=mode, strategy_id=strategy_id,
         trades_page=trades_page, trades_strategy=trades_strategy,
     )
