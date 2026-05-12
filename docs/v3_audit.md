@@ -868,3 +868,40 @@ calibrated regime classifier.
 fleet has a regime-specific weakness that REGIME's switching logic
 could address. If DDs span every regime, the entry signal itself
 needs fixing, not just regime gating.
+
+
+---
+
+## §8 Calendar effects
+
+[`docs/v3_audit/calendar_effects.csv`](docs/v3_audit/calendar_effects.csv)
+· [`docs/v3_audit/calendar_effects_per_variant.csv`](docs/v3_audit/calendar_effects_per_variant.csv)
+
+Trading days covered: 2026-05-04 → 2026-05-11 (7 distinct calendar days).
+With ~7 days of data this section reports patterns but each day-of-week
+bucket has only 1-2 instances — **everything in this table is
+suggestive, not significant**. Patterns identified here become real
+findings only after several weeks more of paper data.
+
+### Fleet, by day of week (CT)
+
+| day | n | net P&L | WR | PF | avg/trade |
+| --- | --- | --- | --- | --- | --- |
+| Mon | 1368 | $-1,281.35 | 30.4% | 0.78 | $-0.94 |
+| Tue | 133 | $-41.85 | 33.8% | 0.91 | $-0.31 |
+| Wed | 391 | $+429.30 | 29.4% | 1.28 | $+1.10 |
+| Thu | 771 | $-1,439.70 | 32.6% | 0.65 | $-1.87 |
+| Fri | 1598 | $-408.60 | 42.8% | 0.93 | $-0.26 |
+| Sun | 426 | $+621.80 | 39.4% | 1.65 | $+1.46 |
+
+### Notes
+
+- Each day-of-week has 1-2 instances — the table cannot distinguish
+  "Tuesday is bad" from "the one Tuesday in the window happened to
+  contain the anchor-cluster failure."
+- Week-of-month analysis requires multiple weeks of data; skipped here.
+- The 2026-05-07 anchor cluster (worst day at -\$1,439.70 per §5) was a
+  Thursday. If Thursdays show up systematically bad in later weeks, the
+  pattern is real. Right now: insufficient sample.
+- **Recommended**: re-run §8 after 4+ weeks of paper data accumulates.
+  The CSV provides the per-variant × day-of-week base table for that.
