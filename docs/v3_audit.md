@@ -673,3 +673,56 @@ The inverter is taking real shorts, but as §1 showed v4-trend-flip lost
 money overall in this window. The inversion direction *is* aligned with
 the regime call; the *exit policy* (which it inherits from the v3 base)
 still suffers the same 1-bar churn problem identified in §3.
+
+
+---
+
+## §5 Concentration and tail dependence
+
+[`docs/v3_audit/tail_dependence.csv`](docs/v3_audit/tail_dependence.csv)
+
+For each variant: net P&L with extremes removed, plus largest single
+trading-day P&L (the metric the Topstep 50K consistency rule cares about
+— best single day must stay below $1,500).
+
+| variant | n | net P&L | minus top5 | minus bot5 | top5 / net | max day | tail? |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| v4-overnight-bias | 301 | $+133.05 | $-117.20 | $+252.80 | +188% | $+69.65 | yes |
+| v4-trend-gate | 250 | $+33.75 | $-206.50 | $+153.50 | +712% | $+29.30 | yes |
+| v4-vol-regime | 309 | $+22.45 | $-225.30 | $+144.70 | +1104% | $+56.90 | yes |
+| v5-mtf-anchor | 312 | $+2.85 | $-244.90 | $+125.10 | +8693% | $+56.90 | yes |
+| v3.1-armor | 20 | $-62.75 | $-76.75 | $-10.50 | -22% | $-4.90 | no |
+| v3.1-min2bar | 163 | $-65.35 | $-208.10 | $+33.15 | -218% | $+53.25 | ambiguous |
+| v3-min2bar | 434 | $-88.95 | $-437.95 | $+145.80 | -392% | $+171.10 | ambiguous |
+| v3.1-trail | 183 | $-89.35 | $-199.60 | $+9.15 | -123% | $+40.25 | ambiguous |
+| v4-loose-shorts | 276 | $-115.70 | $-315.95 | $-2.20 | -173% | $+15.45 | no |
+| v3.1-pctile | 173 | $-119.85 | $-262.60 | $-21.35 | -119% | $+32.20 | no |
+| v3.1-canon | 181 | $-139.20 | $-281.95 | $-40.70 | -103% | $+34.35 | no |
+| v3-canon | 627 | $-236.55 | $-591.80 | $-76.80 | -150% | $+109.35 | no |
+| v3-pctile | 478 | $-257.25 | $-577.50 | $-97.50 | -124% | $+86.50 | no |
+| v4-trend-flip | 289 | $-258.55 | $-531.30 | $-42.55 | -105% | $+36.65 | no |
+| v3-armor | 147 | $-394.30 | $-698.30 | $-255.80 | -77% | $+43.15 | no |
+| v3-trail | 544 | $-484.70 | $-732.45 | $-324.95 | -51% | $+64.95 | no |
+
+**Tail-driven (positive net depends on top-5 wins):** v4-overnight-bias, v4-trend-gate, v4-vol-regime, v5-mtf-anchor
+
+**Ambiguous (negative net but removing top-5 makes it worse):** v3.1-min2bar, v3-min2bar, v3.1-trail
+
+### Topstep $1,500 consistency-rule check
+
+Best single trading-day per variant (max_day_pnl) is in the table above.
+At the fleet level over the 7d window:
+
+| Direction | Day | Net P&L |
+|---|---|---:|
+| Best fleet day | 2026-05-10 | $+621.80 |
+| Worst fleet day | 2026-05-07 | $-1,439.70 |
+
+| Rule | Status |
+|---|---|
+| Best-day-up < $1,500 (consistency rule) | **PASS** |
+| Best-day-down > -$1,500 (informal) | **PASS** |
+
+This is paper P&L for the *entire fleet running simultaneously*; the
+real-money 50K rule applies to one strategy. The per-variant max_day
+column is the relevant view for sizing the future fleet.
