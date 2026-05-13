@@ -1,15 +1,21 @@
-"""New-fleet runner — wires the 4 Part-2 strategies through the classic
-conductor, against one ProjectX broker session.
+"""New-fleet runner — wires the three keeper strategies through the
+classic conductor, against one ProjectX broker session.
 
-Replaces `acme.runner` (the 16-variant v3 multi-runtime) with the new
-fleet:
-  - IGNITION  (GO/NO-GO entry + min-2-bar hold + ATR stop)
-  - SESSION   (audit-driven time windows + overnight bias)
-  - REGIME    (vol-expansion + trend deadband)
-  - BOUNDARY  (level-rejection fade)
+Active fleet (post-2-year backtest filtering):
+  - BOUNDARY         (level-rejection fade) — $25 dynamic sizing,
+                     PF 3.80, +$4,079/2yr at 1-4 contracts
+  - OVERNIGHT_DRIFT  (weak-bullish bias overnight) — 5 contracts,
+                     PF 1.88, +$7,252/2yr
+  - GAP_FILL         (RTH-open gap fade) — 3 contracts fixed,
+                     PF 1.68, +$1,701/2yr at 1 contract → ~$5K at 3
 
-All four start in SHADOW; the conductor logs phantom dry-run trades.
-Promotion runs through PerfTracker as usual.
+Archived (kept in src/acme/strategies/ for reference, removed from
+active fleet registration here):
+  - IGNITION / SESSION / REGIME — no edge after 2-year filtering,
+    were emitting heartbeats but generating no realised P&L
+
+All three keepers start in SHADOW; the conductor logs phantom dry-run
+trades. Promotion runs through PerfTracker as usual.
 
 Single ProjectX SignalR mux (the conductor owns one BrokerAdapter
 instance — no parallel SignalR connections, which TopstepX rejects).
@@ -43,11 +49,29 @@ from acme.config import load_config
 from acme.db import Db
 from acme.registry import StrategyRegistry
 from acme.strategies.boundary import BoundaryStrategy
-from acme.strategies.ignition import IgnitionStrategy
-from acme.strategies.regime import RegimeStrategy
-from acme.strategies.session import SessionStrategy
+from acme.strategies.gap_fill import GapFillConfig, GapFillStrategy
+from acme.strategies.overnight_drift import OvernightDriftStrategy
 
 log = structlog.get_logger(__name__)
+
+
+def _build_keeper_instances() -> list[tuple[str, object]]:
+    """Construct the three keeper-strategy instances with their
+    live-sizing configs. Backtested 2-year configurations:
+
+      - BOUNDARY: default config ($25 budget → 1-4 contracts dynamic)
+      - OVERNIGHT_DRIFT: default config ($510 budget → 5 contracts at
+        the 20pt stop)
+      - GAP_FILL: fixed_contracts=3 (overrides the default $100 budget
+        to give predictable 3-contract sizing for Topstep MLL compliance)
+    """
+    return [
+        ("boundary", BoundaryStrategy()),
+        ("overnight_drift", OvernightDriftStrategy()),
+        ("gap_fill", GapFillStrategy(
+            config=GapFillConfig(fixed_contracts=3),
+        )),
+    ]
 
 
 def _build_registry(db: Db) -> StrategyRegistry:
@@ -55,30 +79,24 @@ def _build_registry(db: Db) -> StrategyRegistry:
 
     Strategies must have been pre-registered via
     `scripts/register_new_fleet.py --execute`. If a row is missing for
-    one of the four, we upsert it on the fly at SHADOW state to be
+    one of the keepers, we upsert it on the fly at SHADOW state to be
     fail-safe.
     """
     reg = StrategyRegistry(db=db)
     reg.load_from_db()
 
-    pairs = [
-        ("ignition", IgnitionStrategy),
-        ("session", SessionStrategy),
-        ("regime", RegimeStrategy),
-        ("boundary", BoundaryStrategy),
-    ]
+    pairs = _build_keeper_instances()
 
-    for name, cls in pairs:
+    for name, inst in pairs:
         if name not in {s.name for s in reg.list_all()}:
             log.warning("fleet_runner_missing_registry_row_upserting", name=name)
-            inst = cls()
             reg.upsert(
                 name=inst.name, version=inst.version,
                 state=inst.metadata.default_lifecycle,
                 tier=inst.metadata.tier, params={},
                 notes="auto-upserted by fleet_runner on startup",
             )
-        reg.attach_instance(name, cls())
+        reg.attach_instance(name, inst)
 
     return reg
 

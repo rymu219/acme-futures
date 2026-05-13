@@ -24,7 +24,7 @@ Mounted at `/` by web/app.py.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -32,7 +32,7 @@ CT = ZoneInfo("America/Chicago")
 UTC = ZoneInfo("UTC")
 
 # Strategies on the new fleet (Part-2). Order is display order in the UI.
-FLEET = ["ignition", "session", "regime", "boundary"]
+FLEET = ["boundary", "overnight_drift", "gap_fill"]
 
 # PerfTracker thresholds from src/acme/perf/scoring.py
 PILOT_THRESHOLD = 0.55
@@ -198,6 +198,171 @@ def _fetch_recent_closes(sb, *, days: int = 7, limit: int = 1000) -> list[dict[s
     except Exception:
         return []
     return res.data or []
+
+
+def _fetch_kill_switch_state(sb) -> dict[str, Any]:
+    """Latest kill-switch event from operator_events. Returns
+    {'active': bool, 'ts': iso or None, 'by': str or None}."""
+    try:
+        res = (
+            sb.table("operator_events").select("*")
+            .in_("kind", ["kill_switch_activated", "kill_switch_cleared"])
+            .order("occurred_at", desc=True).limit(1).execute()
+        )
+        rows = res.data or []
+    except Exception:
+        return {"active": False, "ts": None, "by": None}
+    if not rows:
+        return {"active": False, "ts": None, "by": None}
+    row = rows[0]
+    return {
+        "active": row.get("kind") == "kill_switch_activated",
+        "ts": row.get("occurred_at"),
+        "by": (row.get("raw") or {}).get("by") if isinstance(row.get("raw"), dict) else None,
+    }
+
+
+def _today_session_closes(closes: list[dict]) -> list[dict]:
+    """Closes that exited during the current CT trading-day session.
+    Trade-date rolls at 17:00 CT (Globex open), matching trading_date_ct."""
+    now_ct = datetime.now(UTC).astimezone(CT)
+    # Find the start of the current trading day.
+    if now_ct.time() >= time(17, 0):
+        td_start = datetime.combine(now_ct.date(), time(17, 0), tzinfo=CT)
+    else:
+        td_start = datetime.combine(
+            now_ct.date() - timedelta(days=1), time(17, 0), tzinfo=CT
+        )
+    out = []
+    for c in closes:
+        ts = c.get("occurred_at")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(CT)
+        except Exception:
+            continue
+        if dt >= td_start:
+            out.append(c)
+    return out
+
+
+# ─────────────────────────── Topstep MLL tracker ────────────────────
+
+
+_TOPSTEP_DLL = 1_000.0
+_TOPSTEP_MLL = 2_000.0
+
+
+def _mll_color(distance: float, limit: float) -> str:
+    """Distance-to-limit → color. green=safe (>50% away), yellow=mid,
+    red=within 20% of limit."""
+    if distance >= 0.5 * limit:
+        return "#15803d"  # green
+    if distance >= 0.2 * limit:
+        return "#d97706"  # yellow
+    return "#b91c1c"      # red
+
+
+def _render_mll_tracker(closes: list[dict]) -> str:
+    """Topstep DLL+MLL header. Session P&L is sum of today's CT-session
+    realized closes. DLL distance = $1000 − today's drawdown. MLL
+    distance uses today's session drawdown as a simple proxy for the
+    trailing-MLL exposure (real trailing-MLL math needs cross-session
+    peak tracking which lives in the runner)."""
+    todays = _today_session_closes(closes)
+
+    # Build per-close P&L stream (chronological) to compute the
+    # session's intraday drawdown.
+    pnls = []
+    for c in sorted(todays, key=lambda r: r.get("occurred_at") or ""):
+        raw = c.get("raw") or {}
+        pnls.append(float(raw.get("net_pnl") or 0.0))
+    session_pnl = sum(pnls)
+
+    # Intraday drawdown: peak running sum − current running sum
+    running = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for p in pnls:
+        running += p
+        peak = max(peak, running)
+        max_dd = max(max_dd, peak - running)
+
+    # DLL exposure tracks intraday loss vs $1K
+    intraday_loss = max(0.0, -session_pnl) if session_pnl < 0 else 0.0
+    dll_distance = max(0.0, _TOPSTEP_DLL - intraday_loss)
+    mll_distance = max(0.0, _TOPSTEP_MLL - max_dd)
+
+    pnl_color = "#15803d" if session_pnl > 0 else "#b91c1c" if session_pnl < 0 else "#475569"
+    dll_color = _mll_color(dll_distance, _TOPSTEP_DLL)
+    mll_color = _mll_color(mll_distance, _TOPSTEP_MLL)
+
+    return f"""
+  <section class="mll-tracker">
+    <div class="mll-card">
+      <div class="mll-label dim mini">SESSION P&amp;L</div>
+      <div class="mll-num mono" style="color:{pnl_color};">${session_pnl:+,.2f}</div>
+      <div class="mll-sub dim mini">{len(pnls)} closed today</div>
+    </div>
+    <div class="mll-card">
+      <div class="mll-label dim mini">DLL DISTANCE ($1,000 limit)</div>
+      <div class="mll-num mono" style="color:{dll_color};">${dll_distance:,.0f}</div>
+      <div class="mll-sub dim mini">intraday loss ${intraday_loss:,.2f}</div>
+    </div>
+    <div class="mll-card">
+      <div class="mll-label dim mini">TRAILING MLL ($2,000 limit)</div>
+      <div class="mll-num mono" style="color:{mll_color};">${mll_distance:,.0f}</div>
+      <div class="mll-sub dim mini">peak-to-trough today ${max_dd:,.2f}</div>
+    </div>
+  </section>
+"""
+
+
+# ─────────────────────────── kill switch ─────────────────────────────
+
+
+def _render_kill_switch(ks: dict[str, Any], token: str | None) -> str:
+    """Big red EMERGENCY FLAT button + green RESUME button. Two-click
+    safety via JS confirm(). Active/Inactive state from operator_events."""
+    token_q = f"&token={token}" if token else ""
+    active = bool(ks.get("active"))
+    state_label = "KILL SWITCH ACTIVE" if active else "KILL SWITCH INACTIVE"
+    state_color = "#b91c1c" if active else "#15803d"
+    state_bg = "#fee2e2" if active else "#dcfce7"
+
+    ts_line = ""
+    if ks.get("ts"):
+        ts_line = f"<span class='dim mini'>since {_ago(ks['ts'])}</span>"
+
+    if active:
+        # Show resume button only
+        action_html = f"""
+        <a href="/kill-switch?action=clear{token_q}"
+           class="ks-btn ks-btn-resume"
+           onclick="return confirm('Clear the kill switch and resume trading?');">
+          RESUME TRADING
+        </a>
+        """
+    else:
+        # Show emergency-flat button only
+        action_html = f"""
+        <a href="/kill-switch?action=activate{token_q}"
+           class="ks-btn ks-btn-flat"
+           onclick="return confirm('EMERGENCY FLAT — force-close ALL positions immediately. Are you sure?');">
+          EMERGENCY FLAT — ALL POSITIONS
+        </a>
+        """
+
+    return f"""
+  <section class="kill-switch-row">
+    <div class="ks-status" style="background:{state_bg};color:{state_color};">
+      <span class="ks-status-label">{state_label}</span>
+      {ts_line}
+    </div>
+    <div class="ks-action">{action_html}</div>
+  </section>
+"""
 
 
 # ─────────────────────────── header ─────────────────────────────────
@@ -388,7 +553,7 @@ def _render_bucket_selector(current: str, token: str | None) -> str:
     chips = []
     for key, b in TIME_BUCKETS.items():
         active = (key == current) or (current == "all" and key == "all")
-        bg = "#0891b2" if active else "rgba(255,255,255,0.06)"
+        bg = "#0891b2" if active else "#f1f5f9"
         color = "white" if active else "var(--dim-1)"
         chips.append(
             f"<a class='bucket-chip' "
@@ -755,12 +920,15 @@ def _render_recent_trades(closes: list[dict], limit: int = 20) -> str:
 
 _CSS = """
 :root {
-  --bg: #0b1220;
-  --card: #111827;
-  --border: #1f2937;
-  --text: #e2e8f0;
-  --dim-1: #94a3b8;
-  --dim-2: #64748b;
+  --bg: #ffffff;
+  --card: #f8fafc;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --dim-1: #475569;
+  --dim-2: #94a3b8;
+  --pos: #15803d;
+  --neg: #b91c1c;
+  --warn: #d97706;
 }
 * { box-sizing: border-box; }
 body {
@@ -817,7 +985,7 @@ body {
   gap: 10px;
 }
 .strat-card {
-  background: rgba(255,255,255,0.02); border: 1px solid var(--border);
+  background: #ffffff; border: 1px solid var(--border);
   border-radius: 6px; padding: 10px 12px;
 }
 .strat-head { display: flex; justify-content: space-between; align-items: center;
@@ -831,7 +999,7 @@ body {
   display: grid; grid-template-columns: 90px 70px 1fr 60px 1fr;
   gap: 10px; align-items: center;
 }
-.gate-bar { background: rgba(255,255,255,0.06); border-radius: 999px;
+.gate-bar { background: #f1f5f9; border-radius: 999px;
             height: 6px; overflow: hidden; }
 .gate-fill { height: 100%; border-radius: 999px; transition: width 0.3s; }
 .gate-score { text-align: right; font-weight: 700; }
@@ -871,12 +1039,54 @@ body {
   text-decoration: none; font-weight: 600; border: 1px solid var(--border);
   transition: background 0.15s;
 }
-.bucket-chip:hover { background: rgba(255,255,255,0.10) !important; }
+.bucket-chip:hover { background: #e2e8f0 !important; }
 
 .recent { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* ── Kill switch ────────────────────────────────────────────────── */
+.kill-switch-row {
+  display: grid; grid-template-columns: 1fr 2fr;
+  gap: 12px; margin-bottom: 16px; align-items: stretch;
+}
+.ks-status {
+  padding: 12px 16px; border-radius: 8px; font-weight: 700;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.ks-status-label { font-size: 13px; letter-spacing: 0.4px; }
+.ks-action { display: flex; align-items: stretch; }
+.ks-btn {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 14px 20px; border-radius: 8px; text-decoration: none;
+  font-weight: 700; font-size: 14px; letter-spacing: 0.6px;
+  transition: opacity 0.15s, transform 0.05s;
+}
+.ks-btn:active { transform: scale(0.99); }
+.ks-btn-flat {
+  background: #b91c1c; color: white; border: 2px solid #991b1b;
+}
+.ks-btn-flat:hover { background: #991b1b; }
+.ks-btn-resume {
+  background: #15803d; color: white; border: 2px solid #166534;
+}
+.ks-btn-resume:hover { background: #166534; }
+
+/* ── MLL tracker ────────────────────────────────────────────────── */
+.mll-tracker {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 10px; margin-bottom: 16px;
+}
+.mll-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px;
+}
+.mll-label { letter-spacing: 0.5px; }
+.mll-num {
+  font-size: 26px; font-weight: 700; margin: 4px 0 2px;
+}
+.mll-sub { font-size: 11px; }
+
 .recent th { text-align: left; padding: 4px 8px; color: var(--dim-1);
              border-bottom: 1px solid var(--border); font-weight: 600; }
-.recent td { padding: 4px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+.recent td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; }
 """
 
 
@@ -897,9 +1107,12 @@ def render_overview(sb, *, token: str | None = None,
     snaps = _fetch_perf_snapshots(sb)
     closes_all = _fetch_recent_closes(sb)
     closes_filtered = _filter_closes_by_bucket(closes_all, bucket)
+    ks_state = _fetch_kill_switch_state(sb)
 
     body = (
-        _render_header(heartbeats)
+        _render_kill_switch(ks_state, token)
+        + _render_mll_tracker(closes_all)
+        + _render_header(heartbeats)
         + _render_bucket_selector(bucket, token)
         + _render_position_panel(heartbeats)
         + _render_strategy_cards(strategies, snaps,
@@ -907,7 +1120,6 @@ def render_overview(sb, *, token: str | None = None,
                                   bucket=bucket)
         + _render_promotion_gate(strategies)
         + _render_hour_heatmap(closes_all, selected_bucket=bucket)
-        + _render_bars_held(closes_filtered)
         + _render_recent_trades(closes_filtered)
     )
     token_q = f"?token={token}" if token else ""
@@ -921,8 +1133,8 @@ def render_overview(sb, *, token: str | None = None,
 </head><body>
 {body}
 <footer class="dim mini" style="text-align:center;padding:12px;">
-  v3 archive: <a href="/v3-archive{token_q}" style="color:#94a3b8;">→ here</a>
-  · legacy fleet: <a href="/fleet{token_q}" style="color:#94a3b8;">→ here</a>
+  v3 archive: <a href="/v3-archive{token_q}" style="color:#475569;">→ here</a>
+  · legacy fleet: <a href="/fleet{token_q}" style="color:#475569;">→ here</a>
   · auto-refresh 10s
 </footer>
 </body></html>
