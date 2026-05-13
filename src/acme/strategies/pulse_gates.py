@@ -33,7 +33,6 @@ from typing import Literal
 from acme.broker.base import Bar
 from acme.indicators import ATR, EMA, SMA
 
-
 # ════════════════════════════════════════════════════════════════════
 # Vol regime
 # ════════════════════════════════════════════════════════════════════
@@ -185,7 +184,7 @@ class PullbackRisk:
     def evaluate(
         cls, *, slope: float, rvol: float,
         slope_band: float = 0.02, rvol_band: float = 0.90,
-    ) -> "PullbackRisk":
+    ) -> PullbackRisk:
         s = abs(slope) < slope_band
         v = rvol < rvol_band
         return cls(slope_too_flat=s, rvol_too_low=v, flagged=s or v)
@@ -207,7 +206,7 @@ class Exhaustion:
     def evaluate(
         cls, *, current_close: float, lookback_close: float, atr: float,
         atr_mult: float = 1.25,
-    ) -> "Exhaustion":
+    ) -> Exhaustion:
         du = current_close - lookback_close
         dd = lookback_close - current_close
         thr = atr_mult * atr
@@ -387,6 +386,4 @@ class HTFAlignmentEngine:
             return True
         if p_long > p_short and self._latest.htf_bullish:
             return True
-        if p_short > p_long and self._latest.htf_bearish:
-            return True
-        return False
+        return bool(p_short > p_long and self._latest.htf_bearish)

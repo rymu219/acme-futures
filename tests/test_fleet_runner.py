@@ -14,7 +14,6 @@ from acme.strategies.ignition import IgnitionStrategy
 from acme.strategies.regime import RegimeStrategy
 from acme.strategies.session import SessionStrategy
 
-
 EXPECTED = [
     ("ignition", IgnitionStrategy),
     ("session", SessionStrategy),
@@ -32,7 +31,7 @@ def test_all_four_strategies_can_be_built():
 
 
 def test_each_strategy_emits_no_signal_on_empty_state():
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime
 
     from acme.broker.base import Bar
     from acme.risk import TOPSTEP_50K, DailyState

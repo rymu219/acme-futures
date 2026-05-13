@@ -14,21 +14,26 @@ so callers can present the [low_sample] qualifier.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Iterable
+from collections.abc import Iterable
 
 import pandas as pd
 
 try:
     from scripts.v3_audit.db import (  # type: ignore
-        CT, MIN_TRADES_FOR_INFERENCE, UTC, fetch_all_v3_trades, get_client,
+        CT,
+        MIN_TRADES_FOR_INFERENCE,
+        fetch_all_v3_trades,
+        get_client,
     )
 except ImportError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.v3_audit.db import (  # type: ignore  # noqa: E402
-        CT, MIN_TRADES_FOR_INFERENCE, UTC, fetch_all_v3_trades, get_client,
+        CT,
+        MIN_TRADES_FOR_INFERENCE,
+        fetch_all_v3_trades,
+        get_client,
     )
 
 

@@ -54,7 +54,7 @@ class IgnitionTimeWindow:
         return self.start <= ct < self.end
 
     @classmethod
-    def from_hours(cls, start_hour: int, end_hour: int) -> "IgnitionTimeWindow":
+    def from_hours(cls, start_hour: int, end_hour: int) -> IgnitionTimeWindow:
         return cls(time(start_hour, 0), time(end_hour, 0))
 
 

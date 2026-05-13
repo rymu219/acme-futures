@@ -26,7 +26,6 @@ from warden.db import (
 )
 from warden.monitors.heartbeat import run as run_heartbeat_monitor
 
-
 MONITORS = [
     ("heartbeat", run_heartbeat_monitor),
 ]

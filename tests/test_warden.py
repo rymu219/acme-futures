@@ -6,7 +6,7 @@ and verify the events it would emit. No actual Supabase access here.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # warden/ is at repo root, not under src/acme/. Put repo root on sys.path.
@@ -16,12 +16,14 @@ from warden.monitors.heartbeat import (
     FLEET,
     LIVE_MAX_S,
     OFFLINE_MIN_S,
+)
+from warden.monitors.heartbeat import (
     run as run_heartbeat,
 )
 
 
 def _hb(service: str, age_s: int) -> dict:
-    ts = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat()
+    ts = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
     return {"service": service, "ts": ts, "last_bar_ts": ts,
             "position_state": "flat", "auth_ok": True, "consecutive_errors": 0,
             "extra": {}}

@@ -23,16 +23,26 @@ import pandas as pd
 try:
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore
     from scripts.v3_audit.trades import (  # type: ignore
-        append_section, df_to_md, load_settled_trades, low_sample_set,
-        max_drawdown, profit_factor, sharpe_daily,
+        append_section,
+        df_to_md,
+        load_settled_trades,
+        low_sample_set,
+        max_drawdown,
+        profit_factor,
+        sharpe_daily,
     )
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore  # noqa: E402
     from scripts.v3_audit.trades import (  # type: ignore  # noqa: E402
-        append_section, df_to_md, load_settled_trades, low_sample_set,
-        max_drawdown, profit_factor, sharpe_daily,
+        append_section,
+        df_to_md,
+        load_settled_trades,
+        low_sample_set,
+        max_drawdown,
+        profit_factor,
+        sharpe_daily,
     )
 
 
@@ -126,7 +136,7 @@ def render_md(summary: pd.DataFrame, exits: pd.DataFrame) -> str:
         summary_disp[c] = summary_disp[c].map(lambda v: f"${v:,.2f}")
     pct_cols = ["win_rate", "max_drawdown_pct_of_peak"]
     for c in pct_cols:
-        summary_disp[c] = summary_disp[c].map(lambda v: f"{v*100:.1f}%" if c == "win_rate" else f"{v:.1f}%")
+        summary_disp[c] = summary_disp[c].map(lambda v, c=c: f"{v*100:.1f}%" if c == "win_rate" else f"{v:.1f}%")
     for c in ("profit_factor", "win_loss_ratio", "sharpe_daily_annualized",
               "avg_bars_held", "mean_mfe_atr", "mean_mae_atr"):
         summary_disp[c] = summary_disp[c].map(lambda v: f"{v:.2f}" if pd.notna(v) else "")

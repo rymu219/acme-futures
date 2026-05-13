@@ -28,7 +28,6 @@ from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
 from acme.strategies.session import SessionStrategy  # noqa: E402
 
-
 STRATEGIES = [
     IgnitionStrategy,
     SessionStrategy,
@@ -71,7 +70,7 @@ def main() -> int:
             state=instance.metadata.default_lifecycle,
             tier=instance.metadata.tier,
             params={},
-            notes=f"registered by scripts/register_new_fleet.py for Part 2 SHADOW launch",
+            notes="registered by scripts/register_new_fleet.py for Part 2 SHADOW launch",
         )
         print(f"  ✓ upserted {rec.name} v{rec.version} state={rec.state}")
 

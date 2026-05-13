@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from acme.broker.base import Bar
 from acme.risk import TOPSTEP_50K, DailyState
 from acme.strategies.go_no_go import GoNoGoConfig

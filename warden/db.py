@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from dotenv import load_dotenv
@@ -43,7 +43,7 @@ def fetch_recent_operator_events(
     sb: Client, *, kind: str | None = None, since_minutes: int = 60,
 ) -> list[dict[str, Any]]:
     from datetime import timedelta
-    floor = (datetime.now(timezone.utc)
+    floor = (datetime.now(UTC)
               - timedelta(minutes=since_minutes)).isoformat()
     q = (sb.table("operator_events").select("*")
          .gte("occurred_at", floor)
@@ -85,7 +85,7 @@ def resolve_operator_event(sb: Client, event_id: int) -> None:
     """Mark an event resolved (sets resolved_at = now)."""
     try:
         sb.table("operator_events").update(
-            {"resolved_at": datetime.now(timezone.utc).isoformat()}
+            {"resolved_at": datetime.now(UTC).isoformat()}
         ).eq("id", event_id).execute()
     except Exception as e:
         print(f"warden: resolve_operator_event failed: {e}", file=sys.stderr)

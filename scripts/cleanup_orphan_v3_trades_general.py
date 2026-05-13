@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -83,7 +83,7 @@ def main() -> int:
     print(f"  → live (heartbeat agrees): {len(live)}")
 
     if live:
-        print(f"\nLive positions kept (do not touch):")
+        print("\nLive positions kept (do not touch):")
         for o, st in live:
             print(f"  id={o['id']:>5}  {o['strategy_id']:<22}  "
                   f"{o['entry_ts']}  @ {o['entry_price']}  ({o['direction']})  "
@@ -98,16 +98,16 @@ def main() -> int:
         print(f"  id={o['id']:>5}  {o['strategy_id']:<22}  "
               f"{o['entry_ts']}  @ {o['entry_price']}  ({o['direction']})")
 
-    now_utc = datetime.now(timezone.utc).isoformat()
-    print(f"\nPayload:")
-    print(f"  exit_price   = entry_price (per row)")
+    now_utc = datetime.now(UTC).isoformat()
+    print("\nPayload:")
+    print("  exit_price   = entry_price (per row)")
     print(f"  exit_ts      = {now_utc}")
     print(f"  exit_reason  = '{EXIT_REASON_TAG}'")
     print(f"  pnl_dollars  = -{ROUND_TURN_COMMISSION:.2f}")
-    print(f"  bars_held    = NULL")
-    print(f"  mfe_atr      = NULL")
-    print(f"  mae_atr      = NULL")
-    print(f"  slippage_ticks = 0")
+    print("  bars_held    = NULL")
+    print("  mfe_atr      = NULL")
+    print("  mae_atr      = NULL")
+    print("  slippage_ticks = 0")
 
     if not args.execute:
         print("\n(dry-run — pass --execute to actually write)")

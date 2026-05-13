@@ -1,7 +1,7 @@
 """Tests for the BOUNDARY strategy."""
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from acme.broker.base import Bar
@@ -22,7 +22,7 @@ def _state():
     )
 
 
-def _bar(t, *, o, h, l, c, v=100):
+def _bar(t, *, o, h, l, c, v=100):  # noqa: E741 — matches Bar.l field
     return Bar(t=t, o=o, h=h, l=l, c=c, v=v)
 
 

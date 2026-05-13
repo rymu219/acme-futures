@@ -60,7 +60,7 @@ def _build_downtrend_bars(start: datetime, n: int = 50, start_price: float = 100
 def _build_flat_bars(start: datetime, n: int = 50, price: float = 100.0) -> list[Bar]:
     bars = []
     t = start
-    for i in range(n):
+    for _ in range(n):
         bars.append(_bar(t, price))
         t += timedelta(minutes=2)
     return bars

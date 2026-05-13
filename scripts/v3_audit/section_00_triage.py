@@ -33,8 +33,15 @@ from acme.runner import VARIANTS
 # Robust imports whether invoked as a script or a module:
 try:
     from scripts.v3_audit.db import (  # type: ignore
-        AUDIT_DIR, CT, UTC, fetch_all_v3_trades, fetch_heartbeats,
-        fetch_open_trades, fmt_ct, get_client, parse_iso, to_ct, write_csv,
+        CT,
+        UTC,
+        fetch_all_v3_trades,
+        fetch_heartbeats,
+        fetch_open_trades,
+        fmt_ct,
+        get_client,
+        parse_iso,
+        write_csv,
     )
 except ImportError:
     # Allow `uv run python scripts/v3_audit/section_00_triage.py` directly.
@@ -42,8 +49,15 @@ except ImportError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.v3_audit.db import (  # type: ignore  # noqa: E402
-        AUDIT_DIR, CT, UTC, fetch_all_v3_trades, fetch_heartbeats,
-        fetch_open_trades, fmt_ct, get_client, parse_iso, to_ct, write_csv,
+        CT,
+        UTC,
+        fetch_all_v3_trades,
+        fetch_heartbeats,
+        fetch_open_trades,
+        fmt_ct,
+        get_client,
+        parse_iso,
+        write_csv,
     )
 
 

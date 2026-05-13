@@ -20,7 +20,7 @@ Lifecycle: SHADOW. Long-only by default (audit §4); shorts allowed via config.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
@@ -30,7 +30,6 @@ from acme.ryan_spec.v4_regime import DEFAULT_LOOKBACK_BARS, classify_trend_ema
 from acme.strategies.base import Signal, StrategyMetadata
 from acme.strategies.params import ParameterSpec
 from acme.strategies.pulse_gates import VolRegimeClassifier
-
 
 # 60 bars = 120 min of 2-min bars. Enough for the trend_ema classifier
 # (EMA(20) on a 60-bar window).
@@ -163,15 +162,15 @@ class RegimeStrategy:
             holding_long = current_position > 0
 
             # Exit 1: vol regime no longer expansion → entry thesis gone
-            if self.config.exit_on_vol_normalization and vol.label != "high":
-                if self._bars_held >= self.config.min_bars_before_opposite_exit:
-                    side = "sell" if holding_long else "buy"
-                    return self._build_signal(
-                        bar=bar, side=side, state=state, profile=profile,
-                        current_position=current_position,
-                        current_balance_unrealized=current_balance_unrealized,
-                        reason="regime_vol_normalized",
-                    )
+            if (self.config.exit_on_vol_normalization and vol.label != "high"
+                    and self._bars_held >= self.config.min_bars_before_opposite_exit):
+                side = "sell" if holding_long else "buy"
+                return self._build_signal(
+                    bar=bar, side=side, state=state, profile=profile,
+                    current_position=current_position,
+                    current_balance_unrealized=current_balance_unrealized,
+                    reason="regime_vol_normalized",
+                )
 
             # Exit 2: trend flipped — but only if min-2-bar elapsed
             if self._bars_held >= self.config.min_bars_before_opposite_exit:

@@ -40,11 +40,11 @@ _ARCHIVE = Path(__file__).resolve().parents[2] / "archive" / "v3"
 sys.path.insert(0, str(_ARCHIVE))
 
 from runner import (  # type: ignore[import-not-found]  # noqa: E402,F401
-    VARIANTS,
     SESSION_END_CT,
     SESSION_OPEN_CT,
+    VARIANTS,
     V3Runtime,
-    _VariantSpec,
     _parse_hhmm,
     _resolve_classifier,
+    _VariantSpec,
 )

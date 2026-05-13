@@ -157,8 +157,6 @@ class GoNoGoEngine:
 
         vr = (float(bar.v) / vma) if (vma > 0 and bar.v > 0) else 0.0
         vr_rising = (self._vr_prev is None) or (vr > self._vr_prev)
-        # Update prev for next call
-        prev_vr = self._vr_prev
         self._vr_prev = vr
 
         sep_ok = abs_sep >= cfg.sep_thr

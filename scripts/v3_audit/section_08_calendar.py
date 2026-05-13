@@ -12,14 +12,20 @@ import pandas as pd
 try:
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore
     from scripts.v3_audit.trades import (  # type: ignore
-        append_section, df_to_md, load_settled_trades, profit_factor,
+        append_section,
+        df_to_md,
+        load_settled_trades,
+        profit_factor,
     )
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore  # noqa: E402
     from scripts.v3_audit.trades import (  # type: ignore  # noqa: E402
-        append_section, df_to_md, load_settled_trades, profit_factor,
+        append_section,
+        df_to_md,
+        load_settled_trades,
+        profit_factor,
     )
 
 

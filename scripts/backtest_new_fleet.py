@@ -40,6 +40,7 @@ from pathlib import Path
 # up at config time.
 logging.basicConfig(level=logging.WARNING)
 import structlog  # noqa: E402
+
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
 )
@@ -49,17 +50,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from acme.backtest.data import iter_bars  # noqa: E402
 from acme.broker.base import Bar, BracketSpec  # noqa: E402
-from acme.conductor.bar_aggregator import BarAggregator  # noqa: E402
 from acme.conductor.dry_run import DryRunPosition, check_dry_run_exits  # noqa: E402
 from acme.contracts import MES  # noqa: E402
 from acme.levels import compute_day_levels, trading_date_ct  # noqa: E402
 from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
-from acme.strategies.base import Signal  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
 from acme.strategies.session import SessionStrategy  # noqa: E402
-
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "docs" / "backtest_new_fleet"
 

@@ -29,19 +29,19 @@ from pathlib import Path
 # Silence structlog before any acme.* imports
 logging.basicConfig(level=logging.WARNING)
 import structlog  # noqa: E402
+
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from acme.strategies.session import SessionConfig, SessionStrategy  # noqa: E402
 from scripts.backtest_new_fleet import (  # noqa: E402
     _strategy_stats,
     backtest_strategy,
     stream_2min_bars,
 )
-from acme.strategies.session import SessionConfig, SessionStrategy  # noqa: E402
-
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "docs" / "backtest_new_fleet"
 
@@ -100,7 +100,7 @@ def main() -> int:
                         None,
                     )
                     if sweep_05:
-                        print(f"\nSanity check (main summary vs sweep at 0.5):")
+                        print("\nSanity check (main summary vs sweep at 0.5):")
                         print(f"  main:  n={main_n}  net=${main_net:+,.2f}")
                         print(f"  sweep: n={sweep_05['n']}  net=${sweep_05['net_pnl']:+,.2f}")
                         if main_n == sweep_05["n"] and abs(main_net - sweep_05["net_pnl"]) < 0.01:

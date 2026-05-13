@@ -18,8 +18,8 @@ Lifecycle: SHADOW by default.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, time
+from dataclasses import dataclass
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from acme.broker.base import Bar, BracketSpec
@@ -220,9 +220,7 @@ class SessionStrategy:
         opposing_drop = atr_val * thresh
         if bias == "trend_up" and recent_move <= -opposing_drop:
             return True
-        if bias == "trend_down" and recent_move >= opposing_drop:
-            return True
-        return False
+        return bool(bias == "trend_down" and recent_move >= opposing_drop)
 
     # ───────────────────────── signal construction ──────────────
 
