@@ -27,13 +27,38 @@ HEARTBEAT_PROBE="scripts/check_runner_heartbeat.py"
 
 mkdir -p logs
 
+# Load .env (if present) so ACME_LIVE and other user-controlled toggles
+# reach this script. Done with `set -a / +a` so each variable defined in
+# .env is automatically exported into the child runner's environment.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . .env
+    set +a
+fi
+
+# Live-mode flag — defaults to dry-run for safety. Set ACME_LIVE=true in
+# .env to flip to real-broker execution. The strategies must additionally
+# be in PILOT or LIVE state in the registry; SHADOW strategies always go
+# phantom regardless of this flag.
+if [ "${ACME_LIVE:-false}" = "true" ]; then
+    RUNNER_FLAGS=""
+    MODE_LABEL="LIVE"
+else
+    RUNNER_FLAGS="--dry-run"
+    MODE_LABEL="dry-run"
+fi
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$WATCH_LOG"; }
 
 while true; do
-    log "spawning fleet_runner"
+    log "spawning fleet_runner mode=$MODE_LABEL"
     # PYTHONUNBUFFERED=1 — same rationale as runner_watchdog.sh (line buffering
     # so tail -f stays responsive when stdout is redirected).
-    PYTHONUNBUFFERED=1 nohup caffeinate -i uv run python -m acme.fleet_runner --dry-run \
+    # $RUNNER_FLAGS is intentionally unquoted so an empty value expands to
+    # zero args (no --dry-run); a literal "--dry-run" expands to one arg.
+    # shellcheck disable=SC2086
+    PYTHONUNBUFFERED=1 nohup caffeinate -i uv run python -m acme.fleet_runner $RUNNER_FLAGS \
         >> "$RUNNER_LOG" 2>&1 &
     RUNNER_PID=$!
     log "fleet_runner spawned with caffeinate PID $RUNNER_PID"
