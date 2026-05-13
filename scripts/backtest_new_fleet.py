@@ -96,13 +96,24 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
     """Drive a strategy through every bar; track its phantom positions
     via the same machinery the conductor uses in dry-run.
 
-    Returns a list of close-records (one dict per closed trade)."""
+    Returns a list of close-records (one dict per closed trade).
+
+    Per-day state reset: in live trading the broker balance resets daily
+    and Topstep's trailing max-loss limit (MLL) is computed against the
+    peak-end-of-day balance. In a 2-year backtest with cumulative
+    phantom losses, naive use of `state.peak_balance_eod = starting`
+    would drag the MLL down past the actual balance within weeks, and
+    `can_open_new_position` would silently zero out every signal
+    thereafter (the bug discovered 2026-05-12: SESSION's 228 reported
+    closes vs 11,436 actual entry signals). To replicate live
+    SHADOW conditions, reset DailyState every CT trading-day and
+    compute today's-only P&L; cross-day MLL drift is suppressed."""
     closes: list[dict] = []
     open_positions: list[DryRunPosition] = []
     net_position = 0
-    realized = 0.0
     current_td = None
     state = None
+    today_realized = 0.0
 
     # Bracketed close handling re-uses check_dry_run_exits which writes
     # via Db.log_event when db is supplied. We pass db=None; the function
@@ -111,9 +122,11 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
     for bar in bars_2min:
         td = trading_date_ct(bar.t)
         if td != current_td:
-            # New trading day — refresh state and (for BOUNDARY) levels
+            # New trading day — refresh state, reset today's P&L, and
+            # (for BOUNDARY) the day-levels.
             state = _new_daily_state(td)
             current_td = td
+            today_realized = 0.0
             if levels_by_date is not None and hasattr(strategy, "set_levels"):
                 lv = levels_by_date.get(td)
                 if lv is not None:
@@ -133,7 +146,7 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
             )
             net_position += delta
             for cl in closed:
-                realized += cl.net_pnl
+                today_realized += cl.net_pnl
                 # Find the matching position in the pre-mutation snapshot
                 matched = next(
                     (p for p in snapshot
@@ -163,8 +176,12 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                     "bars_held_minutes": bars_held_min,
                 })
 
-        # 2. Call strategy on this bar
-        balance = 50_000.0 + realized
+        # 2. Call strategy on this bar.
+        # Balance reflects today's P&L only (state was reset on day
+        # rollover). Each backtest day is a fresh slate — matches live
+        # behavior where the conductor passes the broker's same-day
+        # balance, not cumulative-since-eternity P&L.
+        balance = 50_000.0 + today_realized
         sig = strategy.on_bar(
             bar, state=state, profile=TOPSTEP_50K,
             current_position=net_position,
