@@ -57,6 +57,12 @@ class BoundaryConfig:
     # Direction (symmetric by default)
     allow_longs: bool = True
     allow_shorts: bool = True
+    # Entry-hour blacklist (CT). The 2-year backtest showed BOUNDARY's
+    # edge is concentrated in low-liquidity hours (03-08 CT, 17-23 CT)
+    # and reverses during peak RTH volume (09-13 CT: PF 0.31-0.80,
+    # -$712 across that window over 2 years). Skip those hours by
+    # default; pass `()` to disable.
+    entry_hour_blacklist_ct: tuple[int, ...] = (9, 10, 11, 12, 13)
 
 
 # Level names by "side" relative to current price.
@@ -166,6 +172,16 @@ class BoundaryStrategy:
 
         if exh is None or self._levels is None:
             return None
+
+        # Entry-hour blacklist (CT). Skip RTH-volume hours where levels
+        # get broken and exhaustion patterns false-fire. Backtest finding
+        # 2026-05-12: 09-13 CT is -$712 over 2 years; 03-08 + 17-23 CT
+        # carries the edge.
+        if self.config.entry_hour_blacklist_ct:
+            from acme.levels import CT
+            entry_hour = bar.t.astimezone(CT).hour
+            if entry_hour in self.config.entry_hour_blacklist_ct:
+                return None
 
         buffer_pts = self.config.level_buffer_ticks * self.contract.tick_size
 
