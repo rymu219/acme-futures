@@ -57,7 +57,6 @@ from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
 from acme.strategies.overnight_drift import OvernightDriftStrategy  # noqa: E402
-from acme.strategies.overnight_momentum import OvernightMomentumStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
 from acme.strategies.session import SessionStrategy  # noqa: E402
 
@@ -382,7 +381,6 @@ STRATEGIES = {
     "session":  SessionStrategy,
     "regime":   RegimeStrategy,
     "boundary": BoundaryStrategy,
-    "overnight_momentum": OvernightMomentumStrategy,
     "overnight_drift": OvernightDriftStrategy,
 }
 

@@ -1,13 +1,15 @@
 """OVERNIGHT_DRIFT — long-only, weak-bullish-bias overnight hold.
 
-Distilled from the OVERNIGHT_MOMENTUM breakdown:
+Distilled from a 2-year overnight-carry exploration:
   - Strong-body bias bars (|body|>3pt) lose more than weak ones.
-  - LONG-WEAK is the only positive cohort (PF 1.01, breakeven).
-  - 8pt stop hits 70% of the time; 24pt target hits 18%. The bracket
-    shape was the active error.
-  - Force-close-at-08:00 cohort: 80% WR, PF 7.24 — confirms the bias
-    has real directional content, but it doesn't develop within a
-    24pt envelope in 15h.
+  - Long-on-weak is the only positive cohort.
+  - 8pt stops on 24pt targets fail asymmetrically (~70% stop / 18%
+    target), but the survive-to-08:00 cohort closes 80% in profit —
+    so the bias has real directional content; it just doesn't
+    develop within a 24pt envelope in 15h.
+  - With a band of 2pt <= body <= 3pt, 20pt catastrophic stop, no
+    target, and 08:00 force-close, the survive cohort lifts to
+    81% WR / PF 22.4 and the strategy lands at PF 1.88.
 
 Logic:
   1. Bias window 15:30-16:00 CT. body = close - open.
