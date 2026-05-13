@@ -24,7 +24,7 @@ high-side and low-side levels are symmetric.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
@@ -63,13 +63,32 @@ class BoundaryConfig:
     # -$712 across that window over 2 years). Skip those hours by
     # default; pass `()` to disable.
     entry_hour_blacklist_ct: tuple[int, ...] = (9, 10, 11, 12, 13)
+    # Level classes to consider. "pd" = previous-day H/L, "on" = overnight
+    # H/L, "or" = opening-range H/L. The 2-year breakdown showed PD levels
+    # are a clear drag (PF 0.69, -$289), ON levels carry the edge
+    # (PF 27, +$3,228), and OR levels are marginally positive
+    # (PF 1.28, +$511). Default drops PD; pass ("pd","on","or") to
+    # restore the old fully-pooled behavior.
+    level_classes_enabled: tuple[str, ...] = ("on", "or")
+    # Per-class hour blacklist (CT). 2-year OR-by-hour breakdown:
+    # hours {0, 15, 18, 19, 23} CT are net-negative (PF 0.00-0.70,
+    # -$291 combined). Skipping them lifts OR's PF from 1.30 toward
+    # ~1.8-2.0 with no profit lost. ON is left unfiltered — its edge
+    # is uniformly strong across the non-RTH window.
+    # Map: class name → tuple of CT hours where that class is suppressed.
+    level_class_hour_blacklist_ct: dict[str, tuple[int, ...]] = field(
+        default_factory=lambda: {"or": (0, 15, 18, 19, 23)}
+    )
 
 
-# Level names by "side" relative to current price.
-# A high-side level (PDH/ONH/ORH) is a resistance candidate — fade short.
-# A low-side level (PDL/ONL/ORL) is a support candidate — fade long.
-_HIGH_SIDE_LEVELS = ("pdh", "onh", "orh")
-_LOW_SIDE_LEVELS = ("pdl", "onl", "orl")
+# Level class → level names. A high-side level (ending in 'h') is a
+# resistance candidate — fade short. A low-side level (ending in 'l') is
+# a support candidate — fade long.
+_CLASS_LEVELS: dict[str, tuple[str, str]] = {
+    "pd": ("pdh", "pdl"),
+    "on": ("onh", "onl"),
+    "or": ("orh", "orl"),
+}
 
 
 class BoundaryStrategy:
@@ -113,6 +132,26 @@ class BoundaryStrategy:
         self._atr = ATR(self.config.atr_period)
         self._levels: DayLevels | None = None
 
+        bad = [c for c in self.config.level_classes_enabled if c not in _CLASS_LEVELS]
+        if bad:
+            raise ValueError(
+                f"unknown level_classes_enabled entries: {bad} "
+                f"(valid: {sorted(_CLASS_LEVELS)})"
+            )
+        bad_blk = [c for c in self.config.level_class_hour_blacklist_ct
+                   if c not in _CLASS_LEVELS]
+        if bad_blk:
+            raise ValueError(
+                f"unknown level_class_hour_blacklist_ct entries: {bad_blk} "
+                f"(valid: {sorted(_CLASS_LEVELS)})"
+            )
+        self._high_by_class: dict[str, str] = {
+            c: _CLASS_LEVELS[c][0] for c in self.config.level_classes_enabled
+        }
+        self._low_by_class: dict[str, str] = {
+            c: _CLASS_LEVELS[c][1] for c in self.config.level_classes_enabled
+        }
+
     def required_history_bars(self) -> int:
         return max(
             self.config.exh_lookback_bars,
@@ -126,11 +165,20 @@ class BoundaryStrategy:
 
     # ───────────────────────── helpers ─────────────────────────
 
-    def _nearest_high_side(self, price: float) -> tuple[str | None, float | None]:
-        return self._nearest_among(price, _HIGH_SIDE_LEVELS, above_only=True)
+    def _classes_allowed_at(self, entry_hour: int) -> set[str]:
+        blk = self.config.level_class_hour_blacklist_ct
+        return {c for c in self.config.level_classes_enabled
+                if entry_hour not in blk.get(c, ())}
 
-    def _nearest_low_side(self, price: float) -> tuple[str | None, float | None]:
-        return self._nearest_among(price, _LOW_SIDE_LEVELS, above_only=False)
+    def _nearest_high_side(self, price: float, entry_hour: int) -> tuple[str | None, float | None]:
+        allowed = self._classes_allowed_at(entry_hour)
+        names = tuple(self._high_by_class[c] for c in allowed)
+        return self._nearest_among(price, names, above_only=True)
+
+    def _nearest_low_side(self, price: float, entry_hour: int) -> tuple[str | None, float | None]:
+        allowed = self._classes_allowed_at(entry_hour)
+        names = tuple(self._low_by_class[c] for c in allowed)
+        return self._nearest_among(price, names, above_only=False)
 
     def _nearest_among(
         self, price: float, names: tuple[str, ...], *, above_only: bool,
@@ -173,20 +221,20 @@ class BoundaryStrategy:
         if exh is None or self._levels is None:
             return None
 
+        from acme.levels import CT
+        entry_hour = bar.t.astimezone(CT).hour
+
         # Entry-hour blacklist (CT). Skip RTH-volume hours where levels
         # get broken and exhaustion patterns false-fire. Backtest finding
         # 2026-05-12: 09-13 CT is -$712 over 2 years; 03-08 + 17-23 CT
         # carries the edge.
-        if self.config.entry_hour_blacklist_ct:
-            from acme.levels import CT
-            entry_hour = bar.t.astimezone(CT).hour
-            if entry_hour in self.config.entry_hour_blacklist_ct:
-                return None
+        if entry_hour in self.config.entry_hour_blacklist_ct:
+            return None
 
         buffer_pts = self.config.level_buffer_ticks * self.contract.tick_size
 
         if exh.direction == "top" and self.config.allow_shorts:
-            name, lvl = self._nearest_high_side(bar.h)
+            name, lvl = self._nearest_high_side(bar.h, entry_hour)
             if name is None or lvl is None:
                 return None
             if abs(lvl - bar.h) > buffer_pts:
@@ -202,7 +250,7 @@ class BoundaryStrategy:
             )
 
         if exh.direction == "bottom" and self.config.allow_longs:
-            name, lvl = self._nearest_low_side(bar.l)
+            name, lvl = self._nearest_low_side(bar.l, entry_hour)
             if name is None or lvl is None:
                 return None
             if abs(lvl - bar.l) > buffer_pts:

@@ -1,2 +1,2 @@
 strategy,n,net_pnl,win_rate,profit_factor,avg_pnl,max_win,max_loss,bar1_n,bar1_net,bar1_wr,elapsed_s
-boundary,339,3449.96,0.569,2.21,10.18,47.52,-24.98,20,-218.49,0.2,1.0
+boundary,242,4078.51,0.694,3.8,16.85,47.52,-24.98,13,-123.6,0.231,1.3

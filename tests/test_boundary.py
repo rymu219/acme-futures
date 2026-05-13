@@ -74,7 +74,11 @@ def test_no_entry_during_warmup():
 
 
 def test_short_fade_at_pdh():
-    s = BoundaryStrategy()
+    # PD class is off by default (2-year backtest: PF 0.69, -$289).
+    # This test exercises the PD-fade mechanic, so opt in explicitly.
+    s = BoundaryStrategy(config=BoundaryConfig(
+        level_classes_enabled=("pd", "on", "or"),
+    ))
     s.set_levels(_make_levels(pdh=110.0))
     state = _state()
     # Warm 10 bars at price 100
@@ -122,7 +126,10 @@ def test_no_short_when_high_is_far_from_level():
 
 
 def test_long_fade_at_pdl():
-    s = BoundaryStrategy()
+    # PD class is off by default; opt in for this PDL-fade test.
+    s = BoundaryStrategy(config=BoundaryConfig(
+        level_classes_enabled=("pd", "on", "or"),
+    ))
     s.set_levels(_make_levels(pdl=90.0))
     state = _state()
     for i in range(22):

@@ -159,9 +159,11 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                         1,
                         int((cl.closed_at - matched.entry_bar_t).total_seconds() / 60),
                     )
+                    reason = matched.reason
                 else:
                     entry_ts = ""
                     bars_held_min = 0
+                    reason = ""
                 closes.append({
                     "strategy": name,
                     "entry_ts": entry_ts,
@@ -172,6 +174,7 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                     "net_pnl": cl.net_pnl,
                     "outcome": cl.outcome,
                     "bars_held_minutes": bars_held_min,
+                    "reason": reason,
                 })
 
         # 2. Call strategy on this bar.
@@ -222,6 +225,7 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                 "net_pnl": round(net_pnl, 2),
                 "outcome": "force_close_end_of_backtest",
                 "bars_held_minutes": int((last.t - p.entry_bar_t).total_seconds() / 60),
+                "reason": p.reason,
             })
 
     return closes
@@ -408,7 +412,7 @@ def main() -> int:
         # Per-strategy CSV
         cols = ["strategy", "entry_ts", "exit_ts", "side",
                 "entry_price", "exit_price", "net_pnl", "outcome",
-                "bars_held_minutes"]
+                "bars_held_minutes", "reason"]
         _write_csv(OUT_DIR / f"{name}.csv", closes, cols)
 
         summary_rows.append({"strategy": name, **stats, "elapsed_s": round(elapsed, 1)})
