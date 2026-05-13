@@ -56,6 +56,10 @@ from acme.levels import compute_day_levels, trading_date_ct  # noqa: E402
 from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
+from acme.strategies.orb_30 import ORB30Strategy  # noqa: E402
+from acme.strategies.orb_pullback import ORBPullbackStrategy  # noqa: E402
+from acme.strategies.overnight_drift import OvernightDriftStrategy  # noqa: E402
+from acme.strategies.overnight_momentum import OvernightMomentumStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
 from acme.strategies.session import SessionStrategy  # noqa: E402
 
@@ -176,6 +180,37 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                     "bars_held_minutes": bars_held_min,
                     "reason": reason,
                 })
+
+        # 1b. Strategy-requested time-based force-flat.
+        # ORB_30 needs a hard close at 9:30 CT that the bracket can't
+        # express. Strategy opts in by defining `wants_force_flat(bar)`.
+        # All open positions close at this bar's open with outcome
+        # "force_close_session".
+        if (open_positions
+                and hasattr(strategy, "wants_force_flat")
+                and strategy.wants_force_flat(bar)):
+            fee_per = TOPSTEP_50K.round_turn_fees.get("MES", 0.0)
+            for p in list(open_positions):
+                sign = 1 if p.side == "buy" else -1
+                price_pnl = sign * (bar.o - p.entry_price) * MES.point_value * p.size
+                net_pnl = round(price_pnl - fee_per * p.size, 2)
+                today_realized += net_pnl
+                bars_held_min = max(
+                    1, int((bar.t - p.entry_bar_t).total_seconds() / 60))
+                closes.append({
+                    "strategy": name,
+                    "entry_ts": p.entry_bar_t.isoformat(),
+                    "exit_ts": bar.t.isoformat(),
+                    "side": p.side,
+                    "entry_price": p.entry_price,
+                    "exit_price": bar.o,
+                    "net_pnl": net_pnl,
+                    "outcome": "force_close_session",
+                    "bars_held_minutes": bars_held_min,
+                    "reason": p.reason,
+                })
+                net_position += (-p.size if p.side == "buy" else p.size)
+                open_positions.remove(p)
 
         # 2. Call strategy on this bar.
         # Balance reflects today's P&L only (state was reset on day
@@ -349,6 +384,10 @@ STRATEGIES = {
     "session":  SessionStrategy,
     "regime":   RegimeStrategy,
     "boundary": BoundaryStrategy,
+    "orb_pullback": ORBPullbackStrategy,
+    "orb_30": ORB30Strategy,
+    "overnight_momentum": OvernightMomentumStrategy,
+    "overnight_drift": OvernightDriftStrategy,
 }
 
 
