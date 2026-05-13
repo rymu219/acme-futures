@@ -56,7 +56,6 @@ from acme.levels import compute_day_levels, trading_date_ct  # noqa: E402
 from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
-from acme.strategies.orb_30 import ORB30Strategy  # noqa: E402
 from acme.strategies.overnight_drift import OvernightDriftStrategy  # noqa: E402
 from acme.strategies.overnight_momentum import OvernightMomentumStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
@@ -383,7 +382,6 @@ STRATEGIES = {
     "session":  SessionStrategy,
     "regime":   RegimeStrategy,
     "boundary": BoundaryStrategy,
-    "orb_30": ORB30Strategy,
     "overnight_momentum": OvernightMomentumStrategy,
     "overnight_drift": OvernightDriftStrategy,
 }
