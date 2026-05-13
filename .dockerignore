@@ -1,0 +1,36 @@
+# Keep the runner image small and avoid baking secrets or local-only
+# state into it. See Dockerfile.runner.
+
+# Secrets — env vars come from Railway service config, not the image.
+.env
+.env.*
+!.env.example
+
+# Git metadata — not needed at runtime.
+.git
+.gitignore
+.github
+
+# Local runtime artifacts from the Mac runner.
+logs/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Large data files that only the backtest path on the Mac needs.
+historical data/
+
+# Editor / OS noise.
+.DS_Store
+.vscode/
+.idea/
+
+# Mac-only supervision config — irrelevant in a Linux container.
+launchd/
+
+# Streamlit local config — dashboard service uses its own.
+.streamlit/
+
+# Tests aren't needed in the runtime image (they run in CI), but they're
+# small and tooling sometimes imports test fixtures — leave them in.

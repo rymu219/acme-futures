@@ -1,0 +1,43 @@
+# Dockerfile.runner — Railway image for the fleet runner, dry-run only.
+#
+# This is the second service in the Railway project; the dashboard
+# (web/app.py) still builds from railpack.json. See CLAUDE.md for the
+# load-bearing constraint: this container MUST run with --dry-run and
+# ACME_LIVE=false. TopstepX prohibits automated trading from VPS, so
+# the runner here is observability-only — it connects to ProjectX for
+# market data, routes through the Conductor's phantom simulator, and
+# writes heartbeats + phantom trades to Supabase. No broker orders.
+#
+# Single-instance discipline still applies: the Mac LaunchAgent
+# (com.acme-futures.fleet-runner) must be unloaded before this
+# container boots, otherwise the two ProjectX SignalR sessions will
+# kick each other.
+
+FROM python:3.11-slim
+
+# uv is the project's package manager (pyproject.toml + uv.lock); pip
+# is only used to bootstrap uv itself.
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+
+# Install dependencies first for layer caching — pyproject + lock change
+# rarely; source changes every push.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Copy the rest of the repo. archive/v3/ is included intentionally:
+# src/acme/runner.py is a deprecation shim that re-exports from there,
+# and the backtest harness imports VARIANTS from it. The runner itself
+# doesn't touch archive/v3/ at runtime, but keeping it avoids surprise
+# ImportError if something transitively pulls it in.
+COPY . .
+
+# Line-buffer stdout/stderr so Railway's log UI shows structured logs
+# in real time. Same reason the Mac watchdog sets PYTHONUNBUFFERED=1.
+ENV PYTHONUNBUFFERED=1
+
+# Worker, not a web service — no EXPOSE, no $PORT. Liveness is
+# observed via runtime_heartbeats rows in Supabase, which the existing
+# watcher already monitors.
+CMD ["uv", "run", "python", "-m", "acme.fleet_runner", "--dry-run"]
