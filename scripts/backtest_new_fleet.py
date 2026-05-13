@@ -217,21 +217,49 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
 
 def stream_2min_bars(*, start: datetime | None = None,
                      end: datetime | None = None) -> list[Bar]:
-    """Stream 1-min bars from the cache and aggregate to 2-min.
-    Materializes the full list so multiple strategies can share it."""
-    agg = BarAggregator(timeframe_minutes=2)
+    """Stream 1-min OHLCV bars from the cache and properly aggregate to
+    2-min OHLCV bars.
+
+    Earlier version of this fed only the close as a tick to BarAggregator,
+    which collapsed the bar's true high/low range to the min/max of
+    closes. That dramatically under-counted bracket-stop / target hits
+    in the backtest (most stops were 1.5x ATR away, but the synthetic
+    bar's range was tiny). Now we compose 2-min OHLCV from the
+    constituent 1-min bars correctly.
+    """
     bars2: list[Bar] = []
     n_in = 0
+    # Current 2-min bucket
+    bucket_start: datetime | None = None
+    bo = bh = bl_ = bc = 0.0
+    bv = 0
     for b in iter_bars(start=start, end=end):
         n_in += 1
-        # Convert 1-min bar to a tick approximation: feed the close.
-        # BarAggregator is tick-based; for OHLCV-aggregation we'd need
-        # to feed h/l/o/c separately. The conductor's MultiTimeframe
-        # uses close-of-1-min as a synthetic tick — same approach here.
-        out = agg.add_tick(b.t, b.c)
-        if out is not None:
-            bars2.append(out)
-    print(f"  streamed {n_in:,} 1-min bars → {len(bars2):,} 2-min bars")
+        # Floor to 2-min boundary
+        floor = b.t.replace(
+            minute=(b.t.minute // 2) * 2, second=0, microsecond=0,
+        )
+        if bucket_start is None:
+            bucket_start = floor
+            bo, bh, bl_, bc = b.o, b.h, b.l, b.c
+            bv = b.v
+            continue
+        if floor == bucket_start:
+            bh = max(bh, b.h)
+            bl_ = min(bl_, b.l)
+            bc = b.c
+            bv += b.v
+            continue
+        # New bucket — emit the previous one
+        bars2.append(Bar(t=bucket_start, o=bo, h=bh, l=bl_, c=bc, v=bv))
+        bucket_start = floor
+        bo, bh, bl_, bc = b.o, b.h, b.l, b.c
+        bv = b.v
+    # Flush last bucket
+    if bucket_start is not None:
+        bars2.append(Bar(t=bucket_start, o=bo, h=bh, l=bl_, c=bc, v=bv))
+    print(f"  streamed {n_in:,} 1-min bars → {len(bars2):,} 2-min bars "
+          f"(avg range={sum(b.h-b.l for b in bars2)/max(len(bars2),1):.2f}pt)")
     return bars2
 
 
