@@ -184,7 +184,7 @@ def test_promotion_gate_renders_thresholds():
 
 
 def test_promotion_gate_progress_for_high_score():
-    strats = {"ignition": {"name": "ignition", "state": "SHADOW", "score": 0.70}}
+    strats = {"boundary": {"name": "boundary", "state": "SHADOW", "score": 0.70}}
     html = _render_promotion_gate(strats)
     assert "LIVE-eligible" in html
 
@@ -203,15 +203,17 @@ def test_hour_heatmap_empty_state():
 
 
 def test_bars_held_renders_distribution():
+    # _render_bars_held is retained for legacy/debugging use but no
+    # longer shown in the dashboard (removed from render_overview).
+    # Keep the unit test on FLEET-current strategy names so any future
+    # debug-page wiring still works.
     closes = [
-        _close(bars_held_minutes=2),  # 1 bar
-        _close(bars_held_minutes=4),  # 2 bars
-        _close(bars_held_minutes=8),  # 4 bars
+        _close(strategy="boundary", bars_held_minutes=2),  # 1 bar
+        _close(strategy="boundary", bars_held_minutes=4),  # 2 bars
+        _close(strategy="boundary", bars_held_minutes=8),  # 4 bars
     ]
     html = _render_bars_held(closes)
-    assert "ignition" in html
-    # The 33% bar-1 should NOT be flagged (warn fires at >20%)
-    # But all 3 trades show, so n=3 must appear
+    assert "boundary" in html
     assert "n=3" in html
 
 
@@ -339,5 +341,8 @@ def test_render_overview_with_full_data():
     assert "Strategy Performance" in html
     assert "Promotion Gate" in html
     assert "Hour-of-day" in html
-    assert "Bars-held" in html
     assert "Recent Closes" in html
+    # New Phase A sections:
+    assert "KILL SWITCH" in html
+    assert "SESSION P&amp;L" in html or "SESSION P&L" in html
+    assert "DLL DISTANCE" in html

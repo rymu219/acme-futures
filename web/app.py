@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from supabase import create_client
 
 # Load .env from project root for local dev. On Railway, env vars come from the
@@ -765,6 +765,34 @@ def fleet_legacy(token: str | None = Query(default=None)):
     _check_token(token)
     sb = _client()
     return _render_html(sb, token=token)
+
+
+@app.get("/kill-switch")
+def kill_switch(
+    action: str = Query(..., regex="^(activate|clear)$"),
+    token: str | None = Query(default=None),
+):
+    """Kill-switch toggle. Writes an event to operator_events; the
+    runner polls this table and force-flats on the next bar when a
+    fresh kill_switch_activated row appears. Redirects back to /.
+
+    Both directions go through a JS confirm() in the UI before this
+    endpoint is hit (two-click safety)."""
+    _check_token(token)
+    sb = _client()
+    kind = "kill_switch_activated" if action == "activate" else "kill_switch_cleared"
+    try:
+        sb.table("operator_events").insert({
+            "kind": kind,
+            "raw": {"by": "fleet_view_ui"},
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"operator_events insert failed: {e}",
+        ) from e
+    redirect_to = f"/?token={token}" if token else "/"
+    return RedirectResponse(url=redirect_to, status_code=303)
 
 
 @app.get("/health")

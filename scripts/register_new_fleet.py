@@ -1,13 +1,17 @@
-"""Register the four Part-2 strategies into the Supabase `strategies` table.
+"""Register the three keeper strategies into the Supabase `strategies` table.
 
-After Phase 1 unwind (v3 LaunchAgent stopped, trades reconciled), the
-new fleet — IGNITION, SESSION, REGIME, BOUNDARY — needs registry rows
-so a future runner can bind instances and the perf tracker can score
-SHADOW performance.
+After 2-year backtest filtering, the active fleet is:
+  - BOUNDARY         (PF 3.80, 09-13 CT blacklist + PD drop + OR-hour blacklist)
+  - OVERNIGHT_DRIFT  (PF 1.88, weak-bullish 2-3pt body band)
+  - GAP_FILL         (PF 1.68, |gap| >= 12pt, 08:30 CT entry, 13:00 close)
 
-Each strategy is registered in SHADOW state (the default per its
-metadata). The runner itself is a separate concern (Phase 6 / new
-LaunchAgent), not handled by this script.
+The previously-registered IGNITION/SESSION/REGIME strategies stay in
+the strategies table (we don't delete their history) but are no longer
+attached by the runner. Their rows remain at whatever state they were
+last set; the runner just doesn't bind instances to them anymore.
+
+Each keeper is registered in SHADOW state (the default per its
+metadata). The runner binds instances in `acme.fleet_runner`.
 
 Idempotent — re-running upserts the same rows.
 
@@ -24,15 +28,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
-from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
-from acme.strategies.regime import RegimeStrategy  # noqa: E402
-from acme.strategies.session import SessionStrategy  # noqa: E402
+from acme.strategies.gap_fill import GapFillStrategy  # noqa: E402
+from acme.strategies.overnight_drift import OvernightDriftStrategy  # noqa: E402
 
 STRATEGIES = [
-    IgnitionStrategy,
-    SessionStrategy,
-    RegimeStrategy,
     BoundaryStrategy,
+    OvernightDriftStrategy,
+    GapFillStrategy,
 ]
 
 
@@ -70,7 +72,7 @@ def main() -> int:
             state=instance.metadata.default_lifecycle,
             tier=instance.metadata.tier,
             params={},
-            notes="registered by scripts/register_new_fleet.py for Part 2 SHADOW launch",
+            notes="registered by scripts/register_new_fleet.py — three-keeper fleet (2-year backtested)",
         )
         print(f"  ✓ upserted {rec.name} v{rec.version} state={rec.state}")
 

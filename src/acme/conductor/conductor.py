@@ -94,6 +94,14 @@ class Conductor:
         self._regime_engine = regime_engine
         self._regime_tf = regime_timeframe_minutes
         self._latest_regime: RegimeSnapshot | None = None
+        # Kill-switch state — polled from operator_events on each bar.
+        # `_kill_switch_active` reflects the latest event seen; flips
+        # to True on a kill_switch_activated row and False on a
+        # kill_switch_cleared row. `_kill_switch_last_id` tracks the
+        # highest event id we've observed, so each new bar only fetches
+        # rows newer than that (cheap incremental polling).
+        self._kill_switch_active: bool = False
+        self._kill_switch_last_id: int = 0
 
     # ---------- main entry ----------
 
@@ -317,6 +325,17 @@ class Conductor:
         starting_balance: float,
         state: DailyState,
     ) -> None:
+        # Kill-switch poll: every bar, look for new operator_events
+        # rows. Flip an activated → flatten everything immediately and
+        # skip the rest of bar processing. Cheap because the query is
+        # incremental (id > _kill_switch_last_id).
+        await self._poll_kill_switch(contract_id)
+        if self._kill_switch_active:
+            # While the switch is active, no new entries are allowed —
+            # any open positions were force-flattened on activation,
+            # subsequent bars just no-op.
+            return
+
         # Update shared market context once per (tf, bar) — features will be
         # written into every per-strategy telemetry row below.
         ctx = self._context_by_tf.setdefault(tf, MarketContext())
@@ -582,6 +601,49 @@ class Conductor:
             )
         log.info("dry_run_signal", strategy=strategy_name,
                  side=signal.side, size=signal.size, price=bar.c)
+
+    async def _poll_kill_switch(self, contract_id: str) -> None:
+        """Read new operator_events rows (id > _kill_switch_last_id).
+        On a kill_switch_activated row we force-flat everything and
+        set _kill_switch_active=True; on kill_switch_cleared we just
+        flip the flag back. No-op if the table or client is missing
+        (e.g. the conductor was constructed without a db)."""
+        if self.db is None:
+            return
+        client = getattr(self.db, "client", None) or getattr(self.db, "sb", None)
+        if client is None:
+            return
+        try:
+            res = (
+                client.table("operator_events").select("id, kind")
+                .in_("kind", ["kill_switch_activated", "kill_switch_cleared"])
+                .gt("id", self._kill_switch_last_id)
+                .order("id", desc=False).limit(20).execute()
+            )
+            rows = res.data or []
+        except Exception as e:
+            log.warning("kill_switch_poll_failed", error=str(e))
+            return
+
+        if not rows:
+            return
+
+        for row in rows:
+            rid = int(row.get("id") or 0)
+            kind = row.get("kind") or ""
+            if rid <= self._kill_switch_last_id:
+                continue
+            self._kill_switch_last_id = rid
+            if kind == "kill_switch_activated" and not self._kill_switch_active:
+                self._kill_switch_active = True
+                log.warning("kill_switch_activated", event_id=rid)
+                # Force-flat immediately regardless of any open positions.
+                await self._flatten_position(
+                    contract_id, requested_by="kill_switch"
+                )
+            elif kind == "kill_switch_cleared" and self._kill_switch_active:
+                self._kill_switch_active = False
+                log.info("kill_switch_cleared", event_id=rid)
 
     async def _flatten_position(self, contract_id: str, requested_by: str) -> None:
         if self.dry_run:

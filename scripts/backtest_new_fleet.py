@@ -55,6 +55,7 @@ from acme.contracts import MES  # noqa: E402
 from acme.levels import compute_day_levels, trading_date_ct  # noqa: E402
 from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
+from acme.strategies.gap_fill import GapFillStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
 from acme.strategies.overnight_drift import OvernightDriftStrategy  # noqa: E402
 from acme.strategies.regime import RegimeStrategy  # noqa: E402
@@ -382,6 +383,7 @@ STRATEGIES = {
     "regime":   RegimeStrategy,
     "boundary": BoundaryStrategy,
     "overnight_drift": OvernightDriftStrategy,
+    "gap_fill": GapFillStrategy,
 }
 
 
