@@ -25,6 +25,7 @@ high-side and low-side levels are symmetric.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import time as dtime
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
@@ -78,6 +79,18 @@ class BoundaryConfig:
     # Map: class name → tuple of CT hours where that class is suppressed.
     level_class_hour_blacklist_ct: dict[str, tuple[int, ...]] = field(
         default_factory=lambda: {"or": (0, 15, 18, 19, 23)}
+    )
+    # Fleet coordination — CT clock times at which any open BOUNDARY
+    # position must be force-flattened to make way for higher-priority
+    # strategies on the next bar. Defaults:
+    #   08:29 CT → clear before GAP_FILL evaluates at 08:30 (priority
+    #             during the 08:30-08:59 BD-allowed overlap)
+    #   16:59 CT → clear before OVERNIGHT_DRIFT evaluates at 17:00
+    # Empty tuple disables the rule (and restores the prior behaviour).
+    # The conductor honors `wants_force_flat(bar)` to call broker.flatten_all
+    # in live mode or to close phantom positions in dry-run.
+    fleet_coordination_close_times_ct: tuple[dtime, ...] = field(
+        default_factory=lambda: (dtime(8, 29), dtime(16, 59))
     )
 
 
@@ -162,6 +175,38 @@ class BoundaryStrategy:
     def set_levels(self, levels: DayLevels) -> None:
         """Caller updates day-levels (typically once per trade date)."""
         self._levels = levels
+
+    # ───────────────────────── harness / conductor hooks ─────────
+
+    def wants_force_flat(self, bar: Bar) -> bool:
+        """Fleet coordination — True iff `bar` falls in a 2-min window
+        that contains one of the configured coordination close times.
+
+        The conductor / backtest harness consults this each bar; on True
+        any open BOUNDARY position is force-flattened so higher-priority
+        strategies (GAP_FILL at 08:30, OVERNIGHT_DRIFT at 17:00) get a
+        clean slate on the next bar.
+
+        Returns False when `fleet_coordination_close_times_ct` is empty,
+        so callers that haven't opted in see no behaviour change.
+        """
+        close_times = self.config.fleet_coordination_close_times_ct
+        if not close_times:
+            return False
+        from acme.levels import CT
+        ct = bar.t.astimezone(CT).time()
+        bar_min = ct.hour * 60 + ct.minute
+        # 2-min bars: trigger on the bar whose start <= close_time < start + 2 min.
+        # In practice this means we fire on the bar that *contains* the close
+        # time. e.g. close_time=16:59 → fires on the bar starting at 16:58
+        # (which runs 16:58–17:00 CT). After force-flat, OVERNIGHT_DRIFT's
+        # on_bar sees bar at 17:00 CT with the strategy flat.
+        timeframe = self.timeframe_minutes
+        for close_t in close_times:
+            close_min = close_t.hour * 60 + close_t.minute
+            if bar_min <= close_min < bar_min + timeframe:
+                return True
+        return False
 
     # ───────────────────────── helpers ─────────────────────────
 

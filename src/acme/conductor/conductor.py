@@ -336,6 +336,14 @@ class Conductor:
             # subsequent bars just no-op.
             return
 
+        # Fleet-coordination force-flat: each strategy that implements
+        # `wants_force_flat(bar)` is consulted before signal collection.
+        # On True we close that strategy's position immediately — for live
+        # mode via broker.flatten_all (the conductor only holds one
+        # position so flattening is fleet-wide), for dry-run by clearing
+        # the strategy's phantom positions.
+        await self._honor_fleet_coordination(bar, tf, contract_id)
+
         # Update shared market context once per (tf, bar) — features will be
         # written into every per-strategy telemetry row below.
         ctx = self._context_by_tf.setdefault(tf, MarketContext())
@@ -601,6 +609,117 @@ class Conductor:
             )
         log.info("dry_run_signal", strategy=strategy_name,
                  side=signal.side, size=signal.size, price=bar.c)
+
+    async def _honor_fleet_coordination(
+        self, bar, tf: int, contract_id: str,
+    ) -> None:
+        """For each registered strategy whose instance declares
+        `wants_force_flat(bar) == True` on this bar, close its open
+        position(s) before regular signal processing runs.
+
+        Live mode: broker.flatten_all() (the conductor holds at most one
+        position, so the flatten is fleet-wide; we also reset our local
+        position cache).
+
+        Dry-run mode: synthesize a DryRunClose for each phantom position
+        in this strategy's bucket, valued at this bar's close (the
+        approximation a market-order flatten would settle near). Clear
+        the bucket; feed the closes to PerfTracker so per-strategy
+        scoring stays accurate."""
+        from acme.conductor.dry_run import DryRunClose
+        flattened: list[str] = []
+        for rec in self.registry.list_all():
+            inst = rec.instance
+            if inst is None:
+                continue
+            if inst.timeframe_minutes != tf:
+                continue
+            wff = getattr(inst, "wants_force_flat", None)
+            if wff is None:
+                continue
+            try:
+                if not wff(bar):
+                    continue
+            except Exception as e:
+                log.warning("wants_force_flat_raised",
+                            strategy=rec.name, error=str(e))
+                continue
+
+            if self.dry_run:
+                open_positions = self.dry_run_open.get(rec.name, [])
+                if not open_positions:
+                    continue
+                for p in open_positions:
+                    sign = 1 if p.side == "buy" else -1
+                    price_pnl = sign * (bar.c - p.entry_price) * self.contract.point_value * p.size
+                    net_pnl = round(price_pnl - self.round_turn_fee * p.size, 2)
+                    cl = DryRunClose(
+                        strategy=p.strategy or rec.name,
+                        side=p.side,
+                        size=p.size,
+                        entry_price=p.entry_price,
+                        exit_price=bar.c,
+                        net_pnl=net_pnl,
+                        outcome="fleet_coord_close",
+                        closed_at=bar.t,
+                        bar_event_id=p.bar_event_id,
+                    )
+                    self.perf.record_close(
+                        strategy=cl.strategy, net_pnl=cl.net_pnl,
+                        side=cl.side, outcome=cl.outcome,
+                        entry_price=cl.entry_price, exit_price=cl.exit_price,
+                        closed_at=cl.closed_at,
+                    )
+                    if self.db is not None:
+                        try:
+                            self.db.log_event(
+                                "dry_run_close",
+                                contract_id=contract_id, symbol="MES",
+                                side="sell" if cl.side == "buy" else "buy",
+                                size=cl.size, price=cl.exit_price,
+                                strategy=cl.strategy,
+                                raw={
+                                    "outcome": cl.outcome,
+                                    "entry_price": cl.entry_price,
+                                    "exit_price": cl.exit_price,
+                                    "net_pnl": cl.net_pnl,
+                                    "entry_reason": p.reason,
+                                    "bar_t": bar.t.isoformat(),
+                                },
+                            )
+                        except Exception as e:
+                            log.warning("fleet_coord_dryrun_close_log_failed",
+                                        error=str(e))
+                self.dry_run_open[rec.name] = []
+                self.dry_run_position_per_strategy[rec.name] = 0
+                flattened.append(rec.name)
+            else:
+                # Live mode: broker.flatten_all is fleet-wide (one position).
+                if self.position != 0:
+                    try:
+                        await self.broker.flatten_all()
+                    except Exception as e:
+                        log.error("fleet_coord_live_flatten_failed",
+                                  strategy=rec.name, error=str(e))
+                        continue
+                    self.position = 0
+                    if self.db is not None:
+                        try:
+                            self.db.log_event(
+                                "flatten_triggered",
+                                contract_id=contract_id, symbol="MES",
+                                strategy=rec.name,
+                                raw={"reason": "fleet_coord_close",
+                                     "dry_run": False},
+                            )
+                        except Exception as e:
+                            log.warning("fleet_coord_live_log_failed",
+                                        error=str(e))
+                    flattened.append(rec.name)
+
+        if flattened:
+            log.info("fleet_coordination_close",
+                     strategies=flattened, bar_t=bar.t.isoformat())
 
     async def _poll_kill_switch(self, contract_id: str) -> None:
         """Read new operator_events rows (id > _kill_switch_last_id).
