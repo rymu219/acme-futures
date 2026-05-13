@@ -194,3 +194,41 @@ def test_no_signal_when_already_in_position():
                    state=state, profile=TOPSTEP_50K,
                    current_position=1, current_balance_unrealized=50_000)
     assert sig is None
+
+
+# ════════════ fleet-coordination close times ═══════════════════════════
+
+
+def _bar_at_ct(hh: int, mm: int) -> Bar:
+    """Bar starting at (hh, mm) CT on an arbitrary recent weekday."""
+    ct_t = datetime(2026, 5, 13, hh, mm, tzinfo=CT)
+    return _bar(ct_t.astimezone(UTC), o=100, h=100, l=100, c=100, v=1)
+
+
+def test_wants_force_flat_fires_at_1659_ct():
+    """16:58→17:00 CT bar contains 16:59 → wants_force_flat is True."""
+    s = BoundaryStrategy()
+    assert s.wants_force_flat(_bar_at_ct(16, 58)) is True
+
+
+def test_wants_force_flat_fires_at_0828_ct():
+    """08:28→08:30 CT bar contains 08:29 → wants_force_flat is True."""
+    s = BoundaryStrategy()
+    assert s.wants_force_flat(_bar_at_ct(8, 28)) is True
+
+
+def test_wants_force_flat_silent_at_other_times():
+    """No coordination time falls inside 12:00→12:02 CT — silent."""
+    s = BoundaryStrategy()
+    assert s.wants_force_flat(_bar_at_ct(12, 0)) is False
+    assert s.wants_force_flat(_bar_at_ct(17, 0)) is False
+    assert s.wants_force_flat(_bar_at_ct(8, 30)) is False
+
+
+def test_wants_force_flat_can_be_disabled():
+    """Empty tuple disables the rule — preserves pre-coordination behavior."""
+    s = BoundaryStrategy(config=BoundaryConfig(
+        fleet_coordination_close_times_ct=(),
+    ))
+    assert s.wants_force_flat(_bar_at_ct(16, 58)) is False
+    assert s.wants_force_flat(_bar_at_ct(8, 28)) is False
