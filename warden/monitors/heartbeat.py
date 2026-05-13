@@ -15,12 +15,11 @@ HB_OFFLINE_MIN_S in web/fleet_view.py).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from warden.db import fetch_heartbeats, fetch_recent_operator_events
 from warden.monitors import MonitorResult
-
 
 FLEET = ["ignition", "session", "regime", "boundary"]
 
@@ -36,7 +35,7 @@ def _hb_age_s(hb: dict[str, Any]) -> int | None:
         d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except Exception:
         return None
-    return int((datetime.now(timezone.utc) - d).total_seconds())
+    return int((datetime.now(UTC) - d).total_seconds())
 
 
 def _hb_status(hb: dict[str, Any] | None) -> str:

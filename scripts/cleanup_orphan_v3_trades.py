@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -103,16 +103,16 @@ def main() -> int:
         print(f"Note: expected variants not in candidate set (already cleaned?): {missing}")
 
     # Show the cleanup payload
-    now_utc = datetime.now(timezone.utc).isoformat()
-    print(f"\nCleanup payload (all rows get the same shape):")
-    print(f"  exit_price   = entry_price (per row)")
+    now_utc = datetime.now(UTC).isoformat()
+    print("\nCleanup payload (all rows get the same shape):")
+    print("  exit_price   = entry_price (per row)")
     print(f"  exit_ts      = {now_utc}")
     print(f"  exit_reason  = '{EXIT_REASON_TAG}'")
     print(f"  pnl_dollars  = -{ROUND_TURN_COMMISSION:.2f}  (MES round-turn commission)")
-    print(f"  bars_held    = NULL")
-    print(f"  mfe_atr      = NULL")
-    print(f"  mae_atr      = NULL")
-    print(f"  slippage_ticks = 0")
+    print("  bars_held    = NULL")
+    print("  mfe_atr      = NULL")
+    print("  mae_atr      = NULL")
+    print("  slippage_ticks = 0")
 
     print(f"\nCandidates ({len(candidates)}):")
     for c in sorted(candidates, key=lambda r: r.get("entry_ts") or ""):

@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -47,7 +47,7 @@ def _bars_held(entry_ts_iso: str, exit_dt: datetime) -> int | None:
 
 def _current_price(sb) -> float:
     """Most recent entry_price across all variants in the last 60 min."""
-    floor = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    floor = (datetime.now(UTC) - timedelta(minutes=60)).isoformat()
     res = (
         sb.table("ryan_spec_v3_trades")
         .select("entry_price,bar_ts")
@@ -80,7 +80,7 @@ def main() -> int:
         return 2
     sb = create_client(url, key)
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     now_iso = now_utc.isoformat()
 
     # 1. Current price proxy

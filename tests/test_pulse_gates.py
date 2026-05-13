@@ -17,9 +17,9 @@ from acme.strategies.pulse_gates import (
 
 
 def _bars_constant(n: int, *, c: float = 100.0, h: float | None = None,
-                   l: float | None = None, v: int = 100) -> list[Bar]:
+                   l: float | None = None, v: int = 100) -> list[Bar]:  # noqa: E741 — matches Bar.l field
     h = h if h is not None else c + 0.1
-    l = l if l is not None else c - 0.1
+    l = l if l is not None else c - 0.1  # noqa: E741 — matches Bar.l field
     t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
     return [
         Bar(t=t0 + timedelta(minutes=2 * i), o=c, h=h, l=l, c=c, v=v)
@@ -228,7 +228,7 @@ def test_htf_aligns_on_bullish_regime():
     t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
     closes = [100, 100, 100.5, 101.0, 101.5, 102.0, 102.5]
     vols = [100, 100, 100, 110, 120, 130, 140]
-    for i, (c, v) in enumerate(zip(closes, vols)):
+    for i, (c, v) in enumerate(zip(closes, vols, strict=True)):
         eng.update_htf(Bar(t=t0 + timedelta(minutes=5 * i),
                            o=c, h=c + 0.1, l=c - 0.1, c=c, v=v))
     assert eng.is_warm
@@ -245,7 +245,7 @@ def test_htf_aligns_on_bearish_regime():
     t0 = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
     closes = [102, 102, 101.5, 101.0, 100.5, 100.0, 99.5]
     vols = [100, 100, 100, 110, 120, 130, 140]
-    for i, (c, v) in enumerate(zip(closes, vols)):
+    for i, (c, v) in enumerate(zip(closes, vols, strict=True)):
         eng.update_htf(Bar(t=t0 + timedelta(minutes=5 * i),
                            o=c, h=c + 0.1, l=c - 0.1, c=c, v=v))
     assert eng.latest is not None

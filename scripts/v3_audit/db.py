@@ -57,10 +57,7 @@ def to_ct(ts: str | datetime | None) -> datetime | None:
     """Convert an ISO string or aware datetime to CT (America/Chicago)."""
     if ts is None:
         return None
-    if isinstance(ts, str):
-        d = parse_iso(ts)
-    else:
-        d = ts
+    d = parse_iso(ts) if isinstance(ts, str) else ts
     if d is None:
         return None
     if d.tzinfo is None:

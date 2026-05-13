@@ -38,8 +38,8 @@ import structlog
 if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from acme.config import load_config
 from acme.conductor.conductor import Conductor
+from acme.config import load_config
 from acme.db import Db
 from acme.registry import StrategyRegistry
 from acme.strategies.boundary import BoundaryStrategy

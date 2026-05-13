@@ -9,7 +9,7 @@ from acme.broker.base import Bar
 from acme.strategies.exhaustion import ExhaustionDetector
 
 
-def _bar(t, *, o, h, l, c, v=100):
+def _bar(t, *, o, h, l, c, v=100):  # noqa: E741 — matches Bar.l field
     return Bar(t=t, o=o, h=h, l=l, c=c, v=v)
 
 

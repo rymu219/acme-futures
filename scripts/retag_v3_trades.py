@@ -38,7 +38,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
@@ -52,9 +51,11 @@ from acme.backtest.data import iter_bars  # noqa: E402
 from acme.contracts import MES  # noqa: E402
 from acme.levels import compute_day_levels, nearest_level_distance, trading_date_ct  # noqa: E402
 from scripts.v3_audit.db import (  # noqa: E402
-    AUDIT_DIR, fetch_all_v3_trades, get_client, write_csv,
+    AUDIT_DIR,
+    fetch_all_v3_trades,
+    get_client,
+    write_csv,
 )
-
 
 # Buckets in TICKS for distance to nearest level (signed).
 # Pos = price above level, Neg = price below level.

@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
 
 from fleet_view import (  # noqa: E402
     FLEET,
-    TIME_BUCKETS,
     _bucket_closes_by_hour,
     _bucket_hours,
     _compute_metrics_from_closes,
@@ -26,7 +25,6 @@ from fleet_view import (  # noqa: E402
     _render_strategy_cards,
     render_overview,
 )
-
 
 # ════════════ helpers ═══════════════════════════════════════════════
 
@@ -266,9 +264,8 @@ def test_filter_closes_by_bucket_keeps_matching():
     ]
     # Manually fix occurred_at to land each in a specific CT hour
     from datetime import UTC, datetime
-    base = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)  # 07:00 CT
     target_hours = [3, 9, 13, 17, 22]
-    for c, ct_hour in zip(closes, target_hours):
+    for c, ct_hour in zip(closes, target_hours, strict=True):
         # CT hour h → UTC h+5 (CDT)
         c["occurred_at"] = datetime(2026, 5, 15, (ct_hour + 5) % 24,
                                      30, tzinfo=UTC).isoformat()

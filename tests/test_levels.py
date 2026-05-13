@@ -1,8 +1,7 @@
 """Tests for the session-level computation module."""
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, date, datetime, time
 
 import pytest
 
@@ -19,7 +18,7 @@ def _ct(d: date, t: time) -> datetime:
     return datetime.combine(d, t, tzinfo=CT)
 
 
-def _bar(ts_ct: datetime, *, h: float, l: float, c: float | None = None,
+def _bar(ts_ct: datetime, *, h: float, l: float, c: float | None = None,  # noqa: E741 — matches Bar.l field
          v: int = 100) -> Bar:
     return Bar(t=ts_ct.astimezone(UTC), o=c if c is not None else (h + l) / 2,
                h=h, l=l, c=c if c is not None else (h + l) / 2, v=v)

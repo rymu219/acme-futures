@@ -18,14 +18,18 @@ import pandas as pd
 try:
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore
     from scripts.v3_audit.trades import (  # type: ignore
-        append_section, df_to_md, load_settled_trades,
+        append_section,
+        df_to_md,
+        load_settled_trades,
     )
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.v3_audit.db import AUDIT_DIR, DOCS_DIR, write_csv  # type: ignore  # noqa: E402
     from scripts.v3_audit.trades import (  # type: ignore  # noqa: E402
-        append_section, df_to_md, load_settled_trades,
+        append_section,
+        df_to_md,
+        load_settled_trades,
     )
 
 
@@ -53,10 +57,7 @@ def tail_table(df: pd.DataFrame) -> pd.DataFrame:
         # Tail attribution: how much of net P&L is from top 5 trades?
         top5_sum = float(g.iloc[:5]["pnl_dollars"].sum()) if n >= 5 else net
         # "% of net from top 5" = top5_sum / net  (only meaningful when net > 0)
-        if abs(net) > 0.01:
-            pct_top5 = top5_sum / net * 100.0
-        else:
-            pct_top5 = float("nan")
+        pct_top5 = top5_sum / net * 100.0 if abs(net) > 0.01 else float("nan")
 
         rows.append({
             "strategy_id": sid,

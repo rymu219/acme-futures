@@ -110,7 +110,7 @@ def test_bias_decay_allows_entry_when_recent_move_supports_bias():
     # Long uptrend continuing through the entry bar — no reversal
     bars = []
     price = 100.0
-    for i in range(70):
+    for _ in range(70):
         bars.append(_bar(t, price))
         t += timedelta(minutes=2)
         price += 0.5
