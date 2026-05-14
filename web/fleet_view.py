@@ -332,17 +332,36 @@ def _strategy_metrics(name: str, strategies: dict, snaps: dict) -> dict[str, Any
 
 
 def _render_topbar(heartbeats: dict) -> str:
-    """Topbar: logo + subtitle on the left, last-bar age on the right."""
+    """Topbar: logo + subtitle on the left, last-bar age on the right.
+
+    The logo is rendered as inline SVG (not <img src=>) so it inherits
+    the Google Fonts loaded by the page. Inline SVG also dodges the
+    binary-file-in-git problem — the real PNG-with-wolf-illustration
+    can be saved to web/static/ghost_dog_logo.png and swapped in by
+    replacing this inline <svg>...</svg> block with an <img> tag.
+    """
     last_bar_ts: str | None = None
     for hb in heartbeats.values():
         lb = hb.get("last_bar_ts")
         if lb and (last_bar_ts is None or lb > last_bar_ts):
             last_bar_ts = lb
     last_bar = _ago(last_bar_ts) if last_bar_ts else "—"
+    # Inline SVG logo: type-only Ghost Dog wordmark. Inherits Bebas Neue
+    # + Barlow Condensed from the page CSS (would NOT inherit if loaded
+    # via <img src>).
+    logo_svg = (
+        '<svg class="logo" viewBox="0 0 200 60" '
+        'preserveAspectRatio="xMidYMid meet" aria-label="Ghost Dog Capital">'
+        '<text x="100" y="40" text-anchor="middle" class="logo-name">'
+        'GHOST DOG</text>'
+        '<text x="100" y="55" text-anchor="middle" class="logo-tag">'
+        'CAPITAL</text>'
+        '</svg>'
+    )
     return f"""
   <header class="topbar">
     <div class="brand">
-      <img src="/static/ghost_dog_logo.png" alt="Ghost Dog Capital" class="logo">
+      {logo_svg}
       <span class="brand-divider"></span>
       <span class="brand-sub">$50K EVAL · CLASSIC CONDUCTOR · SINGLE POSITION</span>
     </div>
@@ -825,7 +844,26 @@ body {
   margin: 0 -16px 0 -16px;
 }
 .brand { display: flex; align-items: center; gap: 14px; }
-.brand .logo { height: 40px; display: block; }
+.brand .logo {
+  height: 44px;
+  width: auto;
+  display: block;
+}
+/* Inline-SVG <text> elements — fonts inherited from page CSS. */
+.logo-name {
+  font-family: 'Bebas Neue', 'Anton', 'Impact', 'Arial Black', sans-serif;
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 2.5px;
+  fill: var(--text);
+}
+.logo-tag {
+  font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 8px;
+  fill: var(--text);
+}
 .brand-divider {
   width: 1px;
   height: 32px;

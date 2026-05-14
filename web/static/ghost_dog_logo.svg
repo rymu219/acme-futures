@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ghost Dog Capital — typography-only standalone logo.
+  Used as a backup asset; the primary topbar logo is rendered as
+  inline SVG inside fleet_view.py so it can inherit the page's
+  Google-Fonts-loaded Bebas Neue + Barlow Condensed. This file uses
+  system-font fallbacks since SVGs loaded via <img src> don't inherit
+  page CSS fonts.
+
+  Drop the real PNG (the wolf-illustration version) at
+  web/static/ghost_dog_logo.png and update fleet_view.py's _render_topbar
+  to swap the inline <svg> block for an <img src="/static/ghost_dog_logo.png">.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 200 60"
+     preserveAspectRatio="xMidYMid meet"
+     aria-label="Ghost Dog Capital">
+  <text x="100" y="40" text-anchor="middle"
+        font-family="'Bebas Neue','Anton','Impact','Arial Black',sans-serif"
+        font-size="32" font-weight="700" letter-spacing="2.5"
+        fill="#E8E2D6">GHOST DOG</text>
+  <text x="100" y="55" text-anchor="middle"
+        font-family="'Barlow Condensed','Arial Narrow',sans-serif"
+        font-size="10" font-weight="700" letter-spacing="8"
+        fill="#E8E2D6">CAPITAL</text>
+</svg>
