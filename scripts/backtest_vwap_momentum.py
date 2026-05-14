@@ -4,14 +4,17 @@ Streams 1-min MES bars from the local Databento cache, aggregates to
 2-min bars, and runs a custom backtest loop that implements:
 
   - intraday VWAP from 08:30 CT (volume-weighted typical price)
-  - long entry on close >= VWAP + entry_threshold_pts, restricted to
-    the 09:00-10:00 CT entry window (the hour the by-hour breakdown
-    showed carries the strategy's edge)
-  - initial stop entry - initial_stop_pts
-  - trailing stop = high_watermark - trail_distance_pts
-  - effective stop = max(initial_stop, trailing_stop)
+  - symmetric long+short entries on the FIRST in-window crossing of
+    +entry_threshold_pts (long) or -entry_threshold_pts (short).
+    Window default 09:00-10:00 CT (the hour the by-hour breakdown on
+    the long-only run showed carries the strategy's edge). Carry-over
+    pre-window crossings consume the trigger flag without entering.
+  - initial stop entry -/+ initial_stop_pts (sign-aware)
+  - trailing stop tracks watermark ± trail_distance_pts (high for
+    longs, low for shorts)
   - hard close at 13:00 CT
-  - one trade per session, long only
+  - one trade per DIRECTION per session — long and short can both
+    fire on the same session if both thresholds cross in-window
 
 Sweep:
   entry_threshold_pts ∈ {4, 6, 8, 10}
@@ -42,6 +45,7 @@ import csv
 import logging
 import sys
 import time as time_mod
+from dataclasses import dataclass
 from datetime import UTC, datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -100,27 +104,104 @@ def _ct_parts(bar: Bar) -> tuple[object, int]:
 # ───────────────────────── core backtest ──────────────────────────
 
 
+@dataclass
+class _Position:
+    """Open phantom position.
+
+    `watermark` tracks the high (for long) or low (for short) since entry.
+    Trailing stop computes off this — `watermark - trail_distance` for
+    long (stop sits below the high), `watermark + trail_distance` for
+    short (stop sits above the low).
+    """
+    side: str               # "buy" or "sell"
+    entry_price: float
+    entry_t: datetime
+    size: int
+    watermark: float
+    reason: str
+
+
+def _close_record(
+    pos: _Position, exit_price: float, exit_t: datetime, outcome: str,
+    *, point_value: float, round_turn_fee: float,
+) -> dict:
+    """Build a trade-close dict matching backtest_new_fleet's schema. P&L
+    is sign-aware: longs profit on price up, shorts on price down."""
+    sign = 1 if pos.side == "buy" else -1
+    price_pnl = sign * (exit_price - pos.entry_price) * point_value * pos.size
+    net_pnl = round(price_pnl - round_turn_fee * pos.size, 2)
+    bars_held_min = max(
+        1, int((exit_t - pos.entry_t).total_seconds() / 60))
+    return {
+        "strategy": "vwap_momentum",
+        "entry_ts": pos.entry_t.isoformat(),
+        "exit_ts": exit_t.isoformat(),
+        "side": pos.side,
+        "entry_price": pos.entry_price,
+        "exit_price": exit_price,
+        "net_pnl": net_pnl,
+        "outcome": outcome,
+        "bars_held_minutes": bars_held_min,
+        "reason": pos.reason,
+    }
+
+
+def _exit_check(
+    pos: _Position, bar: Bar, initial_stop_pts: float, trail_distance_pts: float,
+) -> tuple[float, str] | None:
+    """Returns (exit_price, outcome) if this bar hits the stop, else None.
+
+    Symmetric long/short logic:
+      long  → stops below entry; exit when bar.l <= max(init, trail)
+      short → stops above entry; exit when bar.h >= min(init, trail)
+
+    Outcome flag tracks which stop bound: "trailing_stop" when the trail
+    is tighter than the initial; "initial_stop" otherwise (including ties,
+    matching the long-only convention from the prior implementation).
+    """
+    if pos.side == "buy":
+        init = pos.entry_price - initial_stop_pts
+        trail = pos.watermark - trail_distance_pts
+        eff = max(init, trail)
+        if bar.l <= eff:
+            outcome = "trailing_stop" if trail > init else "initial_stop"
+            return eff, outcome
+    else:   # "sell"
+        init = pos.entry_price + initial_stop_pts
+        trail = pos.watermark + trail_distance_pts
+        eff = min(init, trail)
+        if bar.h >= eff:
+            outcome = "trailing_stop" if trail < init else "initial_stop"
+            return eff, outcome
+    return None
+
+
 def run_vwap_momentum(
     bars: list[Bar],
     *,
     entry_threshold_pts: float,
     initial_stop_pts: float,
     trail_distance_pts: float,
+    allow_longs: bool = True,
+    allow_shorts: bool = True,
 ) -> list[dict]:
-    """Run the VWAP_MOMENTUM strategy with trailing stop over the bar stream.
+    """Run VWAP_MOMENTUM (trailing stop) over the bar stream.
 
-    Returns a list of trade-close dicts matching backtest_new_fleet's schema:
-    {strategy, entry_ts, exit_ts, side, entry_price, exit_price, net_pnl,
-     outcome, bars_held_minutes, reason}.
+    Trade-close dicts match backtest_new_fleet's schema (strategy, entry_ts,
+    exit_ts, side, entry_price, exit_price, net_pnl, outcome,
+    bars_held_minutes, reason). `side` is "buy" for longs, "sell" for shorts.
 
-    Exit precedence on a bar (long position):
-      1. If bar.l <= effective_stop → exit at effective_stop, outcome
-         "trailing_stop" if hw - trail > initial_stop_price else "initial_stop".
-      2. Else: update high watermark with bar.h.
-      3. If bar is at/after HARD_CLOSE_MIN → exit at bar.o, outcome
-         "force_close_session". This runs even after step 1/2 because the
-         force-close bar's exit happens at the open, before the bar trades
-         (matches gap_fill convention).
+    Symmetric long+short by default. `long_triggered` and `short_triggered`
+    are independent one-shot flags per session: the FIRST crossing of
+    +threshold (long) and -threshold (short) consumes the respective
+    trigger. A session can fire BOTH a long and a short if both crossings
+    happen in-window independently. Carry-over (pre-window crossing) and
+    after-window crossings consume the trigger flag without entering.
+
+    Open positions are tracked in a list — at most 2 concurrent (one long,
+    one short). Each has its own watermark (high for long, low for short)
+    and exits via its own effective stop. Force-close at 13:00 CT closes
+    all open positions at the bar's open.
     """
     point_value = MES.point_value
     round_turn_fee = TOPSTEP_50K.round_turn_fees.get("MES", 0.0)
@@ -130,195 +211,116 @@ def run_vwap_momentum(
     current_date = None
     cum_tpv = 0.0
     cum_v = 0.0
-    # `long_triggered` records whether `distance >= entry_threshold_pts` has
-    # ever happened in the current session. It's the trigger-event one-shot
-    # flag (mirrors VWAPMomentumStrategy._DayState.long_triggered). Set on
-    # the FIRST crossing; if that crossing was outside the entry window the
-    # session is dead — no entry, no re-evaluation on subsequent recrossings.
-    # Replaces the old `entered_today` flag (which only knew about actual
-    # entries and so couldn't distinguish "trigger happened pre-window" from
-    # "trigger never happened").
     long_triggered = False
-    # Open position state (long only)
-    pos_entry_price = 0.0
-    pos_entry_t = None
-    pos_size = 0
-    pos_high_watermark = 0.0
-    pos_reason = ""
+    short_triggered = False
+    open_positions: list[_Position] = []
 
     for bar in bars:
         ct_date, ct_minute = _ct_parts(bar)
 
         # New CT day → reset session state.
         if ct_date != current_date:
-            # Any leftover open position from the previous day shouldn't
-            # exist (force-close at 13:00 each day catches them), but be
-            # defensive — force-close at the prior bar's close if we somehow
-            # carry across a day boundary.
-            if pos_size > 0:
-                # This is the previous bar's close, but we already exited at
-                # 13:00 in normal flow; only reachable if HARD_CLOSE somehow
-                # didn't fire. Use this bar's open as a safe exit.
-                exit_price = bar.o
-                price_pnl = (exit_price - pos_entry_price) * point_value * pos_size
-                net_pnl = round(price_pnl - round_turn_fee * pos_size, 2)
-                bars_held_min = max(
-                    1, int((bar.t - pos_entry_t).total_seconds() / 60))
-                closes.append({
-                    "strategy": "vwap_momentum",
-                    "entry_ts": pos_entry_t.isoformat(),
-                    "exit_ts": bar.t.isoformat(),
-                    "side": "buy",
-                    "entry_price": pos_entry_price,
-                    "exit_price": exit_price,
-                    "net_pnl": net_pnl,
-                    "outcome": "force_close_session",
-                    "bars_held_minutes": bars_held_min,
-                    "reason": pos_reason,
-                })
-                pos_size = 0
+            # Defensive: any leftover position from the previous day shouldn't
+            # exist (13:00 force-close catches them), but exit at this bar's
+            # open just in case HARD_CLOSE didn't fire.
+            for pos in open_positions:
+                closes.append(_close_record(
+                    pos, bar.o, bar.t, "force_close_session",
+                    point_value=point_value, round_turn_fee=round_turn_fee,
+                ))
+            open_positions = []
             current_date = ct_date
             cum_tpv = 0.0
             cum_v = 0.0
             long_triggered = False
+            short_triggered = False
 
-        # Only operate during the session window. Pre-08:30 and post-13:00
-        # bars are skipped entirely (no VWAP cumulation, no entries, no
-        # exits — by design, since the force-close at 13:00 handles closing).
+        # Pre-session bars are skipped entirely (no VWAP cumulation, no
+        # exits — the force-close at 13:00 closes anything still open).
         if ct_minute < SESSION_OPEN_MIN:
             continue
 
-        # ── Force-close gate (runs first; exits at bar.o before any other
-        # logic for the 13:00 bar). Mirrors backtest_new_fleet's
-        # wants_force_flat handling.
+        # ── Force-close gate (runs first; exits at bar.o for the 13:00 bar).
         if ct_minute >= HARD_CLOSE_MIN:
-            if pos_size > 0:
-                exit_price = bar.o
-                price_pnl = (exit_price - pos_entry_price) * point_value * pos_size
-                net_pnl = round(price_pnl - round_turn_fee * pos_size, 2)
-                bars_held_min = max(
-                    1, int((bar.t - pos_entry_t).total_seconds() / 60))
-                closes.append({
-                    "strategy": "vwap_momentum",
-                    "entry_ts": pos_entry_t.isoformat(),
-                    "exit_ts": bar.t.isoformat(),
-                    "side": "buy",
-                    "entry_price": pos_entry_price,
-                    "exit_price": exit_price,
-                    "net_pnl": net_pnl,
-                    "outcome": "force_close_session",
-                    "bars_held_minutes": bars_held_min,
-                    "reason": pos_reason,
-                })
-                pos_size = 0
-            continue   # nothing else happens at or after 13:00
+            for pos in open_positions:
+                closes.append(_close_record(
+                    pos, bar.o, bar.t, "force_close_session",
+                    point_value=point_value, round_turn_fee=round_turn_fee,
+                ))
+            open_positions = []
+            continue
 
-        # ── VWAP update with current bar. Done BEFORE entry/exit so the
-        # 08:30 bar sees a valid VWAP (= its own typical price).
+        # ── VWAP update — done BEFORE entry/exit so the 08:30 bar sees a
+        # valid VWAP (= its own typical price).
         if bar.v > 0:
             tp = (bar.h + bar.l + bar.c) / 3.0
             cum_tpv += tp * bar.v
             cum_v += bar.v
         vwap = (cum_tpv / cum_v) if cum_v > 0 else None
 
-        # ── Exit check (long position only).
-        if pos_size > 0:
-            # Update high watermark to bar's high BEFORE computing trail —
-            # standard convention: trail moves to (running max high) − dist.
-            # Note: bar.h could trigger a higher trail before bar.l triggers
-            # the stop on the same bar; we use bar.h for hw update first to
-            # be conservative (gives the trail the benefit of seeing high
-            # before low).
-            initial_stop_price = pos_entry_price - initial_stop_pts
-            trailing_stop_price = pos_high_watermark - trail_distance_pts
-            effective_stop = max(initial_stop_price, trailing_stop_price)
-
-            if bar.l <= effective_stop:
-                # Stop fired. Determine which one bound.
-                outcome = ("trailing_stop"
-                           if trailing_stop_price > initial_stop_price
-                           else "initial_stop")
-                exit_price = effective_stop
-                price_pnl = (exit_price - pos_entry_price) * point_value * pos_size
-                net_pnl = round(price_pnl - round_turn_fee * pos_size, 2)
-                bars_held_min = max(
-                    1, int((bar.t - pos_entry_t).total_seconds() / 60))
-                closes.append({
-                    "strategy": "vwap_momentum",
-                    "entry_ts": pos_entry_t.isoformat(),
-                    "exit_ts": bar.t.isoformat(),
-                    "side": "buy",
-                    "entry_price": pos_entry_price,
-                    "exit_price": exit_price,
-                    "net_pnl": net_pnl,
-                    "outcome": outcome,
-                    "bars_held_minutes": bars_held_min,
-                    "reason": pos_reason,
-                })
-                pos_size = 0
+        # ── Exit check for each open position. We iterate a copy because
+        # we mutate open_positions on exit. Watermark update happens only
+        # on the no-exit branch — once the stop fires we don't care about
+        # the bar's high/low past that point.
+        for pos in list(open_positions):
+            result = _exit_check(pos, bar, initial_stop_pts, trail_distance_pts)
+            if result is not None:
+                exit_price, outcome = result
+                closes.append(_close_record(
+                    pos, exit_price, bar.t, outcome,
+                    point_value=point_value, round_turn_fee=round_turn_fee,
+                ))
+                open_positions.remove(pos)
             else:
-                # No exit — update watermark for next bar's trail check.
-                if bar.h > pos_high_watermark:
-                    pos_high_watermark = bar.h
+                # Update watermark for next bar's trail.
+                if pos.side == "buy" and bar.h > pos.watermark:
+                    pos.watermark = bar.h
+                elif pos.side == "sell" and bar.l < pos.watermark:
+                    pos.watermark = bar.l
 
-            # Whether we exited or not, do NOT consider entering on the same
-            # bar — one-trade-per-session locks anything further.
-            continue
-
-        # ── Trigger evaluation (only when flat and the session's trigger
-        # event hasn't yet fired). The FIRST bar where price extends
-        # `entry_threshold_pts` above VWAP is the trigger; whether that
-        # bar falls in the entry window decides whether we actually enter.
-        # See the long_triggered comment above for the carry-over rationale.
-        if long_triggered or vwap is None:
+        # ── Trigger evaluation. Each direction has its own one-shot flag.
+        # Same-bar fires are allowed for both directions independently
+        # (price could in principle hit +threshold and -threshold on the
+        # same bar via a wide swing, though it's extremely rare). The
+        # opposite-side trigger doesn't care whether a long/short position
+        # is currently open.
+        if vwap is None:
             continue
 
         distance = bar.c - vwap
-        if distance < entry_threshold_pts:
-            continue
+        in_window = (ENTRY_WINDOW_START_MIN <= ct_minute < ENTRY_WINDOW_END_MIN)
 
-        # Trigger fires now. Record it regardless of window — the session's
-        # one-shot trigger event is consumed either way.
-        long_triggered = True
+        # Long-side trigger.
+        if allow_longs and not long_triggered and distance >= entry_threshold_pts:
+            long_triggered = True
+            if in_window:
+                dist_int = int(round(distance * 100))
+                open_positions.append(_Position(
+                    side="buy", entry_price=bar.c, entry_t=bar.t, size=1,
+                    watermark=bar.c,
+                    reason=f"vwap_momentum_long_d{dist_int:+07d}",
+                ))
 
-        # If the trigger event landed outside the entry window, the session
-        # is a carry-over: an earlier (or later) crossing was the real
-        # signal, not this one. Skip the entry but keep `long_triggered`
-        # set so we don't re-evaluate later in the same session.
-        if not (ENTRY_WINDOW_START_MIN <= ct_minute < ENTRY_WINDOW_END_MIN):
-            continue
+        # Short-side trigger — mirror of long.
+        if allow_shorts and not short_triggered and distance <= -entry_threshold_pts:
+            short_triggered = True
+            if in_window:
+                dist_int = int(round(distance * 100))
+                open_positions.append(_Position(
+                    side="sell", entry_price=bar.c, entry_t=bar.t, size=1,
+                    watermark=bar.c,
+                    reason=f"vwap_momentum_short_d{dist_int:+07d}",
+                ))
 
-        # In-window trigger → enter. Convention matches backtest_new_fleet:
-        # entry price = bar.c, no slippage in the dry-run path.
-        pos_entry_price = bar.c
-        pos_entry_t = bar.t
-        pos_size = 1
-        pos_high_watermark = bar.c   # watermark starts at entry close
-        dist_int = int(round(distance * 100))
-        pos_reason = f"vwap_momentum_long_d{dist_int:+07d}"
-
-    # Flush any still-open position at the last bar (rare; happens only if
-    # the bar stream ends mid-session before 13:00). Match the
-    # force_close_end_of_backtest convention from backtest_new_fleet.
-    if pos_size > 0 and bars:
+    # Flush any still-open positions at the last bar (only happens if the
+    # bar stream ends mid-session before 13:00).
+    if open_positions and bars:
         last = bars[-1]
-        exit_price = last.c
-        price_pnl = (exit_price - pos_entry_price) * point_value * pos_size
-        net_pnl = round(price_pnl - round_turn_fee * pos_size, 2)
-        bars_held_min = max(
-            1, int((last.t - pos_entry_t).total_seconds() / 60))
-        closes.append({
-            "strategy": "vwap_momentum",
-            "entry_ts": pos_entry_t.isoformat(),
-            "exit_ts": last.t.isoformat(),
-            "side": "buy",
-            "entry_price": pos_entry_price,
-            "exit_price": exit_price,
-            "net_pnl": net_pnl,
-            "outcome": "force_close_end_of_backtest",
-            "bars_held_minutes": bars_held_min,
-            "reason": pos_reason,
-        })
+        for pos in open_positions:
+            closes.append(_close_record(
+                pos, last.c, last.t, "force_close_end_of_backtest",
+                point_value=point_value, round_turn_fee=round_turn_fee,
+            ))
 
     return closes
 

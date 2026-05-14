@@ -69,6 +69,7 @@ def main() -> int:
         return 1
 
     enriched: list[dict] = []
+    by_direction: dict[str, list[dict]] = defaultdict(list)
     by_hour: dict[int, list[dict]] = defaultdict(list)
     by_outcome: dict[str, list[dict]] = defaultdict(list)
     by_month: dict[str, list[dict]] = defaultdict(list)
@@ -78,8 +79,11 @@ def main() -> int:
         row["bars_held_minutes"] = int(row.get("bars_held_minutes") or 0)
         entry_dt = datetime.fromisoformat(row["entry_ts"]).astimezone(CT)
         row["entry_dt_ct"] = entry_dt
+        direction = "long" if row.get("side") == "buy" else "short"
+        row["direction"] = direction
 
         enriched.append(row)
+        by_direction[direction].append(row)
         by_hour[entry_dt.hour].append(row)
         by_outcome[row.get("outcome", "")].append(row)
         by_month[entry_dt.strftime("%Y-%m")].append(row)
@@ -96,6 +100,17 @@ def main() -> int:
     print(f"{'':>22} | {'n':>4} | {'WR':>5} | {'PF':>5} | {'net':>11} | {'avg':>9}")
     print("-" * 72)
     _print_row("POOLED", _stats(enriched))
+
+    # ───── by direction ─────
+    # Long vs short split. With symmetric long+short enabled, this is the
+    # most useful read of whether shorts add edge or drag — pooled PF can
+    # be "fine" while one side is bleeding. If only one direction has
+    # trades (legacy long-only CSVs), the missing side shows n=0.
+    print("\nBy direction:")
+    print(f"{'':>22} | {'n':>4} | {'WR':>5} | {'PF':>5} | {'net':>11} | {'avg':>9}")
+    print("-" * 72)
+    _print_row("LONG",  _stats(by_direction.get("long", [])))
+    _print_row("SHORT", _stats(by_direction.get("short", [])))
 
     # ───── by CT entry hour ─────
     # Session is 08:30-13:00 CT so hours 8 through 12 cover the universe.
