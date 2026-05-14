@@ -385,10 +385,30 @@ def main() -> int:
                    help="ISO date (e.g. 2024-04-01); default: cache start.")
     p.add_argument("--end", default=None,
                    help="ISO date (e.g. 2026-04-30); default: cache end.")
+    direction_group = p.add_mutually_exclusive_group()
+    direction_group.add_argument(
+        "--longs-only", action="store_true",
+        help="Run with shorts disabled (mirror image of --shorts-only).",
+    )
+    direction_group.add_argument(
+        "--shorts-only", action="store_true",
+        help="Run with longs disabled. Useful for isolating direction-specific edge.",
+    )
     args = p.parse_args()
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=UTC) if args.start else None
     end = datetime.fromisoformat(args.end).replace(tzinfo=UTC) if args.end else None
+
+    # Direction mode — default is symmetric. The mutually-exclusive group
+    # above guarantees at most one of the two flags is set.
+    allow_longs = not args.shorts_only
+    allow_shorts = not args.longs_only
+    if allow_longs and allow_shorts:
+        mode = "long+short"
+    elif allow_longs:
+        mode = "long-only"
+    else:
+        mode = "short-only"
 
     print(f"Loading 2-min bars from cache (start={start}, end={end})...")
     t0 = time_mod.time()
@@ -401,7 +421,7 @@ def main() -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"VWAP_MOMENTUM sweep — initial_stop fixed at {INITIAL_STOP_PTS}pt")
+    print(f"VWAP_MOMENTUM sweep — {mode}, initial_stop fixed at {INITIAL_STOP_PTS}pt")
     print(f"{'entry_thr':>9} {'trail':>6} | {'n':>4} | {'WR':>5} | "
           f"{'PF':>5} | {'net':>10} | {'avg':>8} | bar1")
     print("-" * 84)
@@ -417,6 +437,8 @@ def main() -> int:
                 entry_threshold_pts=thr,
                 initial_stop_pts=INITIAL_STOP_PTS,
                 trail_distance_pts=trl,
+                allow_longs=allow_longs,
+                allow_shorts=allow_shorts,
             )
             s = _stats(closes)
             elapsed = time_mod.time() - t_combo
