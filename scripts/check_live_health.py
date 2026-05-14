@@ -132,7 +132,15 @@ def check_broker_session(sb, now: datetime) -> tuple[str, dict]:
 
 def check_heartbeats(sb, now: datetime) -> tuple[str, set[str]]:
     """Per-strategy heartbeat freshness from runtime_heartbeats.
-    Returns (verdict, set of fresh strategy names)."""
+
+    Returns (verdict, set of fresh strategy names).
+
+    Only fails the verdict on stale CURRENT-fleet strategies. Rows for
+    retired strategies (e.g. the v3 runtime's `session`/`regime`/`ignition`,
+    or any `v3-*`/`v4-*` variant) sit in the table forever after their
+    runner generation stops. They're displayed for visibility but treated
+    as informational, not failure conditions.
+    """
     res = sb.table("runtime_heartbeats").select("*").execute()
     rows = res.data or []
     if not rows:
@@ -140,28 +148,33 @@ def check_heartbeats(sb, now: datetime) -> tuple[str, set[str]]:
         return "fail", set()
     fresh: set[str] = set()
     by_service = sorted(rows, key=lambda r: r.get("service") or "")
-    any_stale = False
+    keeper_stale = False
     for hb in by_service:
         service = hb.get("service") or "?"
         ts = _parse_ts(hb.get("ts"))
         if ts is None:
-            print(f"  {RED('●')} {service:<18} no/bad timestamp")
-            any_stale = True
+            print(f"  {DIM('●')} {service:<18} no/bad timestamp")
+            if service in EXPECTED_STRATEGIES:
+                keeper_stale = True
             continue
         age = (now - ts).total_seconds()
         pos_state = hb.get("position_state") or "?"
         auth_ok = hb.get("auth_ok", "?")
         errs = hb.get("consecutive_errors", "?")
-        color = GREEN if age <= HEARTBEAT_FRESH_SEC else RED
+        is_keeper = service in EXPECTED_STRATEGIES
         if age <= HEARTBEAT_FRESH_SEC:
             fresh.add(service)
+            color = GREEN
+        elif is_keeper:
+            color = RED
+            keeper_stale = True
         else:
-            any_stale = True
+            # Retired strategy with stale heartbeat — informational only.
+            color = DIM
         print(f"  {color('●')} {service:<18} hb {_ago(age):>5} ago  "
-              f"pos={pos_state:<5} auth_ok={auth_ok} errs={errs}")
-    if any_stale:
-        return "fail", fresh
-    return "go", fresh
+              f"pos={pos_state:<5} auth_ok={auth_ok} errs={errs}"
+              + ("" if is_keeper else DIM("  (retired — informational)")))
+    return ("fail" if keeper_stale else "go"), fresh
 
 
 def check_active_fleet(fresh_services: set[str]) -> str:
