@@ -1,8 +1,10 @@
 """Heartbeat-staleness probe used by the watchdog.
 
 Reads SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY from the project .env, queries
-the runtime_heartbeats table, and exits 0 if any v{N}-* heartbeat is fresh
-(< MAX_STALE_SEC), exit 1 if all are stale (or table is empty).
+the runtime_heartbeats table, and exits 0 if any matching heartbeat is fresh
+(< MAX_STALE_SEC), exit 1 if all are stale (or table is empty). The match set
+is controlled by HEARTBEAT_SERVICE_REGEX; default covers both legacy v{N}-*
+service ids and the current fleet strategy names.
 
 Watchdog calls this on a timer; if it returns 1, the runner is hung even
 if its log doesn't show signalrcore zombie spam (e.g. Mac sleep, ProjectX
@@ -41,12 +43,14 @@ MAX_STALE_SEC = int(os.environ.get("ACME_HEARTBEAT_MAX_STALE_SEC", "300"))
 # round-trip; we filter client-side for simplicity.
 #
 # The new-fleet runner (acme.fleet_runner) writes heartbeats keyed by
-# strategy name (ignition / session / regime / boundary), not by a
+# strategy name (boundary / overnight_drift / gap_fill), not by a
 # v\d-prefix. The watchdog wrapping it sets HEARTBEAT_SERVICE_REGEX
-# to a pattern that matches those names. Default is the v3-style
-# prefix to preserve the existing behavior for any consumer of this
-# script that doesn't set the env var.
-_DEFAULT_RE = r"^v\d+(\.\d+)?-"
+# explicitly, but ad-hoc CLI invocations (`uv run python
+# scripts/check_runner_heartbeat.py`) need the default to cover the
+# active fleet too — otherwise manual checks always return STALE on
+# a healthy runner. Keep the strategy list here in sync with
+# fleet_runner._build_keeper_instances().
+_DEFAULT_RE = r"^(v\d+(\.\d+)?-|boundary|overnight_drift|gap_fill)"
 _SERVICE_PREFIX_RE = re.compile(
     os.environ.get("HEARTBEAT_SERVICE_REGEX", _DEFAULT_RE)
 )

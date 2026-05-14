@@ -104,11 +104,11 @@ while true; do
 
         # 2) Heartbeat staleness probe. The probe's default service regex is
         #    `^v\d+(\.\d+)?-` (v3-canon, v4-vol-regime, etc). The new fleet's
-        #    services are named after strategy classes (ignition, session,
-        #    regime, boundary) — set HEARTBEAT_SERVICE_REGEX so the probe
-        #    looks at the right rows.
+        #    services are named after strategy classes — set
+        #    HEARTBEAT_SERVICE_REGEX so the probe looks at the right rows.
+        #    Keep this list in sync with fleet_runner._build_keeper_instances().
         if [ "$(date +%s)" -gt "$grace_until" ]; then
-            probe_out=$(HEARTBEAT_SERVICE_REGEX='^(ignition|session|regime|boundary)$' \
+            probe_out=$(HEARTBEAT_SERVICE_REGEX='^(boundary|overnight_drift|gap_fill)$' \
                 uv run python "$HEARTBEAT_PROBE" 2>&1)
             probe_rc=$?
             if [ "$probe_rc" -eq 1 ]; then
