@@ -4,7 +4,9 @@ Streams 1-min MES bars from the local Databento cache, aggregates to
 2-min bars, and runs a custom backtest loop that implements:
 
   - intraday VWAP from 08:30 CT (volume-weighted typical price)
-  - long entry on close >= VWAP + entry_threshold_pts
+  - long entry on close >= VWAP + entry_threshold_pts, restricted to
+    the 09:00-10:00 CT entry window (the hour the by-hour breakdown
+    showed carries the strategy's edge)
   - initial stop entry - initial_stop_pts
   - trailing stop = high_watermark - trail_distance_pts
   - effective stop = max(initial_stop, trailing_stop)
@@ -68,9 +70,15 @@ TRAIL_DISTANCES = [4.0, 6.0, 8.0]
 INITIAL_STOP_PTS = 8.0           # fixed per spec
 
 # Session window (CT). VWAP cumulates from session_open; force-close at
-# hard_close. Entries only allowed strictly inside [session_open, hard_close).
+# hard_close. Entries only allowed strictly inside [entry_window_start,
+# entry_window_end) — a narrower band carved out of the session window.
+# Per the by-hour breakdown on the unrestricted run, 09:xx CT delivered
+# PF 1.43 / +$756 while the rest of the session was net-flat to negative.
+# This gate is the "one variable" change vs. the original sweep.
 SESSION_OPEN_CT = dtime(8, 30)
 HARD_CLOSE_CT = dtime(13, 0)
+ENTRY_WINDOW_START_CT = dtime(9, 0)
+ENTRY_WINDOW_END_CT = dtime(10, 0)
 
 
 def _to_minutes(t: dtime) -> int:
@@ -79,6 +87,8 @@ def _to_minutes(t: dtime) -> int:
 
 SESSION_OPEN_MIN = _to_minutes(SESSION_OPEN_CT)
 HARD_CLOSE_MIN = _to_minutes(HARD_CLOSE_CT)
+ENTRY_WINDOW_START_MIN = _to_minutes(ENTRY_WINDOW_START_CT)
+ENTRY_WINDOW_END_MIN = _to_minutes(ENTRY_WINDOW_END_CT)
 
 
 def _ct_parts(bar: Bar) -> tuple[object, int]:
@@ -249,6 +259,11 @@ def run_vwap_momentum(
 
         # ── Entry check (only when flat and haven't traded yet today).
         if entered_today or vwap is None:
+            continue
+
+        # Entry-window gate — VWAP cumulates from SESSION_OPEN regardless,
+        # but only fire entries inside [ENTRY_WINDOW_START, ENTRY_WINDOW_END).
+        if not (ENTRY_WINDOW_START_MIN <= ct_minute < ENTRY_WINDOW_END_MIN):
             continue
 
         distance = bar.c - vwap

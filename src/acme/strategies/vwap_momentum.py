@@ -61,6 +61,14 @@ class VWAPMomentumConfig:
     session_open_ct: time = field(default_factory=lambda: time(8, 30))
     # Hard close — `wants_force_flat` fires at or after this CT time.
     hard_close_ct: time = field(default_factory=lambda: time(13, 0))
+    # Entry window (CT). Entries only fire when session_open <=
+    # entry_window_start <= bar < entry_window_end. VWAP still cumulates
+    # from session_open so the first entry-eligible bar sees a meaningful
+    # VWAP. Exits and force-close run independently regardless of window.
+    # Default 09:00-10:00 — per the by-hour breakdown, this hour carries
+    # the bulk of the strategy's edge (PF 1.43 vs ~breakeven outside).
+    entry_window_start_ct: time = field(default_factory=lambda: time(9, 0))
+    entry_window_end_ct: time = field(default_factory=lambda: time(10, 0))
     # Sizing — fixed contracts for clean backtest comparison. PF/WR are
     # size-invariant; net/avg scale linearly. Bump after sweep results.
     fixed_contracts: int = 1
@@ -144,10 +152,18 @@ class VWAPMomentumStrategy:
 
         self._session_open_min = _to_minutes(self.config.session_open_ct)
         self._hard_close_min = _to_minutes(self.config.hard_close_ct)
+        self._entry_window_start_min = _to_minutes(self.config.entry_window_start_ct)
+        self._entry_window_end_min = _to_minutes(self.config.entry_window_end_ct)
 
         if not (self._session_open_min < self._hard_close_min):
             raise ValueError(
                 "VWAPMomentumConfig: session_open_ct must precede hard_close_ct"
+            )
+        if not (self._session_open_min <= self._entry_window_start_min
+                < self._entry_window_end_min <= self._hard_close_min):
+            raise ValueError(
+                "VWAPMomentumConfig: entry window must lie within "
+                "[session_open_ct, hard_close_ct]"
             )
 
     def required_history_bars(self) -> int:
@@ -206,6 +222,13 @@ class VWAPMomentumStrategy:
         # In-position or already-traded-this-session: nothing to do. The
         # backtest engine handles exits independently via trailing stop.
         if current_position != 0 or self._day.entered:
+            return None
+
+        # Entry-window gate. VWAP keeps cumulating outside this window
+        # (so the first entry-eligible bar still has context) but we
+        # don't emit signals on early or late bars.
+        if not (self._entry_window_start_min <= ct_minute
+                < self._entry_window_end_min):
             return None
 
         vwap = self._vwap.vwap
