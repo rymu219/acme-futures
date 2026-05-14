@@ -1,4 +1,4 @@
-"""Smoke tests for web/fleet_view.py — the new home page."""
+"""Smoke tests for web/fleet_view.py — the Ghost Dog Capital dashboard."""
 from __future__ import annotations
 
 import sys
@@ -10,33 +10,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
 
 from fleet_view import (  # noqa: E402
     FLEET,
-    _bucket_closes_by_hour,
-    _bucket_hours,
-    _compute_metrics_from_closes,
-    _filter_closes_by_bucket,
+    LIVE_THRESHOLD,
+    PILOT_THRESHOLD,
+    STRATEGY_META,
     _heartbeat_status,
-    _render_bars_held,
-    _render_bucket_selector,
-    _render_header,
-    _render_hour_heatmap,
-    _render_position_panel,
-    _render_promotion_gate,
-    _render_recent_trades,
+    _render_active_trade,
+    _render_footer,
+    _render_hour_grid,
+    _render_recent_closes,
     _render_strategy_cards,
+    _render_topbar,
+    _strategy_metrics,
     render_overview,
 )
 
-# ════════════ helpers ═══════════════════════════════════════════════
+# ════════════ FakeSupabase ═════════════════════════════════════════
 
 
 class _FakeSupabase:
     """In-memory mock for the Supabase client surface fleet_view uses."""
 
-    def __init__(self, *, heartbeats=None, strategies=None, snaps=None, closes=None):
+    def __init__(self, *, heartbeats=None, strategies=None, snaps=None,
+                 closes=None, kill_switch_events=None):
         self._heartbeats = heartbeats or []
         self._strategies = strategies or []
         self._snaps = snaps or {}
         self._closes = closes or []
+        self._kill_switch_events = kill_switch_events or []
 
     def table(self, name):
         return _FakeQuery(self, name)
@@ -46,23 +46,29 @@ class _FakeQuery:
     def __init__(self, parent, table):
         self.parent = parent
         self.table_name = table
-        self._filters = []
+        self._eq_filters: dict = {}
 
     def select(self, *_args):
         return self
+
     def in_(self, *_args):
         return self
-    def eq(self, *_args):
+
+    def eq(self, col, value):
+        self._eq_filters[col] = value
         return self
+
     def gte(self, *_args):
         return self
+
     def order(self, *_args, **_kwargs):
         return self
+
     def limit(self, *_args):
         return self
 
     def execute(self):
-        data = []
+        data: list = []
         if self.table_name == "runtime_heartbeats":
             data = self.parent._heartbeats
         elif self.table_name == "strategies":
@@ -70,9 +76,13 @@ class _FakeQuery:
         elif self.table_name == "broker_events":
             data = self.parent._closes
         elif self.table_name == "strategy_perf_snapshot":
-            # Pretend the .eq filter narrowed by strategy name. The fake just
-            # returns the dict for whatever strategy the test set up.
-            data = list(self.parent._snaps.values()) and [list(self.parent._snaps.values())[0]]
+            # _fetch_perf_snapshots issues one query per strategy with
+            # .eq("strategy", name) — honor that filter.
+            wanted = self._eq_filters.get("strategy")
+            if wanted and wanted in self.parent._snaps:
+                data = [self.parent._snaps[wanted]]
+        elif self.table_name == "operator_events":
+            data = self.parent._kill_switch_events
         return _FakeResp(data)
 
 
@@ -81,156 +91,208 @@ class _FakeResp:
         self.data = data
 
 
-def _hb(service, *, state="flat", age_s=10):
+# ════════════ fixtures ═════════════════════════════════════════════
+
+
+def _hb(service, *, state="flat", age_s=10, contract="CON.F.US.MES.M26"):
     ts = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
     return {
         "service": service, "ts": ts, "last_bar_ts": ts,
         "position_state": state, "auth_ok": True,
-        "consecutive_errors": 0, "extra": {"contract_id": "CON.F.US.MES.M26"},
+        "consecutive_errors": 0, "extra": {"contract_id": contract},
     }
 
 
-def _close(*, strategy="ignition", net_pnl=10.0, hours_ago=1, bars_held_minutes=4,
-           outcome="target"):
+def _close(*, strategy="boundary", net_pnl=10.0, hours_ago=1,
+           bars_held_minutes=4, outcome="target"):
     ts = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
     return {
         "id": 1, "occurred_at": ts, "kind": "dry_run_close",
         "strategy": strategy, "side": "buy", "size": 1, "price": 100.0,
         "raw": {
             "net_pnl": net_pnl, "outcome": outcome,
-            "entry_price": 100.0, "exit_price": 100 + net_pnl/5,
+            "entry_price": 100.0, "exit_price": 100 + net_pnl / 5,
             "bars_held_minutes": bars_held_minutes,
         },
     }
 
 
-# ════════════ helpers — pure ════════════════════════════════════════
+# ════════════ pure helpers ═════════════════════════════════════════
+
+
+def test_fleet_lists_three_keepers():
+    assert FLEET == ["boundary", "overnight_drift", "gap_fill"]
+    # Every fleet member has a display-meta entry — otherwise renderers
+    # silently fall back to .upper() which loses the racing-silk styling.
+    for name in FLEET:
+        assert name in STRATEGY_META
 
 
 def test_heartbeat_status_live():
-    label, color, _ = _heartbeat_status(_hb("ignition", age_s=10))
+    label, color, _sub = _heartbeat_status(_hb("boundary", age_s=10))
     assert label == "LIVE"
-    assert color == "#16a34a"
+    assert "green" in color  # CSS-var "var(--green2)"
 
 
 def test_heartbeat_status_stale():
-    label, _, _ = _heartbeat_status(_hb("ignition", age_s=500))
+    label, _color, _sub = _heartbeat_status(_hb("boundary", age_s=500))
     assert label == "STALE"
 
 
 def test_heartbeat_status_offline():
-    label, _, _ = _heartbeat_status(_hb("ignition", age_s=2000))
+    label, _color, _sub = _heartbeat_status(_hb("boundary", age_s=2000))
     assert label == "OFFLINE"
 
 
 def test_heartbeat_status_unknown_on_missing():
-    label, _, _ = _heartbeat_status(None)
+    label, _color, _sub = _heartbeat_status(None)
     assert label == "UNKNOWN"
 
 
-# ════════════ renderers — produce HTML containing key elements ═════
+def test_strategy_metrics_combines_snap_and_strategy():
+    strategies = {"boundary": {"name": "boundary", "state": "PILOT",
+                                "tier": 1, "score": 0.62}}
+    snaps = {"boundary": {"strategy": "boundary", "n_trades": 20,
+                          "net_pnl": 150.0, "win_rate": 0.55,
+                          "profit_factor": 1.4, "sharpe": 0.8,
+                          "max_drawdown": -25}}
+    m = _strategy_metrics("boundary", strategies, snaps)
+    assert m["n_trades"] == 20
+    assert m["net_pnl"] == 150.0
+    assert m["pf"] == 1.4
+    assert m["state"] == "PILOT"
+    # avg_pnl derived when not supplied: 150 / 20 = 7.5
+    assert m["avg_pnl"] == 7.5
 
 
-def test_header_shows_all_four_strategies():
+def test_strategy_metrics_empty_safe():
+    m = _strategy_metrics("boundary", {}, {})
+    assert m["n_trades"] == 0
+    assert m["net_pnl"] == 0
+    assert m["pf"] is None
+
+
+def test_promotion_thresholds_well_ordered():
+    # PILOT must promote at a lower score than LIVE — guards against a
+    # config-style edit that accidentally inverts the ladder.
+    assert PILOT_THRESHOLD < LIVE_THRESHOLD
+
+
+# ════════════ section renderers ════════════════════════════════════
+
+
+def test_topbar_shows_brand_and_last_bar():
     hbs = {name: _hb(name) for name in FLEET}
-    html = _render_header(hbs)
-    for name in FLEET:
-        assert name in html
-    assert "last bar" in html
+    html = _render_topbar(hbs)
+    assert "Ghost Dog Capital" in html
+    assert "LAST BAR" in html
+    # Topbar text mentions the 50K eval context
+    assert "$50K EVAL" in html
 
 
-def test_position_panel_empty_when_flat():
+def test_topbar_renders_with_empty_heartbeats():
+    html = _render_topbar({})
+    assert "LAST BAR" in html
+    assert "—" in html  # last-bar fallback
+
+
+def test_active_trade_empty_when_all_flat():
     hbs = {name: _hb(name, state="flat") for name in FLEET}
-    html = _render_position_panel(hbs)
-    assert "no position held" in html
+    html = _render_active_trade(hbs)
+    assert "NO ACTIVE POSITION" in html
 
 
-def test_position_panel_shows_position_holder():
-    hbs = {name: _hb(name) for name in FLEET}
-    hbs["regime"] = _hb("regime", state="long")
-    html = _render_position_panel(hbs)
-    assert "regime" in html
+def test_active_trade_shows_open_position():
+    hbs = {name: _hb(name, state="flat") for name in FLEET}
+    hbs["boundary"] = _hb("boundary", state="long")
+    html = _render_active_trade(hbs)
+    assert "ACTIVE TRADE" in html
     assert "LONG" in html
+    assert "BOUNDARY" in html  # STRATEGY_META label
 
 
-def test_position_panel_warns_on_multiple_holders():
-    hbs = {"ignition": _hb("ignition", state="long"),
-           "boundary": _hb("boundary", state="short")}
-    html = _render_position_panel(hbs)
-    assert "state desync" in html or "desync" in html
+def test_active_trade_warns_on_multiple_holders():
+    hbs = {
+        "boundary":        _hb("boundary", state="long"),
+        "overnight_drift": _hb("overnight_drift", state="short"),
+        "gap_fill":        _hb("gap_fill", state="flat"),
+    }
+    html = _render_active_trade(hbs)
+    assert "non-flat" in html
 
 
-def test_strategy_cards_include_all_four():
-    snaps = {n: {"n_trades": 10, "net_pnl": 25.0, "win_rate": 0.5,
-                 "profit_factor": 1.2, "sharpe": 0.5, "max_drawdown": 5}
+def test_strategy_cards_render_all_fleet_members():
+    heartbeats = {name: _hb(name) for name in FLEET}
+    strategies = {n: {"name": n, "state": "SHADOW", "score": 0.3, "tier": 2}
+                  for n in FLEET}
+    snaps = {n: {"strategy": n, "n_trades": 10, "net_pnl": 25.0,
+                 "win_rate": 0.5, "profit_factor": 1.2, "sharpe": 0.4,
+                 "max_drawdown": -5}
              for n in FLEET}
-    strats = {n: {"name": n, "state": "SHADOW", "score": 0.3, "tier": 2}
-              for n in FLEET}
-    html = _render_strategy_cards(strats, snaps)
+    html = _render_strategy_cards(heartbeats, strategies, snaps)
     for name in FLEET:
-        assert name in html
+        assert STRATEGY_META[name]["label"] in html
+    # Score below PILOT_THRESHOLD → SHADOW badge for all cards
     assert "SHADOW" in html
 
 
-def test_promotion_gate_renders_thresholds():
-    strats = {n: {"name": n, "state": "SHADOW", "score": 0.3}
-              for n in FLEET}
-    html = _render_promotion_gate(strats)
+def test_strategy_cards_pilot_badge_at_threshold():
+    heartbeats = {name: _hb(name) for name in FLEET}
+    # Boundary clears the PILOT bar; others stay in SHADOW
+    strategies = {
+        "boundary":        {"name": "boundary",        "state": "PILOT",
+                            "score": PILOT_THRESHOLD + 0.01, "tier": 1},
+        "overnight_drift": {"name": "overnight_drift", "state": "SHADOW",
+                            "score": 0.10, "tier": 2},
+        "gap_fill":        {"name": "gap_fill",        "state": "SHADOW",
+                            "score": 0.10, "tier": 2},
+    }
+    snaps: dict = {}
+    html = _render_strategy_cards(heartbeats, strategies, snaps)
     assert "PILOT" in html
-    assert "LIVE" in html
-    # Each row should have a score
-    for name in FLEET:
-        assert name in html
+    assert "SHADOW" in html
 
 
-def test_promotion_gate_progress_for_high_score():
-    strats = {"boundary": {"name": "boundary", "state": "SHADOW", "score": 0.70}}
-    html = _render_promotion_gate(strats)
-    assert "LIVE-eligible" in html
+def test_hour_grid_renders_24_cells_when_empty():
+    html = _render_hour_grid([])
+    assert "HOUR-OF-DAY" in html
+    # Two rows of 12 hour-cells = 24 hour labels (00..23). Count "hh-cell".
+    assert html.count("hh-cell") == 24
 
 
-def test_hour_heatmap_aggregates_pnl():
-    # Three closes at 03:00 CT (08 UTC in CDT) with net=+10 each
-    closes = [_close(net_pnl=10, hours_ago=h) for h in (1, 2, 3)]
-    buckets = _bucket_closes_by_hour(closes)
-    assert sum(v["n"] for v in buckets.values()) == 3
-    assert sum(v["net_pnl"] for v in buckets.values()) == 30
+def test_hour_grid_aggregates_pnl_when_populated():
+    closes = [_close(net_pnl=5, hours_ago=h) for h in (1, 2, 3, 4)]
+    html = _render_hour_grid(closes)
+    assert "HOUR-OF-DAY" in html
+    # Cells with trades use the hh-pos class for positive aggregate P&L.
+    assert "hh-pos" in html
 
 
-def test_hour_heatmap_empty_state():
-    html = _render_hour_heatmap([])
-    assert "no closed trades" in html
+def test_recent_closes_empty_state():
+    html = _render_recent_closes([], {})
+    assert "waiting for first close" in html
 
 
-def test_bars_held_renders_distribution():
-    # _render_bars_held is retained for legacy/debugging use but no
-    # longer shown in the dashboard (removed from render_overview).
-    # Keep the unit test on FLEET-current strategy names so any future
-    # debug-page wiring still works.
-    closes = [
-        _close(strategy="boundary", bars_held_minutes=2),  # 1 bar
-        _close(strategy="boundary", bars_held_minutes=4),  # 2 bars
-        _close(strategy="boundary", bars_held_minutes=8),  # 4 bars
-    ]
-    html = _render_bars_held(closes)
-    assert "boundary" in html
-    assert "n=3" in html
+def test_recent_closes_renders_fleet_member():
+    closes = [_close(strategy="boundary", net_pnl=15)]
+    html = _render_recent_closes(closes, {})
+    # Tag uses STRATEGY_META label, not the raw key
+    assert "BOUNDARY" in html
 
 
-def test_bars_held_empty_state():
-    html = _render_bars_held([])
-    assert "waiting for closed trades" in html
+def test_recent_closes_surfaces_open_position():
+    hbs = {name: _hb(name, state="flat") for name in FLEET}
+    hbs["gap_fill"] = _hb("gap_fill", state="long")
+    html = _render_recent_closes([], hbs)
+    # Open row should appear even when there are no closes yet
+    assert "GAP FILL" in html
+    assert "open" in html
 
 
-def test_recent_trades_renders():
-    closes = [_close(strategy="session", net_pnl=15)]
-    html = _render_recent_trades(closes)
-    assert "session" in html
-
-
-def test_recent_trades_empty_state():
-    html = _render_recent_trades([])
-    assert "waiting" in html
+def test_footer_carries_brand_and_refresh_hint():
+    html = _render_footer()
+    assert "Ghost Dog Capital" in html
+    assert "auto-refresh" in html
 
 
 # ════════════ render_overview — end-to-end ═════════════════════════
@@ -239,90 +301,11 @@ def test_recent_trades_empty_state():
 def test_render_overview_with_empty_data():
     sb = _FakeSupabase()
     html = render_overview(sb, token="t")
-    assert "Acme Futures" in html
-    assert "v3 archive" in html  # footer link present
-
-
-# ════════════ time-bucket filter ═══════════════════════════════════
-
-
-def test_bucket_hours_all_returns_none():
-    assert _bucket_hours("all") is None
-    assert _bucket_hours(None) is None
-    assert _bucket_hours("unknown_key") is None
-
-
-def test_bucket_hours_audit_winners():
-    h = _bucket_hours("audit_winners")
-    assert h == {3, 4, 8, 9, 17}
-
-
-def test_filter_closes_by_bucket_keeps_matching():
-    # 5 closes — one at each of these CT hours: 03, 09, 13, 17, 22.
-    # CT is UTC-5 in May.
-    closes = [
-        _close(strategy="ignition", hours_ago=h_offset)
-        for h_offset in (1, 2, 3, 4, 5)
-    ]
-    # Manually fix occurred_at to land each in a specific CT hour
-    from datetime import UTC, datetime
-    target_hours = [3, 9, 13, 17, 22]
-    for c, ct_hour in zip(closes, target_hours, strict=True):
-        # CT hour h → UTC h+5 (CDT)
-        c["occurred_at"] = datetime(2026, 5, 15, (ct_hour + 5) % 24,
-                                     30, tzinfo=UTC).isoformat()
-    audit_winners = _filter_closes_by_bucket(closes, "audit_winners")
-    # 03 CT and 09 CT and 17 CT → 3 hits
-    assert len(audit_winners) == 3
-    rth_pm = _filter_closes_by_bucket(closes, "rth_pm")
-    # 13 CT → 1 hit
-    assert len(rth_pm) == 1
-
-
-def test_filter_closes_passthrough_on_all():
-    closes = [_close() for _ in range(5)]
-    assert _filter_closes_by_bucket(closes, "all") == closes
-    assert _filter_closes_by_bucket(closes, None) == closes
-
-
-def test_compute_metrics_from_closes_aggregates():
-    closes = [
-        _close(strategy="ignition", net_pnl=10),
-        _close(strategy="ignition", net_pnl=-5),
-        _close(strategy="ignition", net_pnl=20),
-        _close(strategy="session", net_pnl=100),
-    ]
-    m = _compute_metrics_from_closes(closes, "ignition")
-    assert m["n_trades"] == 3
-    assert m["net_pnl"] == 25
-    # 2 wins of 3 = 0.667 WR
-    assert abs(m["win_rate"] - 2/3) < 1e-6
-    # gross_win=30, gross_loss=5 → PF=6
-    assert m["profit_factor"] == 6
-
-
-def test_compute_metrics_empty():
-    m = _compute_metrics_from_closes([], "ignition")
-    assert m["n_trades"] == 0
-    assert m["profit_factor"] is None
-
-
-def test_bucket_selector_marks_current():
-    html = _render_bucket_selector("audit_winners", token="t")
-    assert "Audit winners" in html
-    # The active chip uses #0891b2 background
-    assert "#0891b2" in html
-
-
-def test_render_overview_with_bucket_filter():
-    """End-to-end: passing bucket='audit_winners' should label the
-    strategy-card title with the filter name."""
-    hbs = [_hb(n) for n in FLEET]
-    closes = [_close(strategy=n) for n in FLEET]
-    sb = _FakeSupabase(heartbeats=hbs, closes=closes,
-                       strategies=[], snaps={})
-    html = render_overview(sb, token="t", bucket="audit_winners")
-    assert "Audit winners" in html
+    assert "<!doctype html>" in html
+    assert "Ghost Dog Capital" in html
+    # The page must render even when every fetcher returns nothing.
+    assert "NO ACTIVE POSITION" in html
+    assert "HOUR-OF-DAY" in html
 
 
 def test_render_overview_with_full_data():
@@ -330,19 +313,22 @@ def test_render_overview_with_full_data():
     strats = [{"name": n, "state": "SHADOW", "score": 0.3, "tier": 2}
               for n in FLEET]
     snaps = {n: {"strategy": n, "n_trades": 5, "net_pnl": 12.0,
-                 "win_rate": 0.4, "profit_factor": 1.1,
-                 "sharpe": 0.3, "max_drawdown": 3}
+                 "win_rate": 0.4, "profit_factor": 1.1, "sharpe": 0.3,
+                 "max_drawdown": -3}
              for n in FLEET}
     closes = [_close(strategy=n) for n in FLEET]
-    sb = _FakeSupabase(heartbeats=hbs, strategies=strats, snaps=snaps, closes=closes)
+    sb = _FakeSupabase(heartbeats=hbs, strategies=strats,
+                       snaps=snaps, closes=closes)
     html = render_overview(sb, token="t")
     assert "<!doctype html>" in html
-    assert "Live Position" in html
-    assert "Strategy Performance" in html
-    assert "Promotion Gate" in html
-    assert "Hour-of-day" in html
-    assert "Recent Closes" in html
-    # New Phase A sections:
-    assert "KILL SWITCH" in html
-    assert "SESSION P&amp;L" in html or "SESSION P&L" in html
-    assert "DLL DISTANCE" in html
+    for name in FLEET:
+        assert STRATEGY_META[name]["label"] in html
+
+
+def test_render_overview_accepts_legacy_bucket_kwarg():
+    # render_overview keeps the `bucket` kwarg for backwards compatibility
+    # with callers from before the Ghost Dog redesign — passing it must
+    # not raise even though the value is currently unused.
+    sb = _FakeSupabase()
+    html = render_overview(sb, token="t", bucket="audit_winners")
+    assert "<!doctype html>" in html

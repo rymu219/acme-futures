@@ -1,103 +1,89 @@
-"""New-fleet dashboard.
+"""Ghost Dog Capital · Fleet dashboard.
 
-Renders the home page for the Part-2 fleet: IGNITION / SESSION / REGIME /
-BOUNDARY running through the classic conductor in SHADOW state.
+Full visual overhaul of the Part-2 fleet view. Same architecture, same
+Supabase fetchers, same render_overview() signature — new everything
+else. Mounted at `/` by web/app.py.
 
-Read-only HTML view. Five panels, all on one scroll:
+Layout (top to bottom):
+  1. Topbar           Ghost Dog logo + subtitle + last-bar age
+  2. Ticker bar       Session P&L · MES · Position · Eval target ·
+                      Remaining · Est. days · ARMED/KILL controls
+  3. MLL tracker      Session P&L / DLL / Trailing MLL with progress bars
+  4. Active trade     6-col panel, visible only when a position is open
+  5. Strategy cards   Boundary / Overnight Drift / Gap Fill, P&L-tinted
+  6. Hour-of-day grid 24-cell grid (two rows of 12), CT-hour P&L
+  7. Recent closes    Most recent 20 trades + any open position
+  8. Footer           Brand + auto-refresh indicator
 
-  1. Header — heartbeat per strategy, current bar, live-trade pill.
-  2. Live position — single position (conductor arbitrates), which
-     strategy owns it, entry, age, unrealised P&L.
-  3. Per-strategy cards — state, score, n, net P&L, WR, PF, Sharpe.
-  4. Promotion-gate dashboard — distance to PILOT (≥0.55) and LIVE (≥0.65).
-  5. Hour-of-day P&L heatmap — bucketed by entry hour CT.
-  6. Bars-held distribution — per-strategy histogram with 2-bar
-     benchmark (audit §3).
-  7. Recent trades — compact table of latest dry_run_close events.
+Typography:
+  Bebas Neue          large numbers, strategy names, brand
+  Barlow Condensed    labels, badges, section headers
+  IBM Plex Mono       data values, prices, P&L, timestamps
 
-Reads from Supabase tables: `strategies`, `strategy_perf_snapshot`,
-`broker_events`, `runtime_heartbeats`. Honest framing — no `HALT` or
-`/200` labels (the audit revealed both were misleading).
+Data sources are identical to the prior view:
+  runtime_heartbeats, strategy_perf_snapshot, strategies, broker_events,
+  operator_events. No new queries.
 
-Mounted at `/` by web/app.py.
+Data limitations (carried over from the heartbeat schema):
+  The Active Trade panel needs entry-price / current-price / unrealized /
+  trail-stop fields that the conductor doesn't currently include in its
+  heartbeat `extra` payload. Those cells show `—` until the heartbeat
+  schema is enriched. Everything else (strategy P&L, hour buckets,
+  recent closes, kill switch) is fully wired.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, time, timedelta
+from math import ceil
 from typing import Any
 from zoneinfo import ZoneInfo
 
 CT = ZoneInfo("America/Chicago")
 UTC = ZoneInfo("UTC")
 
-# Strategies on the new fleet (Part-2). Order is display order in the UI.
+# Fleet — display order matches the strategy-cards grid left-to-right.
 FLEET = ["boundary", "overnight_drift", "gap_fill"]
 
-# PerfTracker thresholds from src/acme/perf/scoring.py
+# Per-strategy display metadata. `accent` drives the 3px top bar on each
+# card and the tag color in the recent-closes table. `silk` selects a CSS
+# class for the small "racing silk" badge in the card head.
+STRATEGY_META: dict[str, dict[str, str]] = {
+    "boundary": {
+        "label":     "BOUNDARY",
+        "accent":    "#C49A30",          # gold
+        "silk":      "silk-gold-diag",
+        "window":    "17–23 · 03–08 CT",
+    },
+    "overnight_drift": {
+        "label":     "OVERNIGHT DRIFT",
+        "accent":    "#4A8C3F",          # green
+        "silk":      "silk-green",
+        "window":    "17:00 → 08:30 CT",
+    },
+    "gap_fill": {
+        "label":     "GAP FILL",
+        "accent":    "#C4801A",          # amber
+        "silk":      "silk-amber",
+        "window":    "08:30 → 13:00 CT",
+    },
+}
+
+# Topstep 50K eval constants
+_TOPSTEP_DLL  = 1_000.0
+_TOPSTEP_MLL  = 2_000.0
+EVAL_TARGET   = 3_000.0
+
+# PerfTracker thresholds — only used for the PILOT/SHADOW badge on cards.
 PILOT_THRESHOLD = 0.55
-LIVE_THRESHOLD = 0.65
+LIVE_THRESHOLD  = 0.65
+
+# Heartbeat staleness (matches scripts/check_runner_heartbeat.py default).
+HB_LIVE_MAX_S    = 300
+HB_OFFLINE_MIN_S = 900
 
 
-# Time-of-day buckets for the UI filter. Keys map to a set of hours
-# (CT). 'all' is the default and means no filter. Order matters — used
-# as the chip render order at the top of the page.
-TIME_BUCKETS: dict[str, dict] = {
-    "all":            {"label": "All hours",         "hours": None},
-    "audit_winners":  {"label": "Audit winners",     "hours": {3, 4, 8, 9, 17}},
-    "audit_losers":   {"label": "Audit losers",      "hours": {11, 12, 13, 14, 15}},
-    "europe":         {"label": "Europe 03–05",      "hours": {3, 4}},
-    "rth_am":         {"label": "RTH AM 08–09",      "hours": {8, 9}},
-    "rth_lunch":      {"label": "RTH lunch 10–12",   "hours": {10, 11, 12}},
-    "rth_pm":         {"label": "RTH PM 13–15",      "hours": {13, 14, 15}},
-    "overnight":      {"label": "Overnight 18–07",
-                        "hours": {18, 19, 20, 21, 22, 23, 0, 1, 2, 5, 6, 7}},
-}
-
-
-def _bucket_hours(bucket: str | None) -> set[int] | None:
-    """Returns the hour set for a bucket, or None for 'all' / unknown."""
-    if not bucket or bucket == "all":
-        return None
-    b = TIME_BUCKETS.get(bucket)
-    if not b:
-        return None
-    return b["hours"]
-
-
-def _filter_closes_by_bucket(
-    closes: list[dict[str, Any]], bucket: str | None
-) -> list[dict[str, Any]]:
-    hours = _bucket_hours(bucket)
-    if hours is None:
-        return closes
-    out = []
-    for c in closes:
-        ts = c.get("occurred_at")
-        if not ts:
-            continue
-        try:
-            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(CT)
-        except Exception:
-            continue
-        if d.hour in hours:
-            out.append(c)
-    return out
-
-# Heartbeat staleness — same conventions as the v3 view.
-HB_LIVE_MAX_S = 300        # 5 min (new fleet's 2-min bar + buffer)
-HB_OFFLINE_MIN_S = 900     # 15 min
-
-_STATE_BG = {
-    "LIVE": "#16a34a",
-    "PILOT": "#0891b2",
-    "SHADOW": "#3b82f6",
-    "BENCH": "#a16207",
-    "RETIRED": "#7f1d1d",
-}
-
-
-# ─────────────────────────── small helpers ──────────────────────────
+# ─────────────────────────── small helpers (UNCHANGED) ──────────────
 
 
 def _money(n: float | None) -> str:
@@ -143,11 +129,11 @@ def _ct_str(ts_iso: str | None) -> str:
         return "—"
 
 
-# ─────────────────────────── data fetchers ──────────────────────────
+# ─────────────────────────── data fetchers (UNCHANGED) ──────────────
 
 
 def _fetch_heartbeats(sb) -> dict[str, dict[str, Any]]:
-    """Heartbeats for the 4 fleet strategies only."""
+    """Heartbeats for the 3 fleet strategies only."""
     try:
         res = sb.table("runtime_heartbeats").select("*").in_("service", FLEET).execute()
     except Exception:
@@ -222,11 +208,13 @@ def _fetch_kill_switch_state(sb) -> dict[str, Any]:
     }
 
 
+# ─────────────────────────── derived helpers ────────────────────────
+
+
 def _today_session_closes(closes: list[dict]) -> list[dict]:
     """Closes that exited during the current CT trading-day session.
     Trade-date rolls at 17:00 CT (Globex open), matching trading_date_ct."""
     now_ct = datetime.now(UTC).astimezone(CT)
-    # Find the start of the current trading day.
     if now_ct.time() >= time(17, 0):
         td_start = datetime.combine(now_ct.date(), time(17, 0), tzinfo=CT)
     else:
@@ -247,438 +235,418 @@ def _today_session_closes(closes: list[dict]) -> list[dict]:
     return out
 
 
-# ─────────────────────────── Topstep MLL tracker ────────────────────
+def _session_pnl(closes: list[dict]) -> float:
+    return sum(float((c.get("raw") or {}).get("net_pnl") or 0) for c in closes)
 
 
-_TOPSTEP_DLL = 1_000.0
-_TOPSTEP_MLL = 2_000.0
-
-
-def _mll_color(distance: float, limit: float) -> str:
-    """Distance-to-limit → color. green=safe (>50% away), yellow=mid,
-    red=within 20% of limit."""
-    if distance >= 0.5 * limit:
-        return "#15803d"  # green
-    if distance >= 0.2 * limit:
-        return "#d97706"  # yellow
-    return "#b91c1c"      # red
-
-
-def _render_mll_tracker(closes: list[dict]) -> str:
-    """Topstep DLL+MLL header. Session P&L is sum of today's CT-session
-    realized closes. DLL distance = $1000 − today's drawdown. MLL
-    distance uses today's session drawdown as a simple proxy for the
-    trailing-MLL exposure (real trailing-MLL math needs cross-session
-    peak tracking which lives in the runner)."""
-    todays = _today_session_closes(closes)
-
-    # Build per-close P&L stream (chronological) to compute the
-    # session's intraday drawdown.
-    pnls = []
-    for c in sorted(todays, key=lambda r: r.get("occurred_at") or ""):
+def _avg_daily_pnl(closes: list[dict]) -> float:
+    """Avg P&L per unique CT date across the closes window. Used for the
+    EST. DAYS ticker calculation. Returns 0 if no closes."""
+    by_date: dict = defaultdict(float)
+    for c in closes:
+        ts = c.get("occurred_at")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(CT).date()
+        except Exception:
+            continue
         raw = c.get("raw") or {}
-        pnls.append(float(raw.get("net_pnl") or 0.0))
-    session_pnl = sum(pnls)
-
-    # Intraday drawdown: peak running sum − current running sum
-    running = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for p in pnls:
-        running += p
-        peak = max(peak, running)
-        max_dd = max(max_dd, peak - running)
-
-    # DLL exposure tracks intraday loss vs $1K
-    intraday_loss = max(0.0, -session_pnl) if session_pnl < 0 else 0.0
-    dll_distance = max(0.0, _TOPSTEP_DLL - intraday_loss)
-    mll_distance = max(0.0, _TOPSTEP_MLL - max_dd)
-
-    pnl_color = "#15803d" if session_pnl > 0 else "#b91c1c" if session_pnl < 0 else "#475569"
-    dll_color = _mll_color(dll_distance, _TOPSTEP_DLL)
-    mll_color = _mll_color(mll_distance, _TOPSTEP_MLL)
-
-    return f"""
-  <section class="mll-tracker">
-    <div class="mll-card">
-      <div class="mll-label dim mini">SESSION P&amp;L</div>
-      <div class="mll-num mono" style="color:{pnl_color};">${session_pnl:+,.2f}</div>
-      <div class="mll-sub dim mini">{len(pnls)} closed today</div>
-    </div>
-    <div class="mll-card">
-      <div class="mll-label dim mini">DLL DISTANCE ($1,000 limit)</div>
-      <div class="mll-num mono" style="color:{dll_color};">${dll_distance:,.0f}</div>
-      <div class="mll-sub dim mini">intraday loss ${intraday_loss:,.2f}</div>
-    </div>
-    <div class="mll-card">
-      <div class="mll-label dim mini">TRAILING MLL ($2,000 limit)</div>
-      <div class="mll-num mono" style="color:{mll_color};">${mll_distance:,.0f}</div>
-      <div class="mll-sub dim mini">peak-to-trough today ${max_dd:,.2f}</div>
-    </div>
-  </section>
-"""
+        by_date[d] += float(raw.get("net_pnl") or 0)
+    if not by_date:
+        return 0.0
+    return sum(by_date.values()) / len(by_date)
 
 
-# ─────────────────────────── kill switch ─────────────────────────────
+def _card_bg(net_pnl: float, all_nets: list[float]) -> str:
+    """Background color for a strategy card based on its net P&L relative
+    to the fleet's max. Per spec:
+        red-tint        net <= 0
+        light green     0 < intensity <= 0.33
+        medium green    0.33 < intensity <= 0.66
+        strong green    intensity > 0.66
+    where intensity = this card's net / max(all_nets)."""
+    if net_pnl <= 0:
+        return "#2A1C1A"          # red tint
+    positives = [n for n in all_nets if n > 0]
+    max_net = max(positives) if positives else 1.0
+    intensity = net_pnl / max_net if max_net > 0 else 0
+    if intensity > 0.66:
+        return "#1A2E1A"          # strong green
+    if intensity > 0.33:
+        return "#1E2A1C"          # medium green
+    return "#222B1F"              # light green
 
 
-def _render_kill_switch(ks: dict[str, Any], token: str | None) -> str:
-    """Big red EMERGENCY FLAT button + green RESUME button. Two-click
-    safety via JS confirm(). Active/Inactive state from operator_events."""
-    token_q = f"&token={token}" if token else ""
-    active = bool(ks.get("active"))
-    state_label = "KILL SWITCH ACTIVE" if active else "KILL SWITCH INACTIVE"
-    state_color = "#b91c1c" if active else "#15803d"
-    state_bg = "#fee2e2" if active else "#dcfce7"
-
-    ts_line = ""
-    if ks.get("ts"):
-        ts_line = f"<span class='dim mini'>since {_ago(ks['ts'])}</span>"
-
-    if active:
-        # Show resume button only
-        action_html = f"""
-        <a href="/kill-switch?action=clear{token_q}"
-           class="ks-btn ks-btn-resume"
-           onclick="return confirm('Clear the kill switch and resume trading?');">
-          RESUME TRADING
-        </a>
-        """
-    else:
-        # Show emergency-flat button only
-        action_html = f"""
-        <a href="/kill-switch?action=activate{token_q}"
-           class="ks-btn ks-btn-flat"
-           onclick="return confirm('EMERGENCY FLAT — force-close ALL positions immediately. Are you sure?');">
-          EMERGENCY FLAT — ALL POSITIONS
-        </a>
-        """
-
-    return f"""
-  <section class="kill-switch-row">
-    <div class="ks-status" style="background:{state_bg};color:{state_color};">
-      <span class="ks-status-label">{state_label}</span>
-      {ts_line}
-    </div>
-    <div class="ks-action">{action_html}</div>
-  </section>
-"""
-
-
-# ─────────────────────────── header ─────────────────────────────────
+def _mll_band_color(used_frac: float) -> str:
+    """Color for an MLL/DLL progress band. Per spec: green < 30%, gold
+    30-70%, red > 70%."""
+    if used_frac < 0.30:
+        return "var(--green2)"
+    if used_frac < 0.70:
+        return "var(--gold2)"
+    return "var(--red2)"
 
 
 def _heartbeat_status(hb: dict | None) -> tuple[str, str, str]:
-    """Returns (label, color, sub-text). label ∈ {LIVE, STALE, OFFLINE, UNKNOWN}."""
+    """(label, color, sub-text). label ∈ {LIVE, STALE, OFFLINE, UNKNOWN}."""
     if not hb:
-        return ("UNKNOWN", "#64748b", "no heartbeat")
+        return ("UNKNOWN", "var(--text3)", "no heartbeat")
     ts = hb.get("ts")
     if not ts:
-        return ("UNKNOWN", "#64748b", "no ts")
+        return ("UNKNOWN", "var(--text3)", "no ts")
     try:
         d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except Exception:
-        return ("UNKNOWN", "#64748b", "bad ts")
+        return ("UNKNOWN", "var(--text3)", "bad ts")
     age_s = int((datetime.now(UTC) - d).total_seconds())
     if age_s < HB_LIVE_MAX_S:
-        return ("LIVE", "#16a34a", f"{age_s}s ago")
+        return ("LIVE", "var(--green2)", f"{age_s}s ago")
     if age_s < HB_OFFLINE_MIN_S:
-        return ("STALE", "#f59e0b", _ago(ts))
-    return ("OFFLINE", "#dc2626", _ago(ts))
-
-
-def _render_header(heartbeats: dict[str, dict]) -> str:
-    """Top status bar — one pill per strategy + last-bar across fleet."""
-    pills = []
-    last_bar_ts: str | None = None
-    for name in FLEET:
-        hb = heartbeats.get(name)
-        label, color, sub = _heartbeat_status(hb)
-        pos_state = (hb or {}).get("position_state") or "flat"
-        if pos_state != "flat":
-            pos_chip = (
-                f"<span class='pill mini' style='background:#1e3a8a;color:white;"
-                f"margin-left:6px;'>{pos_state.upper()}</span>"
-            )
-        else:
-            pos_chip = ""
-        pills.append(
-            f"<div class='hb-pill' style='border-color:{color};'>"
-            f"<div class='hb-name'>{name}</div>"
-            f"<div class='hb-status' style='color:{color};'>"
-            f"{label}{pos_chip}</div>"
-            f"<div class='hb-sub dim'>{sub}</div>"
-            f"</div>"
-        )
-        lb = (hb or {}).get("last_bar_ts")
-        if lb and (last_bar_ts is None or lb > last_bar_ts):
-            last_bar_ts = lb
-
-    bar_age = _ago(last_bar_ts) if last_bar_ts else "—"
-    bar_ct = _ct_str(last_bar_ts) if last_bar_ts else "—"
-    return f"""
-  <header class="topbar">
-    <div class="brand">
-      <span class="title">Acme Futures · New Fleet</span>
-      <span class="dim sub">SHADOW · classic conductor · single position</span>
-    </div>
-    <div class="last-bar">
-      <span class="dim">last bar</span>
-      <span class="mono">{bar_ct}</span>
-      <span class="dim mini">({bar_age})</span>
-    </div>
-  </header>
-  <section class="hb-row">
-    {''.join(pills)}
-  </section>
-"""
-
-
-# ─────────────────────────── live position ──────────────────────────
-
-
-def _render_position_panel(heartbeats: dict[str, dict]) -> str:
-    """Single-position view: which strategy currently holds, side, age.
-
-    The classic conductor arbitrates one position across the fleet, so
-    at most one strategy should report non-flat at any time. If multiple
-    do, surface it as a warning (state desync).
-    """
-    in_pos = [(name, hb) for name, hb in heartbeats.items()
-              if (hb.get("position_state") or "flat") != "flat"]
-
-    if not in_pos:
-        return """
-  <section class="card">
-    <div class="card-title">Live Position</div>
-    <div class="empty">no position held — fleet is flat</div>
-  </section>
-"""
-
-    if len(in_pos) > 1:
-        names = ", ".join(n for n, _ in in_pos)
-        warn = (f"<div class='warn'>⚠ {len(in_pos)} strategies report "
-                f"non-flat — possible state desync: {names}</div>")
-    else:
-        warn = ""
-
-    rows = []
-    for name, hb in in_pos:
-        state = hb.get("position_state", "?")
-        extra = hb.get("extra") or {}
-        contract = extra.get("contract_id") or "MES"
-        rows.append(f"""
-    <div class="pos">
-      <span class="pos-name">{name}</span>
-      <span class="pos-side"
-            style="color:{'#16a34a' if state == 'long' else '#dc2626'};">
-            {state.upper()}</span>
-      <span class="pos-contract dim">{contract}</span>
-      <span class="pos-age mini dim">{_ago(hb.get('ts'))}</span>
-    </div>
-""")
-    return f"""
-  <section class="card">
-    <div class="card-title">Live Position</div>
-    {warn}
-    <div class="pos-list">{''.join(rows)}</div>
-  </section>
-"""
-
-
-# ─────────────────────────── strategy cards ─────────────────────────
+        return ("STALE", "var(--amber)", _ago(ts))
+    return ("OFFLINE", "var(--red2)", _ago(ts))
 
 
 def _strategy_metrics(name: str, strategies: dict, snaps: dict) -> dict[str, Any]:
     s = strategies.get(name) or {}
     sn = snaps.get(name) or {}
     return {
-        "name": name,
-        "state": s.get("state") or "?",
-        "tier": int(s.get("tier") or 2),
-        "score": float(s.get("score") or 0),
+        "name":     name,
+        "state":    s.get("state") or "?",
+        "tier":     int(s.get("tier") or 2),
+        "score":    float(s.get("score") or 0),
         "n_trades": int(sn.get("n_trades") or 0),
-        "net_pnl": float(sn.get("net_pnl") or 0),
+        "net_pnl":  float(sn.get("net_pnl") or 0),
         "win_rate": float(sn.get("win_rate") or 0),
-        "pf": sn.get("profit_factor"),
-        "sharpe": float(sn.get("sharpe") or 0),
-        "dd": float(sn.get("max_drawdown") or 0),
-    }
-
-
-def _compute_metrics_from_closes(
-    closes: list[dict], strategy: str,
-) -> dict[str, Any]:
-    """On-the-fly metrics for a strategy from a (possibly bucket-filtered)
-    list of dry_run_close events. Used when the bucket selector is
-    non-default; avoids the snapshot-vs-bucket mismatch.
-
-    Returns the subset of metrics computable cheaply from closes:
-    n_trades, net_pnl, win_rate, profit_factor. PF / Sharpe / MaxDD
-    that require equity-curve walking are left to the snapshot path."""
-    n = 0
-    net = 0.0
-    wins = 0
-    gross_win = 0.0
-    gross_loss = 0.0
-    for c in closes:
-        if c.get("strategy") != strategy:
-            continue
-        raw = c.get("raw") or {}
-        pnl = float(raw.get("net_pnl") or 0)
-        n += 1
-        net += pnl
-        if pnl > 0:
-            gross_win += pnl
-            wins += 1
-        elif pnl < 0:
-            gross_loss += -pnl
-    if n == 0:
-        return {"n_trades": 0, "net_pnl": 0.0, "win_rate": 0.0,
-                "profit_factor": None}
-    return {
-        "n_trades": n,
-        "net_pnl": net,
-        "win_rate": wins / n,
-        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (
-            float("inf") if gross_win > 0 else None
+        "pf":       sn.get("profit_factor"),
+        "sharpe":   float(sn.get("sharpe") or 0),
+        "dd":       float(sn.get("max_drawdown") or 0),
+        "avg_pnl":  float(sn.get("avg_pnl") or 0) if sn.get("avg_pnl") is not None else (
+            (float(sn.get("net_pnl") or 0) / int(sn["n_trades"]))
+            if sn.get("n_trades") else 0.0
         ),
     }
 
 
-def _render_bucket_selector(current: str, token: str | None) -> str:
-    """Chips at the top — clicking one re-renders the page filtered by
-    that hour set."""
-    token_q = f"&token={token}" if token else ""
-    chips = []
-    for key, b in TIME_BUCKETS.items():
-        active = (key == current) or (current == "all" and key == "all")
-        bg = "#0891b2" if active else "#f1f5f9"
-        color = "white" if active else "var(--dim-1)"
-        chips.append(
-            f"<a class='bucket-chip' "
-            f"style='background:{bg};color:{color};' "
-            f"href='/?bucket={key}{token_q}'>{b['label']}</a>"
-        )
-    return f"""
-  <section class="bucket-bar">
-    <span class="dim mini">filter by hour bucket (CT):</span>
-    {''.join(chips)}
-  </section>
-"""
+# ─────────────────────────── section renderers ──────────────────────
 
 
-def _render_strategy_cards(strategies: dict, snaps: dict,
-                            closes_in_bucket: list[dict] | None = None,
-                            bucket: str = "all") -> str:
-    cards = []
-    use_bucket = (bucket != "all" and closes_in_bucket is not None)
-    for name in FLEET:
-        m = _strategy_metrics(name, strategies, snaps)
-        if use_bucket:
-            # Replace the snapshot-derived metrics with bucket-filtered
-            # ones. State / score stay from the strategies-row source of
-            # truth — those are lifecycle-level, not bucket-level.
-            bm = _compute_metrics_from_closes(closes_in_bucket, name)
-            m["n_trades"] = bm["n_trades"]
-            m["net_pnl"] = bm["net_pnl"]
-            m["win_rate"] = bm["win_rate"]
-            m["pf"] = bm["profit_factor"]
-            # Sharpe / MaxDD can't be recomputed cheaply from closes;
-            # leave the snapshot values in but they'll look stale for
-            # bucket views — caller can ignore.
-        state_bg = _STATE_BG.get(m["state"], "#334155")
-        pnl_color = (
-            "#16a34a" if m["net_pnl"] > 0
-            else "#ef4444" if m["net_pnl"] < 0 else "#e2e8f0"
-        )
-        pf = f"{m['pf']:.2f}" if m["pf"] is not None else "—"
-        cards.append(f"""
-    <div class="strat-card">
-      <div class="strat-head">
-        <span class="strat-name">{name}</span>
-        <span class="pill mini" style="background:{state_bg};color:white;">
-          {m['state']}</span>
-      </div>
-      <div class="strat-pnl mono" style="color:{pnl_color};">
-        {_money(m['net_pnl'])}
-      </div>
-      <div class="strat-stats dim mono">
-        <span>n={m['n_trades']}</span>
-        <span>WR {_pct(m['win_rate'])}</span>
-        <span>PF {pf}</span>
-        <span>SR {m['sharpe']:.2f}</span>
-      </div>
-      <div class="strat-dd mini dim mono">
-        max DD {_money(m['dd'])}
-      </div>
-    </div>
-""")
-    label = TIME_BUCKETS.get(bucket, {}).get("label", "All hours")
-    title_suffix = (
-        f"<span class='dim mini'> · filtered to {label}</span>"
-        if use_bucket else "<span class='dim mini'> · latest snapshot</span>"
+def _render_topbar(heartbeats: dict) -> str:
+    """Topbar: logo + subtitle on the left, last-bar age on the right.
+
+    The logo is rendered as inline SVG (not <img src=>) so it inherits
+    the Google Fonts loaded by the page. Inline SVG also dodges the
+    binary-file-in-git problem — the real PNG-with-wolf-illustration
+    can be saved to web/static/ghost_dog_logo.png and swapped in by
+    replacing this inline <svg>...</svg> block with an <img> tag.
+    """
+    last_bar_ts: str | None = None
+    for hb in heartbeats.values():
+        lb = hb.get("last_bar_ts")
+        if lb and (last_bar_ts is None or lb > last_bar_ts):
+            last_bar_ts = lb
+    last_bar = _ago(last_bar_ts) if last_bar_ts else "—"
+    # Primary logo: PNG file at web/static/ghost_dog_logo.png.
+    # Fallback: inline-SVG wordmark, shown via onerror if the PNG is
+    # missing (so the page never breaks during a deploy ordering issue).
+    fallback_svg = (
+        '<svg class=\\\'logo\\\' viewBox=\\\'0 0 200 60\\\' '
+        'preserveAspectRatio=\\\'xMidYMid meet\\\'>'
+        '<text x=\\\'100\\\' y=\\\'40\\\' text-anchor=\\\'middle\\\' class=\\\'logo-name\\\'>'
+        'GHOST DOG</text>'
+        '<text x=\\\'100\\\' y=\\\'55\\\' text-anchor=\\\'middle\\\' class=\\\'logo-tag\\\'>'
+        'CAPITAL</text></svg>'
+    )
+    logo_html = (
+        '<img src="/static/ghost_dog_logo.png" alt="Ghost Dog Capital" '
+        'class="logo" '
+        f'onerror="this.outerHTML=\'{fallback_svg}\'">'
     )
     return f"""
-  <section class="card">
-    <div class="card-title">Strategy Performance{title_suffix}</div>
-    <div class="strat-grid">{''.join(cards)}</div>
+  <header class="topbar">
+    <div class="brand">
+      {logo_html}
+      <span class="brand-divider"></span>
+      <span class="brand-sub">$50K EVAL · CLASSIC CONDUCTOR · SINGLE POSITION</span>
+    </div>
+    <div class="last-bar">
+      <span class="lb-label">LAST BAR</span>
+      <span class="lb-value">{last_bar}</span>
+    </div>
+  </header>
+"""
+
+
+def _render_ticker_bar(
+    closes_all: list[dict], heartbeats: dict, ks: dict, token: str | None,
+) -> str:
+    """Ticker bar: session metrics + kill-switch controls."""
+    today = _today_session_closes(closes_all)
+    session_pnl = _session_pnl(today)
+    pnl_color = ("var(--green2)" if session_pnl > 0
+                 else "var(--red2)" if session_pnl < 0
+                 else "var(--text2)")
+
+    # MES price — not currently in the heartbeat schema. Show "—" until
+    # the conductor includes it in extras. (Same applies to entry/current
+    # in the active trade panel below.)
+    mes_price = "—"
+
+    # Single-position summary across the fleet.
+    in_pos = [(n, hb) for n, hb in heartbeats.items()
+              if (hb.get("position_state") or "flat") != "flat"]
+    if not in_pos:
+        position = "FLAT"
+        pos_color = "var(--text3)"
+    else:
+        name, hb = in_pos[0]
+        side = (hb.get("position_state") or "?").upper()
+        position = f"{side} MES"
+        pos_color = "var(--green2)" if side == "LONG" else "var(--red2)"
+
+    remaining = EVAL_TARGET - session_pnl
+    avg = _avg_daily_pnl(closes_all)
+    if remaining <= 0:
+        days_est = "DONE"
+    elif avg > 0:
+        days_est = str(ceil(remaining / avg))
+    else:
+        days_est = "—"
+
+    token_q = f"&token={token}" if token else ""
+    if ks.get("active"):
+        ks_status = '<span class="ticker-badge ks-active">● KILL ACTIVE</span>'
+        ks_button = (
+            f'<a href="/kill-switch?action=clear{token_q}" '
+            f'class="ticker-btn ks-resume" '
+            f'onclick="return confirm(\'Clear the kill switch and resume trading?\');">'
+            f'RESUME</a>'
+        )
+    else:
+        ks_status = '<span class="ticker-badge ks-armed">● ARMED</span>'
+        ks_button = (
+            f'<a href="/kill-switch?action=activate{token_q}" '
+            f'class="ticker-btn ks-flat" '
+            f'onclick="return confirm(\'EMERGENCY FLAT — force-close ALL positions immediately. '
+            f'Are you sure?\');">'
+            f'⬛ EMERGENCY FLAT</a>'
+        )
+
+    items = [
+        ("SESSION P&amp;L", f'<span style="color:{pnl_color}">{_money(session_pnl)}</span>'),
+        ("MES",             mes_price),
+        ("POSITION",        f'<span style="color:{pos_color}">{position}</span>'),
+        ("EVAL TARGET",     _money(EVAL_TARGET)),
+        ("REMAINING",       _money(remaining)),
+        ("EST. DAYS",       days_est),
+    ]
+    items_html = "".join(
+        f'<div class="ticker-item">'
+        f'<span class="ticker-label">{label}</span>'
+        f'<span class="ticker-value">{value}</span>'
+        f'</div>'
+        for label, value in items
+    )
+    return f"""
+  <section class="ticker">
+    <div class="ticker-items">{items_html}</div>
+    <div class="ticker-actions">{ks_status}{ks_button}</div>
   </section>
 """
 
 
-# ─────────────────────────── promotion gate ─────────────────────────
+def _render_mll_tracker(closes_all: list[dict]) -> str:
+    """3-column MLL/DLL tracker with progress bars. Session-only math —
+    DLL distance is intraday-loss vs $1K, MLL distance is intraday peak-
+    to-trough drawdown vs $2K."""
+    todays = _today_session_closes(closes_all)
+    pnls: list[float] = []
+    for c in sorted(todays, key=lambda r: r.get("occurred_at") or ""):
+        raw = c.get("raw") or {}
+        pnls.append(float(raw.get("net_pnl") or 0.0))
+    session_pnl = sum(pnls)
+
+    running = peak = max_dd = 0.0
+    for p in pnls:
+        running += p
+        peak = max(peak, running)
+        max_dd = max(max_dd, peak - running)
+
+    intraday_loss = max(0.0, -session_pnl) if session_pnl < 0 else 0.0
+    dll_distance  = max(0.0, _TOPSTEP_DLL - intraday_loss)
+    mll_distance  = max(0.0, _TOPSTEP_MLL - max_dd)
+
+    pnl_color = ("var(--green2)" if session_pnl > 0
+                 else "var(--red2)" if session_pnl < 0
+                 else "var(--text2)")
+    dll_used_frac = intraday_loss / _TOPSTEP_DLL if _TOPSTEP_DLL else 0
+    mll_used_frac = max_dd / _TOPSTEP_MLL if _TOPSTEP_MLL else 0
+    dll_color = _mll_band_color(dll_used_frac)
+    mll_color = _mll_band_color(mll_used_frac)
+    dll_fill_pct = min(100.0, dll_used_frac * 100)
+    mll_fill_pct = min(100.0, mll_used_frac * 100)
+    pnl_fill_pct = min(100.0, abs(session_pnl) / EVAL_TARGET * 100)
+
+    return f"""
+  <section class="mll-tracker">
+    <div class="mll-card">
+      <div class="mll-label">SESSION P&amp;L</div>
+      <div class="mll-num" style="color:{pnl_color};">{_money(session_pnl)}</div>
+      <div class="mll-sub">{len(pnls)} closed today</div>
+      <div class="mll-bar"><div class="mll-fill"
+           style="width:{pnl_fill_pct:.1f}%;background:{pnl_color};"></div></div>
+    </div>
+    <div class="mll-card">
+      <div class="mll-label">DAILY LOSS LIMIT  ·  ${_TOPSTEP_DLL:,.0f}</div>
+      <div class="mll-num" style="color:{dll_color};">{_money(dll_distance)}</div>
+      <div class="mll-sub">intraday loss {_money(intraday_loss)}</div>
+      <div class="mll-bar"><div class="mll-fill"
+           style="width:{dll_fill_pct:.1f}%;background:{dll_color};"></div></div>
+    </div>
+    <div class="mll-card">
+      <div class="mll-label">TRAILING MLL  ·  ${_TOPSTEP_MLL:,.0f}</div>
+      <div class="mll-num" style="color:{mll_color};">{_money(mll_distance)}</div>
+      <div class="mll-sub">peak-to-trough today {_money(max_dd)}</div>
+      <div class="mll-bar"><div class="mll-fill"
+           style="width:{mll_fill_pct:.1f}%;background:{mll_color};"></div></div>
+    </div>
+  </section>
+"""
 
 
-def _render_promotion_gate(strategies: dict) -> str:
-    rows = []
+def _render_active_trade(heartbeats: dict) -> str:
+    """6-column active-trade panel. Only renders when any keeper reports
+    a non-flat position. Entry/current/unrealized/trail-stop are placeholders
+    until the heartbeat schema is enriched — see module docstring."""
+    in_pos = [(n, hb) for n, hb in heartbeats.items()
+              if (hb.get("position_state") or "flat") != "flat"]
+    if not in_pos:
+        return """
+  <section class="active-trade flat">
+    <div class="at-label">ACTIVE TRADE</div>
+    <div class="at-empty">NO ACTIVE POSITION</div>
+  </section>
+"""
+
+    # If multiple strategies are non-flat (shouldn't happen on the classic
+    # conductor — single position), show the most recent only and surface
+    # a warning in the badge area.
+    in_pos.sort(key=lambda x: x[1].get("ts") or "", reverse=True)
+    name, hb = in_pos[0]
+    side = (hb.get("position_state") or "?").upper()
+    extras = hb.get("extra") or {}
+    contract = extras.get("contract_id") or "MES"
+    side_color = "var(--green2)" if side == "LONG" else "var(--red2)"
+    meta = STRATEGY_META.get(name, {})
+    label = meta.get("label", name.upper())
+
+    warn = ""
+    if len(in_pos) > 1:
+        others = ", ".join(n for n, _ in in_pos[1:])
+        warn = (f'<span class="at-warn">⚠ {len(in_pos)} non-flat: '
+                f'{name} + {others}</span>')
+
+    cells = [
+        ("STRATEGY",   label,                                "value"),
+        ("SIDE",       f'<span style="color:{side_color};">{side}</span>',  "value"),
+        ("ENTRY",      "—",                                  "value muted"),
+        ("CURRENT",    "—",                                  "value muted"),
+        ("UNREALIZED", "—",                                  "value muted"),
+        ("TRAIL STOP", '<span style="color:var(--gold2);">—</span>', "value"),
+    ]
+    cells_html = "".join(
+        f'<div class="at-cell">'
+        f'<span class="at-cell-label">{label}</span>'
+        f'<span class="at-cell-{cls}">{val}</span>'
+        f'</div>'
+        for label, val, cls in cells
+    )
+    return f"""
+  <section class="active-trade">
+    <div class="at-head">
+      <span class="at-label">ACTIVE TRADE  ·  {contract}</span>
+      {warn}
+    </div>
+    <div class="at-grid">{cells_html}</div>
+  </section>
+"""
+
+
+def _render_strategy_cards(heartbeats: dict, strategies: dict, snaps: dict) -> str:
+    """3-card strategy grid. Background tint scales with each card's net
+    P&L vs the fleet max (per _card_bg). Top 3px accent bar is per-
+    strategy. Racing silk in the head is a small color-coded badge."""
+    metrics = {name: _strategy_metrics(name, strategies, snaps) for name in FLEET}
+    all_nets = [metrics[name]["net_pnl"] for name in FLEET]
+    cards = []
     for name in FLEET:
-        s = strategies.get(name) or {}
-        score = float(s.get("score") or 0)
-        state = s.get("state") or "?"
-        # Distance bar: 0 → 1 progress toward PILOT, then 1 → 2 toward LIVE.
-        if score < PILOT_THRESHOLD:
-            pct = (score / PILOT_THRESHOLD) * 50
-            tgt = f"to PILOT (≥{PILOT_THRESHOLD:.2f}): +{(PILOT_THRESHOLD-score):.3f}"
-            color = "#3b82f6"
-        elif score < LIVE_THRESHOLD:
-            pct = 50 + ((score - PILOT_THRESHOLD) /
-                        (LIVE_THRESHOLD - PILOT_THRESHOLD)) * 50
-            tgt = f"to LIVE (≥{LIVE_THRESHOLD:.2f}): +{(LIVE_THRESHOLD-score):.3f}"
-            color = "#0891b2"
+        m = metrics[name]
+        meta = STRATEGY_META[name]
+        bg = _card_bg(m["net_pnl"], all_nets)
+
+        hb = heartbeats.get(name) or {}
+        pos_state = (hb.get("position_state") or "flat").lower()
+        if pos_state != "flat":
+            dot_color = "var(--green2)"
+            status = f"LIVE · {pos_state.upper()} 1c"
         else:
-            pct = 100
-            tgt = "LIVE-eligible"
-            color = "#16a34a"
-        pct = max(0, min(100, pct))
-        rows.append(f"""
-    <div class="gate-row">
-      <span class="gate-name">{name}</span>
-      <span class="gate-state pill mini"
-            style="background:{_STATE_BG.get(state,'#334155')};color:white;">
-            {state}</span>
-      <div class="gate-bar"><div class="gate-fill"
-           style="width:{pct:.0f}%;background:{color};"></div></div>
-      <span class="gate-score mono">{score:.3f}</span>
-      <span class="gate-target dim mini">{tgt}</span>
+            dot_color = "var(--text3)"
+            status = "FLAT"
+
+        # Lifecycle badge — score-derived rather than literal `state` because
+        # the score is the load-bearing field for the promotion ladder.
+        if m["score"] >= LIVE_THRESHOLD:
+            badge_label, badge_bg = "LIVE-ELIGIBLE", "var(--green)"
+        elif m["score"] >= PILOT_THRESHOLD:
+            badge_label, badge_bg = "PILOT", "var(--gold)"
+        else:
+            badge_label, badge_bg = "SHADOW", "var(--surface2)"
+
+        pnl_color = ("var(--green2)" if m["net_pnl"] > 0
+                     else "var(--red2)" if m["net_pnl"] < 0
+                     else "var(--text2)")
+        pf_str = f"{m['pf']:.2f}" if m["pf"] is not None else "—"
+
+        cards.append(f"""
+    <div class="strat-card" style="background:{bg};border-top-color:{meta['accent']};">
+      <div class="strat-head">
+        <div class="strat-head-left">
+          <div class="silk {meta['silk']}"></div>
+          <span class="strat-name">{meta['label']}</span>
+        </div>
+        <span class="strat-badge"
+              style="background:{badge_bg};color:var(--text);">{badge_label}</span>
+      </div>
+      <div class="strat-pnl" style="color:{pnl_color};">{_money(m['net_pnl'])}</div>
+      <div class="strat-stats">
+        <span class="ss-row">
+          <span class="ss-k">n=</span><span class="ss-v">{m['n_trades']}</span>
+          <span class="ss-k">WR=</span><span class="ss-v">{_pct(m['win_rate'])}</span>
+          <span class="ss-k">PF=</span><span class="ss-v">{pf_str}</span>
+        </span>
+        <span class="ss-row">
+          <span class="ss-k">max DD</span><span class="ss-v">{_money(m['dd'])}</span>
+          <span class="ss-k">avg</span><span class="ss-v">{_money(m['avg_pnl'])}</span>
+        </span>
+      </div>
+      <div class="strat-foot">
+        <span class="live-dot" style="background:{dot_color};"></span>
+        <span class="strat-status">{status}</span>
+        <span class="strat-window">{meta['window']}</span>
+      </div>
     </div>
 """)
     return f"""
-  <section class="card">
-    <div class="card-title">Promotion Gate
-      <span class="dim mini">PILOT ≥ {PILOT_THRESHOLD} · LIVE ≥ {LIVE_THRESHOLD}</span>
-    </div>
-    <div class="gate-list">{''.join(rows)}</div>
+  <section class="strat-grid">
+    {''.join(cards)}
   </section>
 """
 
 
-# ─────────────────────────── hour-of-day heatmap ────────────────────
-
-
-def _bucket_closes_by_hour(closes: list[dict]) -> dict[int, dict[str, float]]:
-    """Returns {hour_ct: {n, net_pnl}} aggregated across the fleet."""
-    out: dict[int, dict[str, float]] = defaultdict(
+def _render_hour_grid(closes: list[dict]) -> str:
+    """24-hour P&L grid laid out as two rows of 12. Cells colored by
+    aggregate P&L sign; current CT hour gets the amber 'live' treatment."""
+    buckets: dict[int, dict[str, float]] = defaultdict(
         lambda: {"n": 0.0, "net_pnl": 0.0}
     )
     for c in closes:
@@ -690,452 +658,704 @@ def _bucket_closes_by_hour(closes: list[dict]) -> dict[int, dict[str, float]]:
         except Exception:
             continue
         raw = c.get("raw") or {}
-        pnl = float(raw.get("net_pnl") or 0)
-        out[d.hour]["n"] += 1
-        out[d.hour]["net_pnl"] += pnl
-    return dict(out)
+        buckets[d.hour]["n"] += 1
+        buckets[d.hour]["net_pnl"] += float(raw.get("net_pnl") or 0)
 
+    current_hour = datetime.now(UTC).astimezone(CT).hour
 
-def _render_hour_heatmap(closes: list[dict], selected_bucket: str = "all") -> str:
-    """Always shows all 24 hours. The selected bucket gets a stronger
-    border treatment so you can see which hours your filter covers."""
-    buckets = _bucket_closes_by_hour(closes)
-    selected_hours = _bucket_hours(selected_bucket) or set()
-    if not buckets:
-        return """
-  <section class="card">
-    <div class="card-title">Hour-of-day P&amp;L
-      <span class="dim mini">audit §2 reference: 03–05 CT, 08–09 CT win</span>
-    </div>
-    <div class="empty">no closed trades yet</div>
-  </section>
-"""
-    # Determine min/max for color scaling
-    pnls = [v["net_pnl"] for v in buckets.values()]
-    max_abs = max((abs(p) for p in pnls), default=1.0) or 1.0
-
-    cells = []
-    for h in range(24):
+    def cell(h: int) -> str:
         v = buckets.get(h)
+        label = f"{h:02d}"
+        if h == current_hour:
+            return (f'<div class="hh-cell hh-live" title="{h:02d}:00 CT — live">'
+                    f'<span class="hh-hour">{label}</span>'
+                    f'<span class="hh-val">live</span>'
+                    f'</div>')
         if v is None or v["n"] == 0:
-            cells.append(
-                f"<div class='hh-cell empty' title='{h:02d}:00 CT — no trades'>"
-                f"<div class='hh-hour'>{h:02d}</div>"
-                f"<div class='hh-pnl dim'>—</div>"
-                f"</div>"
-            )
-            continue
-        intensity = min(1.0, abs(v["net_pnl"]) / max_abs)
-        if v["net_pnl"] > 0:
-            bg = f"rgba(22,163,74,{0.10 + 0.60*intensity:.2f})"
-        elif v["net_pnl"] < 0:
-            bg = f"rgba(220,38,38,{0.10 + 0.60*intensity:.2f})"
-        else:
-            bg = "transparent"
-        # Audit-winning hours get a green border accent; selected bucket
-        # gets a yellow halo (rendered as a wider border via box-shadow).
-        win_hours = {3, 4, 8, 9, 17}
-        loss_hours = {11, 12, 13, 14, 15}
-        border = "#16a34a" if h in win_hours else (
-            "#dc2626" if h in loss_hours else "transparent")
-        halo = ("box-shadow: 0 0 0 2px #fbbf24 inset;"
-                if h in selected_hours else "")
-        n_cell = int(v["n"])
-        pnl_cell = v["net_pnl"]
-        title = f"{h:02d}:00 CT — n={n_cell} net=${pnl_cell:.2f}"
-        cells.append(
-            f"<div class='hh-cell' style='background:{bg};border-color:{border};{halo}' "
-            f"title='{title}'>"
-            f"<div class='hh-hour'>{h:02d}</div>"
-            f"<div class='hh-pnl mono'>{_money(pnl_cell)}</div>"
-            f"<div class='hh-n dim mini'>n={n_cell}</div>"
-            f"</div>"
-        )
+            return (f'<div class="hh-cell hh-empty" title="{h:02d}:00 CT — no trades">'
+                    f'<span class="hh-hour">{label}</span>'
+                    f'<span class="hh-val">—</span>'
+                    f'</div>')
+        pnl = v["net_pnl"]
+        cls = "hh-pos" if pnl > 0 else "hh-neg" if pnl < 0 else "hh-empty"
+        title = f'{h:02d}:00 CT — n={int(v["n"])} net={_money(pnl)}'
+        return (f'<div class="hh-cell {cls}" title="{title}">'
+                f'<span class="hh-hour">{label}</span>'
+                f'<span class="hh-val">{_money(pnl)}</span>'
+                f'</div>')
+
+    row1 = "".join(cell(h) for h in range(0, 12))
+    row2 = "".join(cell(h) for h in range(12, 24))
     return f"""
-  <section class="card">
-    <div class="card-title">Hour-of-day P&amp;L (CT)
-      <span class="dim mini">green border = audit-winning hours · red = audit-losing</span>
-    </div>
-    <div class="hh-grid">{''.join(cells)}</div>
+  <section class="hh-section">
+    <div class="hh-head">HOUR-OF-DAY P&amp;L  ·  CT</div>
+    <div class="hh-row">{row1}</div>
+    <div class="hh-row">{row2}</div>
   </section>
 """
 
 
-# ─────────────────────────── bars-held distribution ─────────────────
-
-
-_BARS_BUCKETS = [
-    ("1", lambda b: b == 1),
-    ("2", lambda b: b == 2),
-    ("3", lambda b: b == 3),
-    ("4-6", lambda b: 4 <= b <= 6),
-    ("7-10", lambda b: 7 <= b <= 10),
-    ("11+", lambda b: b >= 11),
-]
-
-
-def _bars_held_for(close_row: dict) -> int | None:
-    raw = close_row.get("raw") or {}
-    mins = raw.get("bars_held_minutes")
-    if mins is None:
-        return None
-    # 2-min bars
-    return max(1, int(round(int(mins) / 2)))
-
-
-def _render_bars_held(closes: list[dict]) -> str:
-    """Histogram of bars_held per strategy. The audit's load-bearing
-    finding: 1-bar exits destroy P&L (PF 0.18); ≥2-bar holds win
-    (PF 6.14). Watch IGNITION/REGIME closely to see whether the min-2
-    rule is actually keeping bar-1 exits out of the data."""
-    by_strat: dict[str, dict[str, int]] = defaultdict(
-        lambda: {b[0]: 0 for b in _BARS_BUCKETS}
-    )
-    totals: dict[str, int] = defaultdict(int)
-    no_bars_held = 0
-    for c in closes:
-        name = c.get("strategy") or "?"
-        if name not in FLEET:
-            continue
-        bh = _bars_held_for(c)
-        if bh is None:
-            no_bars_held += 1
-            continue
-        for bucket_name, fn in _BARS_BUCKETS:
-            if fn(bh):
-                by_strat[name][bucket_name] += 1
-                totals[name] += 1
-                break
-
-    if not totals:
-        return """
-  <section class="card">
-    <div class="card-title">Bars-held Distribution
-      <span class="dim mini">audit §3: keep 1-bar bucket near zero</span>
-    </div>
-    <div class="empty">waiting for closed trades…</div>
-  </section>
-"""
-
-    cols = []
+def _render_recent_closes(closes: list[dict], heartbeats: dict, limit: int = 20) -> str:
+    """Recent closes table with an optional 'open' row at the top for
+    any currently active position."""
+    open_rows = []
     for name in FLEET:
-        if totals.get(name, 0) == 0:
-            cols.append(f"""
-    <div class="bh-col empty">
-      <div class="bh-name">{name}</div>
-      <div class="dim mini">no trades</div>
-    </div>
-""")
+        hb = heartbeats.get(name) or {}
+        pos = (hb.get("position_state") or "flat").lower()
+        if pos == "flat":
             continue
-        bars = []
-        for bucket_name, _ in _BARS_BUCKETS:
-            count = by_strat[name][bucket_name]
-            pct = count / totals[name] * 100
-            # Bar-1 is highlighted red as the audit's anti-pattern
-            color = "#ef4444" if bucket_name == "1" else "#3b82f6"
-            label = f"{bucket_name}: {count}" if count else ""
-            bars.append(
-                f"<div class='bh-bar'>"
-                f"<div class='bh-fill' style='height:{pct:.0f}%;background:{color};'>"
-                f"</div>"
-                f"<div class='bh-label dim mini'>{label}</div>"
-                f"</div>"
-            )
-        bar1_pct = by_strat[name]["1"] / totals[name] * 100
-        warn = ("⚠ " if bar1_pct > 20 else "") + f"{bar1_pct:.0f}% bar-1"
-        warn_color = "#ef4444" if bar1_pct > 20 else "#94a3b8"
-        cols.append(f"""
-    <div class="bh-col">
-      <div class="bh-name">{name}</div>
-      <div class="bh-bars">{''.join(bars)}</div>
-      <div class="bh-warn mini" style="color:{warn_color};">{warn}</div>
-      <div class="dim mini">n={totals[name]}</div>
-    </div>
+        meta = STRATEGY_META.get(name, {})
+        accent = meta.get("accent", "var(--text2)")
+        label = meta.get("label", name.upper())
+        side_color = "var(--green2)" if pos == "long" else "var(--red2)"
+        open_rows.append(f"""
+        <tr class="rc-row rc-open">
+          <td class="rc-time">{_ct_str(hb.get('ts'))}</td>
+          <td><span class="rc-tag" style="border-color:{accent};color:{accent};">
+            {label}</span></td>
+          <td class="rc-price">— → —</td>
+          <td><span class="rc-outcome rc-outcome-open">open</span></td>
+          <td class="rc-held">—</td>
+          <td class="rc-pnl" style="color:{side_color};">{pos.upper()}</td>
+        </tr>
 """)
-    note = ""
-    if no_bars_held:
-        note = (f'<div class="dim mini" style="margin-top:8px;">'
-                f'{no_bars_held} older closes lack bars_held_minutes — '
-                f'new field added 2026-05-11; pre-existing rows will not '
-                f'show here.</div>')
-    return f"""
-  <section class="card">
-    <div class="card-title">Bars-held Distribution
-      <span class="dim mini">audit §3: keep bar-1 exits below 20%</span>
-    </div>
-    <div class="bh-grid">{''.join(cols)}</div>
-    {note}
-  </section>
-"""
 
-
-# ─────────────────────────── recent trades ──────────────────────────
-
-
-def _render_recent_trades(closes: list[dict], limit: int = 20) -> str:
-    if not closes:
-        return """
-  <section class="card">
-    <div class="card-title">Recent Closes</div>
-    <div class="empty">waiting for first dry_run_close…</div>
-  </section>
-"""
     rows = []
     for c in closes[:limit]:
         raw = c.get("raw") or {}
         net = float(raw.get("net_pnl") or 0)
-        pnl_color = "#16a34a" if net > 0 else "#ef4444" if net < 0 else "#94a3b8"
-        outcome = raw.get("outcome") or "?"
+        pnl_color = ("var(--green2)" if net > 0
+                     else "var(--red2)" if net < 0
+                     else "var(--text2)")
+        outcome = (raw.get("outcome") or "?").lower()
+        if "target" in outcome or net > 0 and outcome != "force_close_session":
+            oc_class = "rc-outcome-target"
+        elif "stop" in outcome:
+            oc_class = "rc-outcome-stop"
+        else:
+            oc_class = "rc-outcome-flat"
         bh_m = raw.get("bars_held_minutes")
         bh_str = f"{int(bh_m)//2}b" if bh_m else "—"
+        strat = c.get("strategy") or "?"
+        meta = STRATEGY_META.get(strat, {})
+        accent = meta.get("accent", "var(--text2)")
+        label = meta.get("label", strat.upper())
+        entry = raw.get("entry_price")
+        exit_p = raw.get("exit_price")
+        price_str = (f'{entry} → {exit_p}'
+                     if entry is not None and exit_p is not None else "—")
         rows.append(f"""
-      <tr>
-        <td class="mono dim">{_ct_str(c.get('occurred_at'))}</td>
-        <td><strong>{c.get('strategy') or '?'}</strong></td>
-        <td class="mono">{raw.get('entry_price') or '—'} → {raw.get('exit_price') or '—'}</td>
-        <td>{outcome}</td>
-        <td class="mono dim">{bh_str}</td>
-        <td class="mono" style="color:{pnl_color};text-align:right;">
-          {_money(net)}</td>
+      <tr class="rc-row">
+        <td class="rc-time">{_ct_str(c.get('occurred_at'))}</td>
+        <td><span class="rc-tag" style="border-color:{accent};color:{accent};">
+          {label}</span></td>
+        <td class="rc-price">{price_str}</td>
+        <td><span class="rc-outcome {oc_class}">{outcome}</span></td>
+        <td class="rc-held">{bh_str}</td>
+        <td class="rc-pnl" style="color:{pnl_color};">{_money(net)}</td>
       </tr>
 """)
+
+    if not rows and not open_rows:
+        body = ('<tr><td colspan="6" class="rc-empty">'
+                'waiting for first close…</td></tr>')
+    else:
+        body = "".join(open_rows) + "".join(rows)
+
     return f"""
-  <section class="card">
-    <div class="card-title">Recent Closes
-      <span class="dim mini">most recent {limit}</span>
-    </div>
-    <table class="recent">
-      <thead><tr>
-        <th>time</th><th>strategy</th><th>price</th>
-        <th>outcome</th><th>held</th><th style="text-align:right;">net P&amp;L</th>
-      </tr></thead>
-      <tbody>{''.join(rows)}</tbody>
+  <section class="rc-section">
+    <div class="rc-head">RECENT CLOSES  ·  most recent {limit}</div>
+    <table class="rc-table">
+      <thead>
+        <tr>
+          <th>TIME</th><th>STRATEGY</th><th>PRICE</th>
+          <th>OUTCOME</th><th>HELD</th><th class="rc-pnl-col">NET P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody>{body}</tbody>
     </table>
   </section>
 """
 
 
-# ─────────────────────────── CSS + page shell ───────────────────────
+def _render_footer() -> str:
+    return """
+  <footer class="footer">
+    <span class="ft-left">Ghost Dog Capital · Fleet v4.0</span>
+    <span class="ft-right">supabase live · auto-refresh 10s</span>
+  </footer>
+"""
+
+
+# ─────────────────────────── CSS ────────────────────────────────────
 
 
 _CSS = """
 :root {
-  --bg: #ffffff;
-  --card: #f8fafc;
-  --border: #e2e8f0;
-  --text: #0f172a;
-  --dim-1: #475569;
-  --dim-2: #94a3b8;
-  --pos: #15803d;
-  --neg: #b91c1c;
-  --warn: #d97706;
+  --bg: #2A2825;
+  --bg2: #232220;
+  --bg3: #1E1D1B;
+  --surface: #323028;
+  --surface2: #3A3835;
+  --border: #4A4740;
+  --border2: #5A5750;
+  --text: #E8E2D6;
+  --text2: #B8B0A0;
+  --text3: #7A7268;
+  --green: #4A8C3F;
+  --green2: #6BAE60;
+  --greenl: rgba(74,140,63,0.15);
+  --red: #8C3A2E;
+  --red2: #B85A4A;
+  --redl: rgba(140,58,46,0.15);
+  --gold: #8C6A1A;
+  --gold2: #C49A30;
+  --amber: #C4801A;
+  --amberl: rgba(196,128,26,0.15);
 }
+
 * { box-sizing: border-box; }
+
 body {
-  margin: 0; padding: 16px; max-width: 1280px; margin-left: auto;
-  margin-right: auto; background: var(--bg); color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  font-size: 14px;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Barlow Condensed', 'Inter', -apple-system, sans-serif;
+  font-size: 13px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
-.dim { color: var(--dim-1); }
-.mini { font-size: 11px; }
-.mono { font-family: 'SF Mono', Menlo, monospace; }
-.empty { padding: 18px; text-align: center; color: var(--dim-2); }
-.warn { color: #f59e0b; padding: 6px 0; font-size: 12px; }
 
+.page {
+  flex: 1;
+  max-width: 1480px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 0 16px;
+}
+
+/* ── Topbar ─────────────────────────────────────────────────────── */
 .topbar {
-  display: flex; justify-content: space-between; align-items: baseline;
-  padding-bottom: 12px; margin-bottom: 12px;
-  border-bottom: 1px solid var(--border);
+  background: var(--bg3);
+  border-bottom: 3px solid var(--gold2);
+  height: 56px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 20px;
+  margin: 0 -16px 0 -16px;
 }
-.brand .title { font-weight: 600; font-size: 16px; }
-.brand .sub { margin-left: 10px; font-size: 11px; }
-.last-bar { font-size: 12px; }
-.last-bar .mono { margin: 0 6px; }
-
-.hb-row {
-  display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;
+.brand { display: flex; align-items: center; gap: 14px; }
+.brand .logo {
+  height: 44px;
+  width: auto;
+  display: block;
 }
-.hb-pill {
-  flex: 1; min-width: 140px; padding: 8px 12px;
-  background: var(--card); border: 2px solid var(--border); border-radius: 6px;
+/* Inline-SVG <text> elements — fonts inherited from page CSS. */
+.logo-name {
+  font-family: 'Bebas Neue', 'Anton', 'Impact', 'Arial Black', sans-serif;
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 2.5px;
+  fill: var(--text);
 }
-.hb-name { font-weight: 600; font-size: 13px; }
-.hb-status { font-weight: 700; font-size: 12px; margin-top: 2px; }
-.hb-sub { margin-top: 2px; }
-
-.card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 8px; padding: 14px; margin-bottom: 14px;
+.logo-tag {
+  font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 8px;
+  fill: var(--text);
 }
-.card-title { font-weight: 600; margin-bottom: 10px; font-size: 13px; }
-.card-title .dim { font-weight: 400; margin-left: 6px; }
-
-.pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
-        font-size: 11px; font-weight: 600; }
-
-.pos-list { display: flex; flex-direction: column; gap: 6px; }
-.pos { display: flex; gap: 12px; align-items: baseline; padding: 6px 0; }
-.pos-name { font-weight: 600; }
-.pos-side { font-weight: 700; font-size: 13px; }
-.pos-contract { font-size: 11px; }
-
-.strat-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+.brand-divider {
+  width: 1px;
+  height: 32px;
+  background: var(--border2);
+}
+.brand-sub {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text2);
+  text-transform: uppercase;
+}
+.last-bar {
+  display: flex;
+  align-items: center;
   gap: 10px;
 }
-.strat-card {
-  background: #ffffff; border: 1px solid var(--border);
-  border-radius: 6px; padding: 10px 12px;
+.lb-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--text3);
+  text-transform: uppercase;
 }
-.strat-head { display: flex; justify-content: space-between; align-items: center;
-              margin-bottom: 6px; }
-.strat-name { font-weight: 600; }
-.strat-pnl { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
-.strat-stats { display: flex; gap: 10px; font-size: 11px; }
-
-.gate-list { display: flex; flex-direction: column; gap: 8px; }
-.gate-row {
-  display: grid; grid-template-columns: 90px 70px 1fr 60px 1fr;
-  gap: 10px; align-items: center;
+.lb-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  color: var(--text);
 }
-.gate-bar { background: #f1f5f9; border-radius: 999px;
-            height: 6px; overflow: hidden; }
-.gate-fill { height: 100%; border-radius: 999px; transition: width 0.3s; }
-.gate-score { text-align: right; font-weight: 700; }
-.gate-target { text-align: left; }
 
-.hh-grid {
-  display: grid; grid-template-columns: repeat(12, 1fr);
-  gap: 4px;
+/* ── Ticker bar ─────────────────────────────────────────────────── */
+.ticker {
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  height: 32px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 20px;
+  margin: 0 -16px 16px -16px;
 }
-.hh-cell {
-  border: 1px solid transparent; border-radius: 4px; padding: 6px 4px;
-  text-align: center; font-size: 11px; min-height: 56px;
-  display: flex; flex-direction: column; justify-content: center;
+.ticker-items { display: flex; gap: 24px; align-items: center; }
+.ticker-item { display: flex; align-items: baseline; gap: 6px; }
+.ticker-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  text-transform: uppercase;
 }
-.hh-cell.empty { opacity: 0.4; }
-.hh-hour { font-weight: 700; margin-bottom: 2px; }
-.hh-pnl { font-size: 10px; }
-.hh-n { font-size: 9px; margin-top: 2px; }
-
-.bh-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; }
-.bh-col { text-align: center; }
-.bh-col.empty { opacity: 0.5; }
-.bh-name { font-weight: 600; margin-bottom: 6px; }
-.bh-bars { display: flex; gap: 4px; height: 80px; align-items: flex-end;
-           border-bottom: 1px solid var(--border); }
-.bh-bar { flex: 1; display: flex; flex-direction: column; height: 100%;
-          justify-content: flex-end; gap: 2px; }
-.bh-fill { width: 100%; border-radius: 2px 2px 0 0; min-height: 1px; }
-.bh-label { line-height: 1.1; height: 24px; }
-.bh-warn { margin-top: 6px; font-weight: 600; }
-
-.bucket-bar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
-              margin-bottom: 14px; }
-.bucket-bar > span:first-child { margin-right: 4px; }
-.bucket-chip {
-  padding: 4px 10px; border-radius: 999px; font-size: 11px;
-  text-decoration: none; font-weight: 600; border: 1px solid var(--border);
+.ticker-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: var(--text);
+  font-weight: 500;
+}
+.ticker-actions { display: flex; align-items: center; gap: 10px; }
+.ticker-badge {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 3px 8px;
+  border-radius: 3px;
+}
+.ks-armed  { background: rgba(107,174,96,0.12); color: var(--green2); }
+.ks-active { background: rgba(184,90,74,0.18);  color: var(--red2); }
+.ticker-btn {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 4px 10px;
+  border-radius: 3px;
+  text-decoration: none;
+  border: 1px solid;
   transition: background 0.15s;
 }
-.bucket-chip:hover { background: #e2e8f0 !important; }
-
-.recent { width: 100%; border-collapse: collapse; font-size: 12px; }
-/* ── Kill switch ────────────────────────────────────────────────── */
-.kill-switch-row {
-  display: grid; grid-template-columns: 1fr 2fr;
-  gap: 12px; margin-bottom: 16px; align-items: stretch;
-}
-.ks-status {
-  padding: 12px 16px; border-radius: 8px; font-weight: 700;
-  display: flex; flex-direction: column; gap: 4px;
-}
-.ks-status-label { font-size: 13px; letter-spacing: 0.4px; }
-.ks-action { display: flex; align-items: stretch; }
-.ks-btn {
-  flex: 1; display: flex; align-items: center; justify-content: center;
-  padding: 14px 20px; border-radius: 8px; text-decoration: none;
-  font-weight: 700; font-size: 14px; letter-spacing: 0.6px;
-  transition: opacity 0.15s, transform 0.05s;
-}
-.ks-btn:active { transform: scale(0.99); }
-.ks-btn-flat {
-  background: #b91c1c; color: white; border: 2px solid #991b1b;
-}
-.ks-btn-flat:hover { background: #991b1b; }
-.ks-btn-resume {
-  background: #15803d; color: white; border: 2px solid #166534;
-}
-.ks-btn-resume:hover { background: #166534; }
+.ks-flat   { color: var(--red2); border-color: var(--red); }
+.ks-flat:hover   { background: rgba(184,90,74,0.15); }
+.ks-resume { color: var(--green2); border-color: var(--green); }
+.ks-resume:hover { background: rgba(107,174,96,0.15); }
 
 /* ── MLL tracker ────────────────────────────────────────────────── */
 .mll-tracker {
-  display: grid; grid-template-columns: repeat(3, 1fr);
-  gap: 10px; margin-bottom: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  margin-bottom: 16px;
 }
 .mll-card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 8px; padding: 12px 14px;
+  background: var(--surface);
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
-.mll-label { letter-spacing: 0.5px; }
+.mll-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  text-transform: uppercase;
+}
 .mll-num {
-  font-size: 26px; font-weight: 700; margin: 4px 0 2px;
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 26px;
+  letter-spacing: 1px;
+  line-height: 1.1;
 }
-.mll-sub { font-size: 11px; }
+.mll-sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: var(--text3);
+}
+.mll-bar {
+  height: 2px;
+  background: var(--bg3);
+  margin-top: 4px;
+}
+.mll-fill {
+  height: 100%;
+  transition: width 0.3s ease;
+}
 
-.recent th { text-align: left; padding: 4px 8px; color: var(--dim-1);
-             border-bottom: 1px solid var(--border); font-weight: 600; }
-.recent td { padding: 4px 8px; border-bottom: 1px solid #f1f5f9; }
+/* ── Active trade panel ─────────────────────────────────────────── */
+.active-trade {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  padding: 14px 18px;
+  margin-bottom: 16px;
+}
+.active-trade.flat .at-empty {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 12px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  text-transform: uppercase;
+  margin-top: 6px;
+}
+.at-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+.at-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text2);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.at-warn {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  color: var(--amber);
+}
+.at-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 1px;
+  background: var(--border);
+}
+.at-cell {
+  background: var(--surface);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.at-cell-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  text-transform: uppercase;
+}
+.at-cell-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  color: var(--text);
+}
+.at-cell-value.muted { color: var(--text3); }
+
+/* ── Strategy cards ─────────────────────────────────────────────── */
+.strat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.strat-card {
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--gold2);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 170px;
+}
+.strat-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.strat-head-left { display: flex; align-items: center; gap: 8px; }
+.silk {
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  border: 1px solid var(--border2);
+}
+.silk-gold-diag {
+  background:
+    repeating-linear-gradient(45deg,
+      var(--gold2) 0px, var(--gold2) 4px,
+      var(--bg3) 4px, var(--bg3) 8px);
+}
+.silk-green { background: var(--green); }
+.silk-amber { background: var(--amber); }
+.strat-name {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 18px;
+  letter-spacing: 1.5px;
+  color: var(--text);
+}
+.strat-badge {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+.strat-pnl {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 30px;
+  letter-spacing: 1px;
+  line-height: 1;
+  margin: 2px 0;
+}
+.strat-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: var(--text2);
+}
+.ss-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.ss-k   { color: var(--text3); }
+.ss-v   { color: var(--text); }
+.strat-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.strat-status { color: var(--text2); font-weight: 600; }
+.strat-window {
+  margin-left: auto;
+  color: var(--text3);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+}
+
+/* ── Hour-of-day grid ───────────────────────────────────────────── */
+.hh-section {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.hh-head {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text2);
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.hh-row {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.hh-row:last-child { margin-bottom: 0; }
+.hh-cell {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-height: 44px;
+  justify-content: center;
+}
+.hh-hour {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.8px;
+  color: var(--text3);
+  font-weight: 600;
+}
+.hh-val {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+}
+.hh-empty .hh-val { color: var(--text3); }
+.hh-pos {
+  background: var(--greenl);
+  border-color: var(--green);
+}
+.hh-pos .hh-val { color: var(--green2); }
+.hh-neg {
+  background: var(--redl);
+  border-color: var(--red);
+}
+.hh-neg .hh-val { color: var(--red2); }
+.hh-live {
+  background: var(--amberl);
+  border: 2px solid var(--amber);
+}
+.hh-live .hh-hour { color: var(--gold2); }
+.hh-live .hh-val  { color: var(--gold2); font-weight: 600; }
+
+/* ── Recent closes table ────────────────────────────────────────── */
+.rc-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.rc-head {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text2);
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.rc-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.rc-table th {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  font-weight: 700;
+  text-transform: uppercase;
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.rc-table th.rc-pnl-col { text-align: right; }
+.rc-row td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--bg2);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.rc-row.rc-open td { background: rgba(196,128,26,0.10); }
+.rc-time  { color: var(--text2); }
+.rc-price { color: var(--text); }
+.rc-held  { color: var(--text3); }
+.rc-pnl   { text-align: right; font-weight: 600; }
+.rc-tag {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  border: 1px solid;
+  text-transform: uppercase;
+}
+.rc-outcome {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+.rc-outcome-target  { color: var(--green2); }
+.rc-outcome-stop    { color: var(--red2); }
+.rc-outcome-flat    { color: var(--text3); }
+.rc-outcome-open    { color: var(--amber); }
+.rc-empty {
+  text-align: center;
+  padding: 16px;
+  color: var(--text3);
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 12px;
+  letter-spacing: 1.2px;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────── */
+.footer {
+  background: var(--bg3);
+  border-top: 1px solid var(--border);
+  padding: 12px 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: auto;
+}
+.ft-left {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text2);
+  text-transform: uppercase;
+}
+.ft-right {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: var(--text3);
+}
 """
+
+
+# ─────────────────────────── entry point ────────────────────────────
 
 
 def render_overview(sb, *, token: str | None = None,
                     bucket: str = "all") -> str:
-    """Main entry — renders the full HTML page.
+    """Main entry — renders the full Ghost Dog Capital dashboard.
 
-    `bucket` is one of TIME_BUCKETS keys ('all' default). When set to a
-    specific bucket, strategy cards / bars-held / recent trades are
-    filtered to closes whose entry-hour CT falls in that bucket's hour
-    set. The hour heatmap always shows all 24 hours (the discovery
-    surface) but highlights the selected bucket with a yellow halo.
+    Signature preserved for backwards compatibility with web/app.py.
+    `bucket` is currently unused (the bucket selector was removed in the
+    Ghost Dog redesign); kept on the signature so callers that pass it
+    don't break.
     """
-    if bucket not in TIME_BUCKETS:
-        bucket = "all"
-    heartbeats = _fetch_heartbeats(sb)
-    strategies = _fetch_strategies(sb)
-    snaps = _fetch_perf_snapshots(sb)
-    closes_all = _fetch_recent_closes(sb)
-    closes_filtered = _filter_closes_by_bucket(closes_all, bucket)
-    ks_state = _fetch_kill_switch_state(sb)
+    _ = bucket   # explicitly unused
+
+    heartbeats  = _fetch_heartbeats(sb)
+    strategies  = _fetch_strategies(sb)
+    snaps       = _fetch_perf_snapshots(sb)
+    closes_all  = _fetch_recent_closes(sb)
+    ks_state    = _fetch_kill_switch_state(sb)
 
     body = (
-        _render_kill_switch(ks_state, token)
+        _render_topbar(heartbeats)
+        + '<div class="page">'
+        + _render_ticker_bar(closes_all, heartbeats, ks_state, token)
         + _render_mll_tracker(closes_all)
-        + _render_header(heartbeats)
-        + _render_bucket_selector(bucket, token)
-        + _render_position_panel(heartbeats)
-        + _render_strategy_cards(strategies, snaps,
-                                  closes_in_bucket=closes_filtered,
-                                  bucket=bucket)
-        + _render_promotion_gate(strategies)
-        + _render_hour_heatmap(closes_all, selected_bucket=bucket)
-        + _render_recent_trades(closes_filtered)
+        + _render_active_trade(heartbeats)
+        + _render_strategy_cards(heartbeats, strategies, snaps)
+        + _render_hour_grid(closes_all)
+        + _render_recent_closes(closes_all, heartbeats)
+        + '</div>'
+        + _render_footer()
     )
-    token_q = f"?token={token}" if token else ""
+
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="refresh" content="10" />
-<title>Acme Futures · New Fleet</title>
+<title>Ghost Dog Capital · Fleet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;600&family=Barlow+Condensed:wght@400;600;700&display=swap">
 <style>{_CSS}</style>
 </head><body>
 {body}
-<footer class="dim mini" style="text-align:center;padding:12px;">
-  v3 archive: <a href="/v3-archive{token_q}" style="color:#475569;">→ here</a>
-  · legacy fleet: <a href="/fleet{token_q}" style="color:#475569;">→ here</a>
-  · auto-refresh 10s
-</footer>
 </body></html>
 """

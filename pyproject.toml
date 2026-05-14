@@ -23,6 +23,11 @@ dev = [
     "ruff>=0.5",
     "respx>=0.21",
     "streamlit>=1.57.0",
+    # Web dashboard (the Railway deploy uses web/requirements.txt; these
+    # are mirrored here so `uv run uvicorn web.app:app` works locally
+    # for development).
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [build-system]
