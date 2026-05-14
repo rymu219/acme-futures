@@ -346,22 +346,26 @@ def _render_topbar(heartbeats: dict) -> str:
         if lb and (last_bar_ts is None or lb > last_bar_ts):
             last_bar_ts = lb
     last_bar = _ago(last_bar_ts) if last_bar_ts else "—"
-    # Inline SVG logo: type-only Ghost Dog wordmark. Inherits Bebas Neue
-    # + Barlow Condensed from the page CSS (would NOT inherit if loaded
-    # via <img src>).
-    logo_svg = (
-        '<svg class="logo" viewBox="0 0 200 60" '
-        'preserveAspectRatio="xMidYMid meet" aria-label="Ghost Dog Capital">'
-        '<text x="100" y="40" text-anchor="middle" class="logo-name">'
+    # Primary logo: PNG file at web/static/ghost_dog_logo.png.
+    # Fallback: inline-SVG wordmark, shown via onerror if the PNG is
+    # missing (so the page never breaks during a deploy ordering issue).
+    fallback_svg = (
+        '<svg class=\\\'logo\\\' viewBox=\\\'0 0 200 60\\\' '
+        'preserveAspectRatio=\\\'xMidYMid meet\\\'>'
+        '<text x=\\\'100\\\' y=\\\'40\\\' text-anchor=\\\'middle\\\' class=\\\'logo-name\\\'>'
         'GHOST DOG</text>'
-        '<text x="100" y="55" text-anchor="middle" class="logo-tag">'
-        'CAPITAL</text>'
-        '</svg>'
+        '<text x=\\\'100\\\' y=\\\'55\\\' text-anchor=\\\'middle\\\' class=\\\'logo-tag\\\'>'
+        'CAPITAL</text></svg>'
+    )
+    logo_html = (
+        '<img src="/static/ghost_dog_logo.png" alt="Ghost Dog Capital" '
+        'class="logo" '
+        f'onerror="this.outerHTML=\'{fallback_svg}\'">'
     )
     return f"""
   <header class="topbar">
     <div class="brand">
-      {logo_svg}
+      {logo_html}
       <span class="brand-divider"></span>
       <span class="brand-sub">$50K EVAL · CLASSIC CONDUCTOR · SINGLE POSITION</span>
     </div>
