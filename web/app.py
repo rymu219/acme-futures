@@ -65,9 +65,6 @@ app = FastAPI(title="Acme Futures · Watcher")
 # Combine starting balance — used as the baseline for P&L. Override via env var
 # if running a different account size (e.g. 25K or 100K Combine).
 STARTING_BALANCE = float(os.getenv("ACME_STARTING_BALANCE", "50000"))
-# Trailing-drawdown max-loss amount for the active Combine profile. 50K → $2,000,
-# 25K → $1,500, 100K → $3,000. Mirrors profile.max_loss_amount in acme.risk.
-MAX_LOSS_AMOUNT = float(os.getenv("ACME_MAX_LOSS_AMOUNT", "2000"))
 
 
 # View-only mirror of the runner's calendar gates. The runner has the full
@@ -393,8 +390,6 @@ def _render_html(sb, *, token: str | None = None) -> str:
     _, latest = _fetch_snapshots(sb, session_start)
     if latest is None:
         bal_str = pnl_str = today_str = net_str = "—"
-        mll_str = "—"
-        mll_color = "#94a3b8"
         snap_age = ""
         pnl_color = today_color = "#94a3b8"
     else:
@@ -408,23 +403,6 @@ def _render_html(sb, *, token: str | None = None) -> str:
         net_str = f"{net:+d}"
         snap_age = f"as of {_ago(latest['occurred_at'])} ago"
         pnl_color = "#e2e8f0" if abs(pnl) < 0.005 else ("#16a34a" if pnl > 0 else "#dc2626")
-        # Trailing Max Loss Limit. Topstep's MLL ratchets up with the EOD peak
-        # and locks at starting_balance. We don't track peak_balance_eod yet
-        # (daily_state is unpopulated) — until that lands, approximate peak as
-        # max(current_balance, starting_balance). Exact in dry-run since
-        # balance never moves; slightly aggressive in live if an intraday
-        # spike didn't survive to EOD. See acme.risk.trailing_max_loss_limit.
-        peak_proxy = max(bal, STARTING_BALANCE)
-        mll = min(peak_proxy - MAX_LOSS_AMOUNT, STARTING_BALANCE)
-        mll_str = _money(mll)
-        mll_buffer = bal - mll
-        # Amber within $1.5K of MLL, red within $500. Otherwise dim (no alarm).
-        if mll_buffer < 500:
-            mll_color = "#dc2626"
-        elif mll_buffer < 1500:
-            mll_color = "#f59e0b"
-        else:
-            mll_color = "#5a6789"   # var(--dim-2)
         # Today's P&L — relative to balance at start of current Topstep day (17:00 CT).
         today_baseline = _todays_baseline_balance(sb, session_start)
         if today_baseline is None:
@@ -669,7 +647,6 @@ def _render_html(sb, *, token: str | None = None) -> str:
     <div class="card">
       <div class="label">Balance</div>
       <div class="value mono">{bal_str}</div>
-      <div class="meta" style="color:{mll_color}">MLL {mll_str}</div>
     </div>
     <div class="card">
       <div class="label">Cumulative P&amp;L</div>
