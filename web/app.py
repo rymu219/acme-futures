@@ -16,9 +16,17 @@ Railway deploy:
 from __future__ import annotations
 
 import os
+import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Ensure unqualified sibling imports (`from fleet_view import ...` etc.)
+# resolve whether uvicorn is invoked from the repo root
+# (`uvicorn web.app:app`) or from web/ itself (Railway / Procfile use
+# `uvicorn app:app --app-dir web`). Without this, the bare `from
+# fleet_view import …` only works in the latter case.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
