@@ -9,13 +9,20 @@ inevitable mean-reversion back through VWAP.
 Logic:
   1. Compute intraday VWAP from the 08:30 CT session-open bar onward, weighted
      by volume on typical price (h+l+c)/3. Resets each CT calendar date.
-  2. Entry: price closes `entry_threshold_pts` above VWAP → long; below →
-     would be short, but long-only by default.
-  3. Initial stop: `initial_stop_pts` below entry (long). Hard floor.
-  4. Trailing stop: `trail_distance_pts` below the high watermark. Updates
+  2. Trigger event: the FIRST bar of the session where `distance >=
+     entry_threshold_pts` (long) or `<= -entry_threshold_pts` (short). The
+     trigger is one-shot per direction per session — once it fires, even
+     if price retraces and re-crosses, no second trigger evaluation.
+  3. Entry: fire only if the trigger event falls inside the configured
+     entry window (default 09:00-10:00 CT). If the trigger happened before
+     the window (carry-over from a pre-window move) or after the window
+     (too late), no entry fires for that session.
+  4. Initial stop: `initial_stop_pts` below entry (long). Hard floor.
+  5. Trailing stop: `trail_distance_pts` below the high watermark. Updates
      each new high. Effective stop = max(initial_stop, hw - trail).
-  5. Hard close at 13:00 CT via `wants_force_flat`.
-  6. One trade per session; once exited, no re-entry.
+  6. Hard close at 13:00 CT via `wants_force_flat`.
+  7. One trade per session; once exited, no re-entry (the trigger has
+     already fired).
 
 LIVE INTEGRATION CAVEAT — the existing Conductor's bracket model exits on a
 fixed stop/target. It has no hook to tighten the stop as a position runs.
@@ -106,12 +113,28 @@ class _VWAPState:
 
 
 class _DayState:
-    """Per-session entry bookkeeping. One-trade-per-session enforcement."""
-    __slots__ = ("session_date", "entered")
+    """Per-session entry bookkeeping.
+
+    `long_triggered` / `short_triggered` record whether the directional
+    threshold (distance >= +threshold for long, <= -threshold for short)
+    has ever been crossed during the current session. The flag is set on
+    the FIRST crossing only; subsequent recrossings are ignored. If the
+    first crossing happens outside the configured entry window, the
+    direction is effectively dead for the session (no entry will fire
+    even on later, in-window crossings — the trigger event already passed).
+
+    `entered` is the position-state flag: True once a Signal with size > 0
+    has actually been emitted. Distinct from triggered, because a trigger
+    can happen outside the window (no entry) and we still want to record
+    that it occurred so we don't fire on a later in-window crossing.
+    """
+    __slots__ = ("session_date", "entered", "long_triggered", "short_triggered")
 
     def __init__(self, session_date: date) -> None:
         self.session_date = session_date
         self.entered = False
+        self.long_triggered = False
+        self.short_triggered = False
 
 
 class VWAPMomentumStrategy:
@@ -224,13 +247,6 @@ class VWAPMomentumStrategy:
         if current_position != 0 or self._day.entered:
             return None
 
-        # Entry-window gate. VWAP keeps cumulating outside this window
-        # (so the first entry-eligible bar still has context) but we
-        # don't emit signals on early or late bars.
-        if not (self._entry_window_start_min <= ct_minute
-                < self._entry_window_end_min):
-            return None
-
         vwap = self._vwap.vwap
         if vwap is None:
             return None   # zero-volume bar at session open, vanishingly rare
@@ -238,25 +254,46 @@ class VWAPMomentumStrategy:
         # Distance from VWAP (signed; positive = price above VWAP).
         distance = bar.c - vwap
         cfg = self.config
+        in_window = (self._entry_window_start_min <= ct_minute
+                     < self._entry_window_end_min)
 
-        # Long: price extended above VWAP by at least entry_threshold.
-        if cfg.allow_longs and distance >= cfg.entry_threshold_pts:
-            return self._build_signal(
-                side="buy", entry=bar.c, distance=distance,
-                state=state, profile=profile,
-                current_position=current_position,
-                current_balance_unrealized=current_balance_unrealized,
-            )
+        # Long-side trigger evaluation. The FIRST bar of the session where
+        # `distance >= entry_threshold_pts` is the trigger event. Two
+        # branches:
+        #   - Trigger in-window     → fire entry at this bar's close.
+        #   - Trigger out-of-window → mark long_triggered, return None.
+        #                              The session's long-direction is now
+        #                              dead — even if price retraces and
+        #                              re-crosses the threshold inside the
+        #                              window, no entry fires. This prevents
+        #                              the "carry-over from a pre-window
+        #                              push" contamination where a strong
+        #                              08:xx move that persisted into 09:00
+        #                              would otherwise trigger a late chase
+        #                              entry on an already-extended move.
+        if cfg.allow_longs and not self._day.long_triggered:
+            if distance >= cfg.entry_threshold_pts:
+                self._day.long_triggered = True
+                if in_window:
+                    return self._build_signal(
+                        side="buy", entry=bar.c, distance=distance,
+                        state=state, profile=profile,
+                        current_position=current_position,
+                        current_balance_unrealized=current_balance_unrealized,
+                    )
 
-        # Short: price extended below VWAP by at least entry_threshold. Long-
-        # only by default; flip allow_shorts to enable the symmetric variant.
-        if cfg.allow_shorts and distance <= -cfg.entry_threshold_pts:
-            return self._build_signal(
-                side="sell", entry=bar.c, distance=distance,
-                state=state, profile=profile,
-                current_position=current_position,
-                current_balance_unrealized=current_balance_unrealized,
-            )
+        # Short-side trigger — symmetric structure. Long-only by default;
+        # flip allow_shorts to enable.
+        if cfg.allow_shorts and not self._day.short_triggered:
+            if distance <= -cfg.entry_threshold_pts:
+                self._day.short_triggered = True
+                if in_window:
+                    return self._build_signal(
+                        side="sell", entry=bar.c, distance=distance,
+                        state=state, profile=profile,
+                        current_position=current_position,
+                        current_balance_unrealized=current_balance_unrealized,
+                    )
 
         return None
 

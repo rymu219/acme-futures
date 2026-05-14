@@ -130,7 +130,15 @@ def run_vwap_momentum(
     current_date = None
     cum_tpv = 0.0
     cum_v = 0.0
-    entered_today = False
+    # `long_triggered` records whether `distance >= entry_threshold_pts` has
+    # ever happened in the current session. It's the trigger-event one-shot
+    # flag (mirrors VWAPMomentumStrategy._DayState.long_triggered). Set on
+    # the FIRST crossing; if that crossing was outside the entry window the
+    # session is dead — no entry, no re-evaluation on subsequent recrossings.
+    # Replaces the old `entered_today` flag (which only knew about actual
+    # entries and so couldn't distinguish "trigger happened pre-window" from
+    # "trigger never happened").
+    long_triggered = False
     # Open position state (long only)
     pos_entry_price = 0.0
     pos_entry_t = None
@@ -172,7 +180,7 @@ def run_vwap_momentum(
             current_date = ct_date
             cum_tpv = 0.0
             cum_v = 0.0
-            entered_today = False
+            long_triggered = False
 
         # Only operate during the session window. Pre-08:30 and post-13:00
         # bars are skipped entirely (no VWAP cumulation, no entries, no
@@ -257,28 +265,37 @@ def run_vwap_momentum(
             # bar — one-trade-per-session locks anything further.
             continue
 
-        # ── Entry check (only when flat and haven't traded yet today).
-        if entered_today or vwap is None:
-            continue
-
-        # Entry-window gate — VWAP cumulates from SESSION_OPEN regardless,
-        # but only fire entries inside [ENTRY_WINDOW_START, ENTRY_WINDOW_END).
-        if not (ENTRY_WINDOW_START_MIN <= ct_minute < ENTRY_WINDOW_END_MIN):
+        # ── Trigger evaluation (only when flat and the session's trigger
+        # event hasn't yet fired). The FIRST bar where price extends
+        # `entry_threshold_pts` above VWAP is the trigger; whether that
+        # bar falls in the entry window decides whether we actually enter.
+        # See the long_triggered comment above for the carry-over rationale.
+        if long_triggered or vwap is None:
             continue
 
         distance = bar.c - vwap
         if distance < entry_threshold_pts:
             continue
 
-        # Entry. Convention matches backtest_new_fleet: entry price = bar.c,
-        # no slippage in the dry-run path.
+        # Trigger fires now. Record it regardless of window — the session's
+        # one-shot trigger event is consumed either way.
+        long_triggered = True
+
+        # If the trigger event landed outside the entry window, the session
+        # is a carry-over: an earlier (or later) crossing was the real
+        # signal, not this one. Skip the entry but keep `long_triggered`
+        # set so we don't re-evaluate later in the same session.
+        if not (ENTRY_WINDOW_START_MIN <= ct_minute < ENTRY_WINDOW_END_MIN):
+            continue
+
+        # In-window trigger → enter. Convention matches backtest_new_fleet:
+        # entry price = bar.c, no slippage in the dry-run path.
         pos_entry_price = bar.c
         pos_entry_t = bar.t
         pos_size = 1
         pos_high_watermark = bar.c   # watermark starts at entry close
         dist_int = int(round(distance * 100))
         pos_reason = f"vwap_momentum_long_d{dist_int:+07d}"
-        entered_today = True
 
     # Flush any still-open position at the last bar (rare; happens only if
     # the bar stream ends mid-session before 13:00). Match the
