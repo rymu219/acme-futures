@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from supabase import create_client
 
 # Load .env from project root for local dev. On Railway, env vars come from the
@@ -61,6 +63,13 @@ KIND_COLORS = {
 
 
 app = FastAPI(title="Acme Futures · Watcher")
+
+# Static assets (Ghost Dog logo + future images/icons). The directory is
+# resolved relative to this file so it works whether uvicorn runs from
+# the repo root (`uvicorn web.app:app`) or from web/ (Railway / Procfile).
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # Combine starting balance — used as the baseline for P&L. Override via env var
 # if running a different account size (e.g. 25K or 100K Combine).
