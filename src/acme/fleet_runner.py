@@ -50,6 +50,7 @@ from acme.db import Db
 from acme.registry import StrategyRegistry
 from acme.strategies.boundary import BoundaryStrategy
 from acme.strategies.gap_fill import GapFillConfig, GapFillStrategy
+from acme.strategies.go_no_go_levels import GoNoGoLevelsStrategy
 from acme.strategies.overnight_drift import OvernightDriftStrategy
 
 log = structlog.get_logger(__name__)
@@ -71,6 +72,7 @@ def _build_keeper_instances() -> list[tuple[str, object]]:
         ("gap_fill", GapFillStrategy(
             config=GapFillConfig(fixed_contracts=3),
         )),
+        ("go_no_go_levels", GoNoGoLevelsStrategy()),
     ]
 
 
