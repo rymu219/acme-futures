@@ -55,6 +55,42 @@ class Db:
         except Exception as e:
             log.error("db_log_event_failed", kind=kind, error=str(e))
 
+    def write_eval_log(
+        self,
+        *,
+        bar_ts: datetime,
+        strategy: str,
+        outcome: str,
+        near_miss: bool,
+        gate_failed: str | None = None,
+        signal_side: str | None = None,
+        gate_values: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Append one row to the `eval_log` table.
+
+        Same fire-and-forget pattern as `log_event` — synchronous insert
+        wrapped in try/except so write failures don't tear down the bar
+        loop. `near_miss` is required (no default) because PostgREST
+        overrides Postgres column defaults with explicit nulls on
+        missing JSON keys, violating eval_log's NOT NULL constraint.
+        """
+        row = {
+            "bar_ts": bar_ts.isoformat(),
+            "strategy": strategy,
+            "outcome": outcome,
+            "near_miss": bool(near_miss),
+            "gate_failed": gate_failed,
+            "signal_side": signal_side,
+            "gate_values": gate_values or {},
+            "reason": (reason or "")[:120],   # 120-char convention per migration comment
+        }
+        try:
+            self.client.table("eval_log").insert(row).execute()
+        except Exception as e:
+            log.error("db_eval_log_write_failed",
+                      strategy=strategy, outcome=outcome, error=str(e))
+
     def read_control_flag(self, flag: str) -> dict | None:
         try:
             res = self.client.table("control_flags").select("*").eq("flag", flag).limit(1).execute()

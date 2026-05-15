@@ -26,13 +26,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import time as dtime
+from typing import Any
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
 from acme.indicators import ATR
 from acme.levels import DayLevels
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
-from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.base import EvalResult, Signal, StrategyMetadata
 from acme.strategies.exhaustion import ExhaustionDetector
 from acme.strategies.params import ParameterSpec
 
@@ -172,6 +173,43 @@ class BoundaryStrategy:
             self.config.atr_period,
         ) + 2
 
+    # ───────────────────────── charge_pct ──────────────────────────
+
+    def _compute_charge_pct(
+        self, exh, hi_dist_ticks: float | None, lo_dist_ticks: float | None,
+    ) -> float:
+        """Half-and-half: actionable exhaustion direction + level proximity.
+
+          0.5 × actionable_exhaustion + 0.5 × level_proximity_charge
+
+        actionable_exhaustion = 1.0 iff exh.direction ∈ {top, bottom} AND
+          the corresponding side (short for top, long for bottom) is allowed.
+
+        level_proximity_charge =
+          max(0, 1 - |dist| / buffer_ticks)  for the side that would fire.
+          Uses high-side distance for top exhaustion, low-side for bottom.
+          0 if no level set or distance None.
+        """
+        if exh is None:
+            return 0.0
+        is_top = exh.direction == "top"
+        is_bottom = exh.direction == "bottom"
+        if is_top and self.config.allow_shorts:
+            dist = hi_dist_ticks
+            actionable = 1.0
+        elif is_bottom and self.config.allow_longs:
+            dist = lo_dist_ticks
+            actionable = 1.0
+        else:
+            return 0.0     # exhaustion not actionable → charge floor
+        buffer = self.config.level_buffer_ticks
+        level_prox = (
+            0.0 if dist is None or buffer <= 0
+            else max(0.0, 1.0 - abs(dist) / buffer)
+        )
+        charge = 0.5 * actionable + 0.5 * level_prox
+        return min(1.0, max(0.0, charge))
+
     def set_levels(self, levels: DayLevels) -> None:
         """Caller updates day-levels (typically once per trade date)."""
         self._levels = levels
@@ -254,63 +292,173 @@ class BoundaryStrategy:
         profile: EvalProfile,
         current_position: int,
         current_balance_unrealized: float,
-    ) -> Signal | None:
+    ) -> Signal | EvalResult | None:
         exh = self._exh.update(bar)
-        self._atr.update(bar)
+        atr_val = self._atr.update(bar)
 
-        # Stay quiet while in position. BOUNDARY exits are handled by the
-        # bracket (stop = level + buffer; target = level ± distance).
-        if current_position != 0:
-            return None
-
+        # Warmup: still building exhaustion / level history — return bare None.
+        # The conductor doesn't log eval_log rows for warmup bars.
         if exh is None or self._levels is None:
             return None
 
         from acme.levels import CT
         entry_hour = bar.t.astimezone(CT).hour
-
-        # Entry-hour blacklist (CT). Skip RTH-volume hours where levels
-        # get broken and exhaustion patterns false-fire. Backtest finding
-        # 2026-05-12: 09-13 CT is -$712 over 2 years; 03-08 + 17-23 CT
-        # carries the edge.
-        if entry_hour in self.config.entry_hour_blacklist_ct:
-            return None
-
         buffer_pts = self.config.level_buffer_ticks * self.contract.tick_size
+        buffer_ticks = self.config.level_buffer_ticks
 
-        if exh.direction == "top" and self.config.allow_shorts:
-            name, lvl = self._nearest_high_side(bar.h, entry_hour)
-            if name is None or lvl is None:
-                return None
-            if abs(lvl - bar.h) > buffer_pts:
-                return None
-            stop_distance = (lvl + self.config.stop_buffer_ticks * self.contract.tick_size) - bar.c
-            target_distance = self.config.target_distance_ticks * self.contract.tick_size
-            return self._build_signal(
-                side="sell", state=state, profile=profile,
-                current_position=current_position,
-                current_balance_unrealized=current_balance_unrealized,
-                stop_distance=stop_distance, target_distance=target_distance,
-                reason=f"boundary_fade_{name}",
+        # Compute both sides' nearest level + distance (in ticks) for diagnostics.
+        # These two calls are cheap (small loops over six levels) and they're
+        # exactly what BOUNDARY already calls before deciding to fire — we just
+        # surface the result either way.
+        hi_name, hi_lvl = self._nearest_high_side(bar.h, entry_hour)
+        lo_name, lo_lvl = self._nearest_low_side(bar.l, entry_hour)
+        hi_dist_ticks = (
+            (bar.h - hi_lvl) / self.contract.tick_size
+            if hi_lvl is not None else None
+        )
+        lo_dist_ticks = (
+            (lo_lvl - bar.l) / self.contract.tick_size
+            if lo_lvl is not None else None
+        )
+
+        gate_values: dict[str, Any] = {
+            "exh_direction": exh.direction,
+            "entry_hour_ct": entry_hour,
+            "buffer_ticks": buffer_ticks,
+            "bar_close": bar.c,
+            "bar_high": bar.h,
+            "bar_low": bar.l,
+            "atr": atr_val,
+            "nearest_high_name": hi_name,
+            "nearest_high_value": hi_lvl,
+            "nearest_high_dist_ticks": (
+                round(hi_dist_ticks, 2) if hi_dist_ticks is not None else None
+            ),
+            "nearest_low_name": lo_name,
+            "nearest_low_value": lo_lvl,
+            "nearest_low_dist_ticks": (
+                round(lo_dist_ticks, 2) if lo_dist_ticks is not None else None
+            ),
+            "charge_pct": round(
+                self._compute_charge_pct(exh, hi_dist_ticks, lo_dist_ticks), 4,
+            ),
+        }
+        self._last_gate_values = gate_values
+
+        # ────── In-position: bracket exits handle close; we stand down. ──────
+        if current_position != 0:
+            return EvalResult(
+                outcome="HOLD",
+                gate_failed=None,
+                near_miss=False,
+                signal_side=None,
+                gate_values=gate_values,
+                reason="HOLD — position open, bracket exit only",
             )
 
-        if exh.direction == "bottom" and self.config.allow_longs:
-            name, lvl = self._nearest_low_side(bar.l, entry_hour)
-            if name is None or lvl is None:
-                return None
-            if abs(lvl - bar.l) > buffer_pts:
-                return None
-            stop_distance = bar.c - (lvl - self.config.stop_buffer_ticks * self.contract.tick_size)
-            target_distance = self.config.target_distance_ticks * self.contract.tick_size
-            return self._build_signal(
-                side="buy", state=state, profile=profile,
-                current_position=current_position,
-                current_balance_unrealized=current_balance_unrealized,
-                stop_distance=stop_distance, target_distance=target_distance,
-                reason=f"boundary_fade_{name}",
+        # ────── Evaluate primary gates regardless of order ──────
+        # Internal: exhaustion direction + level proximity. External: entry
+        # hour blacklist. We compute booleans first so NEAR can fire when
+        # all internals pass but the hour is blacklisted.
+        is_top = exh.direction == "top"
+        is_bottom = exh.direction == "bottom"
+        short_dir_ok = is_top and self.config.allow_shorts
+        long_dir_ok = is_bottom and self.config.allow_longs
+
+        # Which side, if any, would the strategy try to fire?
+        target_side: str | None = None
+        target_name: str | None = None
+        target_lvl: float | None = None
+        target_dist_ticks: float | None = None
+        if short_dir_ok:
+            target_side = "sell"
+            target_name, target_lvl = hi_name, hi_lvl
+            target_dist_ticks = hi_dist_ticks
+        elif long_dir_ok:
+            target_side = "buy"
+            target_name, target_lvl = lo_name, lo_lvl
+            target_dist_ticks = lo_dist_ticks
+
+        # PASS — no actionable exhaustion direction this bar.
+        if target_side is None:
+            return EvalResult(
+                outcome="PASS",
+                gate_failed="exh_direction",
+                near_miss=False,
+                signal_side=None,
+                gate_values=gate_values,
+                reason=(
+                    f"No actionable exhaustion — direction={exh.direction!r}"
+                    + (" (shorts disabled)" if is_top else "")
+                    + (" (longs disabled)" if is_bottom else "")
+                ),
             )
 
-        return None
+        # PASS — no allowed-side level at this hour.
+        if target_name is None or target_lvl is None:
+            return EvalResult(
+                outcome="PASS",
+                gate_failed="level_available",
+                near_miss=False,
+                signal_side=target_side,
+                gate_values=gate_values,
+                reason=(
+                    f"No allowed {('high' if target_side == 'sell' else 'low')}-side "
+                    f"level at hour {entry_hour:02d} CT"
+                ),
+            )
+
+        # Level proximity check — primary internal gate.
+        dist_pts = abs(target_lvl - (bar.h if target_side == "sell" else bar.l))
+        level_proximity_ok = dist_pts <= buffer_pts
+
+        # External: entry hour blacklist.
+        hour_blacklisted = entry_hour in self.config.entry_hour_blacklist_ct
+
+        # PASS — level proximity miss (internal gate failed).
+        if not level_proximity_ok:
+            return EvalResult(
+                outcome="PASS",
+                gate_failed="level_proximity",
+                near_miss=False,
+                signal_side=target_side,
+                gate_values=gate_values,
+                reason=(
+                    f"Level gate miss — nearest {target_name.upper()} "
+                    f"{target_dist_ticks:.1f}t away (buffer {buffer_ticks}t)"
+                ),
+            )
+
+        # NEAR — every internal gate passed, but the entry hour is on the
+        # blacklist. This is the invisible save: the strategy was at the door,
+        # the level was tagged in the correct direction, and we stood down
+        # because the backtest said this hour kills the edge.
+        if hour_blacklisted:
+            return EvalResult(
+                outcome="NEAR",
+                gate_failed=None,
+                near_miss=True,
+                signal_side=target_side,
+                gate_values=gate_values,
+                reason=(
+                    f"All gates PASS · {target_name.upper()} "
+                    f"{target_dist_ticks:.1f}t — hour {entry_hour:02d} CT blacklisted"
+                ),
+            )
+
+        # All gates pass. Fire.
+        if target_side == "sell":
+            stop_distance = (target_lvl + self.config.stop_buffer_ticks * self.contract.tick_size) - bar.c
+        else:
+            stop_distance = bar.c - (target_lvl - self.config.stop_buffer_ticks * self.contract.tick_size)
+        target_distance = self.config.target_distance_ticks * self.contract.tick_size
+        return self._build_signal(
+            side=target_side, state=state, profile=profile,
+            current_position=current_position,
+            current_balance_unrealized=current_balance_unrealized,
+            stop_distance=stop_distance, target_distance=target_distance,
+            reason=f"boundary_fade_{target_name}",
+        )
 
     # ───────────────────────── signal construction ──────────────
 

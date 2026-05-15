@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from acme.broker.base import Bar
 from acme.levels import DayLevels
 from acme.risk import TOPSTEP_50K, DailyState
+from acme.strategies.base import EvalResult, Signal
 from acme.strategies.boundary import BoundaryConfig, BoundaryStrategy
 
 CT = ZoneInfo("America/Chicago")
@@ -188,12 +189,18 @@ def test_no_signal_when_already_in_position():
                   o=109.5, h=110.0, l=109.4, c=109.9, v=100),
              state=state, profile=TOPSTEP_50K,
              current_position=0, current_balance_unrealized=50_000)
-    # Already long 1 — should not emit anything even on a clean fade setup
+    # Already long 1 — should not emit a Signal even on a clean fade setup.
+    # Post-eval-log instrumentation: HOLD is now reported as an EvalResult
+    # (outcome="HOLD") rather than a bare None. The invariant being tested
+    # is "no trade fires" — i.e., the return is anything except a Signal.
     sig = s.on_bar(_bar(T0 + timedelta(minutes=2 * 24),
                         o=109.35, h=110.0, l=109.0, c=109.25, v=40),
                    state=state, profile=TOPSTEP_50K,
                    current_position=1, current_balance_unrealized=50_000)
-    assert sig is None
+    assert not isinstance(sig, Signal)
+    assert sig is None or isinstance(sig, EvalResult)
+    if isinstance(sig, EvalResult):
+        assert sig.outcome == "HOLD"
 
 
 # ════════════ fleet-coordination close times ═══════════════════════════
