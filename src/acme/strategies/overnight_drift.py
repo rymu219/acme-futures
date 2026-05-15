@@ -31,12 +31,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, time
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
-from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.base import EvalResult, Signal, StrategyMetadata
 from acme.strategies.params import ParameterSpec
 
 CT = ZoneInfo("America/Chicago")
@@ -131,6 +132,24 @@ class OvernightDriftStrategy:
 
     # ───────────────────────── helpers ─────────────────────────
 
+    def _compute_charge_pct(self, body: float | None) -> float:
+        """Triangle function on body magnitude.
+
+        - body <= min_body_points: 0  (too weak / doji / bearish)
+        - body == weak_body_threshold_points: 1  (peak — just inside the band)
+        - body >  weak_body_threshold_points: 0  (too strong)
+        - in between: linear ramp from 0 (at min) to 1 (at weak threshold)
+        """
+        if body is None:
+            return 0.0
+        min_b = self.config.min_body_points
+        max_b = self.config.weak_body_threshold_points
+        if body < min_b or body > max_b:
+            return 0.0
+        if max_b <= min_b:
+            return 1.0
+        return (body - min_b) / (max_b - min_b)
+
     def _ct_parts(self, bar: Bar) -> tuple[date, int]:
         ct = bar.t.astimezone(CT)
         return ct.date(), ct.hour * 60 + ct.minute
@@ -161,46 +180,127 @@ class OvernightDriftStrategy:
         profile: EvalProfile,
         current_position: int,
         current_balance_unrealized: float,
-    ) -> Signal | None:
-        # Bracket / force-flat handle exits; stay quiet while in position.
-        if current_position != 0:
-            return None
-
+    ) -> Signal | EvalResult | None:
         ct_date, ct_minute = self._ct_parts(bar)
+        day_snapshot = self._day                            # snapshot before bias-window mutation
+        bias_open_now = day_snapshot.bias_open if day_snapshot else None
+        bias_close_now = day_snapshot.bias_close if day_snapshot else None
+        body_now = (
+            bias_close_now - bias_open_now
+            if (bias_open_now is not None and bias_close_now is not None) else None
+        )
 
-        # Build the bias bar across 15:30-16:00 CT.
+        gate_values: dict[str, Any] = {
+            "ct_minute": ct_minute,
+            "bias_open": bias_open_now,
+            "bias_close": bias_close_now,
+            "bias_body_points": (round(body_now, 4) if body_now is not None else None),
+            "min_body_points": self.config.min_body_points,
+            "weak_body_threshold_points": self.config.weak_body_threshold_points,
+            "entry_min": self._entry_min,
+            "bias_window_start_min": self._bias_start_min,
+            "bias_window_end_min": self._bias_end_min,
+            "day_entered": bool(day_snapshot and day_snapshot.entered),
+            "charge_pct": round(self._compute_charge_pct(body_now), 4),
+        }
+        self._last_gate_values = gate_values
+
+        # HOLD — in a position; bracket / force-flat handles exits.
+        if current_position != 0:
+            return EvalResult(
+                outcome="HOLD", gate_failed=None, near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason="HOLD — long position open, bracket/force-flat handles exit",
+            )
+
+        # Build the bias bar across 15:30-16:00 CT. This is "still working" —
+        # PASS with the build_bias gate so the dashboard knows we're alive.
         if self._in_bias_window(ct_minute):
             day = self._ensure_day_state(ct_date)
             if day.bias_open is None:
                 day.bias_open = bar.o
             day.bias_close = bar.c
-            return None
+            gate_values["bias_open"] = day.bias_open
+            gate_values["bias_close"] = day.bias_close
+            partial_body = day.bias_close - day.bias_open
+            gate_values["bias_body_points"] = round(partial_body, 4)
+            gate_values["charge_pct"] = round(self._compute_charge_pct(partial_body), 4)
+            return EvalResult(
+                outcome="PASS", gate_failed="building_bias", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason=(
+                    f"Building bias bar (15:30-16:00 CT) — partial body "
+                    f"{partial_body:+.2f}pt at minute {ct_minute}"
+                ),
+            )
 
-        # Maintenance break 16:00-16:59 — nothing to do; wait for 17:00.
+        # Maintenance break 16:00-16:59 CT — bias is sealed, waiting for entry.
         if ct_minute < self._entry_min:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="pre_entry_window", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason=(
+                    f"Pre-entry — bias sealed, waiting for 17:00 CT "
+                    f"(currently {ct_minute // 60:02d}:{ct_minute % 60:02d} CT)"
+                ),
+            )
 
-        # Entry phase: at or after 17:00 CT on the same calendar date
-        # as the bias bar. (No bias today → no trade today.)
+        # Entry phase: at or after 17:00 CT on the same calendar date as the
+        # bias bar. (No bias today → no trade today.)
         day = self._day
         if day is None or day.bias_date != ct_date:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="no_bias_today", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason="No bias bar built for today's date (missed 15:30-16:00 CT window)",
+            )
         if day.entered:
-            return None
+            # NEAR — daily entry slot already consumed. The "external"
+            # blocker here is the once-per-session rule.
+            return EvalResult(
+                outcome="NEAR", gate_failed=None, near_miss=True,
+                signal_side="buy", gate_values=gate_values,
+                reason="All gates PASS — daily entry slot already consumed today",
+            )
         if day.bias_open is None or day.bias_close is None:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="bias_incomplete", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason="Bias bar incomplete — missing open or close",
+            )
 
         body = day.bias_close - day.bias_open
-        # WEAK BULLISH BAND. Reject:
-        #   - bearish or doji (body <= 0)
-        #   - too small (body < min_body)
-        #   - too strong (body > weak_body_threshold)
+        gate_values["bias_body_points"] = round(body, 4)
+        gate_values["charge_pct"] = round(self._compute_charge_pct(body), 4)
+
+        # WEAK BULLISH BAND. Reject bearish/doji, too small, too strong.
         if body <= 0:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="bias_body_direction", near_miss=False,
+                signal_side="buy", gate_values=gate_values,
+                reason=f"Bias bar bearish/doji ({body:+.2f}pt) — needed > 0",
+            )
         if body < self.config.min_body_points:
-            return None
+            shortfall = self.config.min_body_points - body
+            return EvalResult(
+                outcome="PASS", gate_failed="bias_body_too_weak", near_miss=False,
+                signal_side="buy", gate_values=gate_values,
+                reason=(
+                    f"Bias body too weak — {body:+.2f}pt, "
+                    f"needed >= {self.config.min_body_points:.1f}pt (short {shortfall:.2f}pt)"
+                ),
+            )
         if body > self.config.weak_body_threshold_points:
-            return None
+            overshoot = body - self.config.weak_body_threshold_points
+            return EvalResult(
+                outcome="PASS", gate_failed="bias_body_too_strong", near_miss=False,
+                signal_side="buy", gate_values=gate_values,
+                reason=(
+                    f"Bias body too strong — {body:+.2f}pt, "
+                    f"needed <= {self.config.weak_body_threshold_points:.1f}pt "
+                    f"(over by {overshoot:.2f}pt — conviction bullish, not weak bullish)"
+                ),
+            )
 
         stop_distance = self.config.catastrophic_stop_points
         tick = self.contract.tick_size
@@ -214,7 +314,11 @@ class OvernightDriftStrategy:
             round_turn_fee=round_turn_fee,
         )
         if size <= 0:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="size_zero", near_miss=False,
+                signal_side="buy", gate_values=gate_values,
+                reason=f"Bias in band ({body:+.2f}pt) but sizing returned 0 contracts",
+            )
 
         allowed, block_reason = can_open_new_position(
             profile, state, current_balance_unrealized,

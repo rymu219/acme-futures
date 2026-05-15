@@ -24,12 +24,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from acme.broker.base import Bar, BracketSpec
 from acme.contracts import MES, FuturesContract
 from acme.risk import DailyState, EvalProfile, can_open_new_position, dollars_to_contracts
-from acme.strategies.base import Signal, StrategyMetadata
+from acme.strategies.base import EvalResult, Signal, StrategyMetadata
 from acme.strategies.params import ParameterSpec
 
 CT = ZoneInfo("America/Chicago")
@@ -121,6 +122,20 @@ class GapFillStrategy:
 
     # ───────────────────────── helpers ─────────────────────────
 
+    def _compute_charge_pct(self, abs_gap: float | None) -> float:
+        """Distance-to-threshold on the absolute gap.
+
+          abs_gap / min_gap_points, clamped to [0, 1]
+          - 0 when no prior close (abs_gap=None) or gap=0
+          - 1 at or above the threshold
+        """
+        if abs_gap is None:
+            return 0.0
+        threshold = self.config.min_gap_points
+        if threshold <= 0:
+            return 1.0
+        return min(1.0, max(0.0, abs_gap / threshold))
+
     def _ct_parts(self, bar: Bar) -> tuple[date, int]:
         ct = bar.t.astimezone(CT)
         return ct.date(), ct.hour * 60 + ct.minute
@@ -155,7 +170,7 @@ class GapFillStrategy:
         profile: EvalProfile,
         current_position: int,
         current_balance_unrealized: float,
-    ) -> Signal | None:
+    ) -> Signal | EvalResult | None:
         ct_date, ct_minute = self._ct_parts(bar)
 
         # Always track the 15:58 CT bar's close (= 16:00 CT print).
@@ -163,46 +178,123 @@ class GapFillStrategy:
         if ct_minute == self._prior_close_min:
             self._prior_closes[ct_date] = bar.c
 
+        prior_close = self._lookup_prior_close(ct_date)
+        gap = (bar.o - prior_close) if prior_close is not None else None
+        day_snapshot = self._day
+        day_entered = bool(day_snapshot and day_snapshot.entered
+                           and day_snapshot.session_date == ct_date)
+        abs_gap_now = abs(gap) if gap is not None else None
+        gate_values: dict[str, Any] = {
+            "ct_minute": ct_minute,
+            "entry_min": self._entry_min,
+            "prior_close": prior_close,
+            "bar_open": bar.o,
+            "bar_close": bar.c,
+            "gap_points": (round(gap, 4) if gap is not None else None),
+            "abs_gap_points": (round(abs_gap_now, 4) if abs_gap_now is not None else None),
+            "min_gap_points": self.config.min_gap_points,
+            "day_entered": day_entered,
+            "charge_pct": round(self._compute_charge_pct(abs_gap_now), 4),
+        }
+        self._last_gate_values = gate_values
+
+        # HOLD — in a position; bracket / hard-close handles exit.
         if current_position != 0:
-            return None
+            return EvalResult(
+                outcome="HOLD", gate_failed=None, near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason="HOLD — position open, bracket/hard-close handles exit",
+            )
 
-        # Only fire on the bar at the entry time.
+        # Pre-entry / post-entry bars — strategy only fires on the 08:30 CT bar.
         if ct_minute != self._entry_min:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="not_entry_bar", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason=(
+                    f"Outside entry bar — currently "
+                    f"{ct_minute // 60:02d}:{ct_minute % 60:02d} CT, entry at "
+                    f"{self._entry_min // 60:02d}:{self._entry_min % 60:02d} CT"
+                ),
+            )
 
+        # We're on the 08:30 CT bar.
         day = self._ensure_day_state(ct_date)
         if day.entered:
-            return None
+            # NEAR — daily entry slot already consumed (one trade per session).
+            return EvalResult(
+                outcome="NEAR", gate_failed=None, near_miss=True,
+                signal_side=None, gate_values=gate_values,
+                reason="All gates PASS — daily entry slot already consumed today",
+            )
 
-        prior_close = self._lookup_prior_close(ct_date)
         if prior_close is None:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="no_prior_close", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason="No prior 15:58 CT close recorded — cannot compute gap",
+            )
 
-        gap = bar.o - prior_close
-        if abs(gap) < self.config.min_gap_points:
-            return None
+        # gap is guaranteed non-None here because prior_close is non-None.
+        assert gap is not None
+        abs_gap = abs(gap)
+        if abs_gap < self.config.min_gap_points:
+            shortfall = self.config.min_gap_points - abs_gap
+            return EvalResult(
+                outcome="PASS", gate_failed="gap_too_small", near_miss=False,
+                signal_side=None, gate_values=gate_values,
+                reason=(
+                    f"Gap too small — {gap:+.2f}pt, "
+                    f"needed |gap| >= {self.config.min_gap_points:.1f}pt "
+                    f"(short {shortfall:.2f}pt)"
+                ),
+            )
 
         # Entry on the bar's close (harness convention).
         entry = bar.c
         if gap > 0:
             # Gap-up → fade short. Target is prior_close (below entry).
             if not self.config.allow_shorts:
-                return None
+                return EvalResult(
+                    outcome="NEAR", gate_failed=None, near_miss=True,
+                    signal_side="sell", gate_values=gate_values,
+                    reason=(
+                        f"All gates PASS · gap {gap:+.2f}pt — shorts disabled by policy"
+                    ),
+                )
             target_distance = entry - prior_close
             stop_distance = self.config.stop_gap_multiple * abs(gap)
             side = "sell"
         else:
             # Gap-down → fade long. Target is prior_close (above entry).
             if not self.config.allow_longs:
-                return None
+                return EvalResult(
+                    outcome="NEAR", gate_failed=None, near_miss=True,
+                    signal_side="buy", gate_values=gate_values,
+                    reason=(
+                        f"All gates PASS · gap {gap:+.2f}pt — longs disabled by policy"
+                    ),
+                )
             target_distance = prior_close - entry
             stop_distance = self.config.stop_gap_multiple * abs(gap)
             side = "buy"
 
+        gate_values["entry_price"] = entry
+        gate_values["target_distance_points"] = round(target_distance, 4)
+        gate_values["stop_distance_points"] = round(stop_distance, 4)
+        gate_values["intended_side"] = side
+
         if target_distance <= 0 or stop_distance <= 0:
             # Bar already crossed back through prior_close before close —
             # fill happened during the entry bar; skip.
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="bar_through_fill", near_miss=False,
+                signal_side=side, gate_values=gate_values,
+                reason=(
+                    f"08:30 bar already moved through prior close — "
+                    f"fill happened intrabar (target_dist={target_distance:.2f}pt)"
+                ),
+            )
 
         tick = self.contract.tick_size
         stop_ticks = max(1, int(round(stop_distance / tick)))
@@ -219,7 +311,13 @@ class GapFillStrategy:
                 round_turn_fee=round_turn_fee,
             )
         if size <= 0:
-            return None
+            return EvalResult(
+                outcome="PASS", gate_failed="size_zero", near_miss=False,
+                signal_side=side, gate_values=gate_values,
+                reason=(
+                    f"Gap qualifies ({gap:+.2f}pt) but sizing returned 0 contracts"
+                ),
+            )
 
         allowed, block_reason = can_open_new_position(
             profile, state, current_balance_unrealized,

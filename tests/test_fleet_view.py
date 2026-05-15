@@ -120,8 +120,10 @@ def _close(*, strategy="boundary", net_pnl=10.0, hours_ago=1,
 # ════════════ pure helpers ═════════════════════════════════════════
 
 
-def test_fleet_lists_three_keepers():
-    assert FLEET == ["boundary", "overnight_drift", "gap_fill"]
+def test_fleet_lists_keepers():
+    # Post-eval-log dashboard update: fourth keeper go_no_go_levels joined
+    # the displayed fleet alongside the original three.
+    assert FLEET == ["boundary", "overnight_drift", "gap_fill", "go_no_go_levels"]
     # Every fleet member has a display-meta entry — otherwise renderers
     # silently fall back to .upper() which loses the racing-silk styling.
     for name in FLEET:

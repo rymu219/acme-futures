@@ -45,7 +45,7 @@ from acme.regime.classifier import RegimeEngine, RegimeSnapshot
 from acme.regime.habitat import eligible_strategies
 from acme.registry import RegisteredStrategy, StrategyRegistry
 from acme.risk import DailyState
-from acme.strategies.base import Signal
+from acme.strategies.base import EvalResult, Signal
 from acme.telemetry import BarEventLogger
 
 log = structlog.get_logger(__name__)
@@ -414,7 +414,36 @@ class Conductor:
                 current_position=strat_pos,
                 current_balance_unrealized=starting_balance + state.realized_pnl,
             )
+
+            # EvalResult branch — strategy evaluated but didn't fire.
+            # Write one row to Supabase `eval_log`, log telemetry with
+            # signal=None (the local sqlite logger only understands Signal
+            # | None), and skip arbitration. Fire-and-forget — eval_log
+            # write failures never tear down the bar loop.
+            if isinstance(sig, EvalResult):
+                if self.db is not None:
+                    try:
+                        self.db.write_eval_log(
+                            bar_ts=bar.t, strategy=rec.name,
+                            outcome=sig.outcome, near_miss=sig.near_miss,
+                            gate_failed=sig.gate_failed,
+                            signal_side=sig.signal_side,
+                            gate_values=sig.gate_values,
+                            reason=sig.reason,
+                        )
+                    except Exception as e:
+                        log.warning("eval_log_write_eval_failed",
+                                    strategy=rec.name, error=str(e))
+                self._telemetry.log(
+                    bar=bar, timeframe=tf, strategy=rec.name,
+                    signal=None, context=ctx_features,
+                    position=strat_pos,
+                    balance=starting_balance + state.realized_pnl,
+                )
+                continue
+
             # Telemetry write — every (strategy, bar) regardless of fire/no-fire.
+            # `sig` here is Signal | None.
             bar_event_id = self._telemetry.log(
                 bar=bar, timeframe=tf, strategy=rec.name,
                 signal=sig, context=ctx_features,
@@ -423,6 +452,25 @@ class Conductor:
             )
             if sig is None:
                 continue
+
+            # ENTRY branch — Signal fired. Write a matching eval_log row so
+            # the activity feed shows the full timeline (PASS/NEAR/HOLD/ENTRY
+            # in one stream). The trade itself goes through the existing
+            # broker_events path below.
+            if self.db is not None and sig.size > 0:
+                try:
+                    last_gv = dict(getattr(inst, "_last_gate_values", None) or {})
+                    last_gv["fired"] = True
+                    self.db.write_eval_log(
+                        bar_ts=bar.t, strategy=rec.name,
+                        outcome="ENTRY", near_miss=False,
+                        gate_failed=None, signal_side=sig.side,
+                        gate_values=last_gv, reason=sig.reason,
+                    )
+                except Exception as e:
+                    log.warning("eval_log_write_entry_failed",
+                                strategy=rec.name, error=str(e))
+
             self._emit_signal_event(rec, sig, bar)
             if rec.metadata is not None:
                 candidates.append(_Candidate(

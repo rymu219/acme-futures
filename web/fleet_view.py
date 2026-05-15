@@ -43,7 +43,7 @@ CT = ZoneInfo("America/Chicago")
 UTC = ZoneInfo("UTC")
 
 # Fleet — display order matches the strategy-cards grid left-to-right.
-FLEET = ["boundary", "overnight_drift", "gap_fill"]
+FLEET = ["boundary", "overnight_drift", "gap_fill", "go_no_go_levels"]
 
 # Per-strategy display metadata. `accent` drives the 3px top bar on each
 # card and the tag color in the recent-closes table. `silk` selects a CSS
@@ -66,6 +66,12 @@ STRATEGY_META: dict[str, dict[str, str]] = {
         "accent":    "#C4801A",          # amber
         "silk":      "silk-amber",
         "window":    "08:30 → 13:00 CT",
+    },
+    "go_no_go_levels": {
+        "label":     "GO/NO-GO LEVELS",
+        "accent":    "#5B7FB8",          # steel blue
+        "silk":      "silk-blue",
+        "window":    "08:00 → 12:00 CT",
     },
 }
 
@@ -184,6 +190,69 @@ def _fetch_recent_closes(sb, *, days: int = 7, limit: int = 1000) -> list[dict[s
     except Exception:
         return []
     return res.data or []
+
+
+def _fetch_eval_log_counts(sb) -> dict[str, int]:
+    """Counts for the FLEET ACTIVITY panel: total evals today + near misses
+    today. 'Today' = the current CT calendar date. Failures return zeros
+    rather than tearing down the page render."""
+    now_ct = datetime.now(UTC).astimezone(CT)
+    midnight_ct = now_ct.replace(hour=0, minute=0, second=0, microsecond=0)
+    floor_iso = midnight_ct.astimezone(UTC).isoformat()
+    out = {"evals_today": 0, "near_misses_today": 0}
+    try:
+        res = (sb.table("eval_log").select("id", count="exact")
+               .gte("bar_ts", floor_iso).limit(1).execute())
+        out["evals_today"] = int(res.count or 0)
+    except Exception:
+        pass
+    try:
+        res = (sb.table("eval_log").select("id", count="exact")
+               .eq("near_miss", True).gte("bar_ts", floor_iso).limit(1).execute())
+        out["near_misses_today"] = int(res.count or 0)
+    except Exception:
+        pass
+    return out
+
+
+def _fetch_eval_log_activity(sb, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Most recent N eval_log rows for the activity feed.
+
+    Returns rows sorted bar_ts desc. Empty list on failure or no rows.
+    """
+    try:
+        res = (sb.table("eval_log")
+               .select("bar_ts,strategy,outcome,near_miss,gate_failed,"
+                       "signal_side,reason,gate_values")
+               .order("bar_ts", desc=True).limit(limit).execute())
+        return res.data or []
+    except Exception:
+        return []
+
+
+def _fetch_charge_pct_by_strategy(sb) -> dict[str, float | None]:
+    """Most-recent charge_pct per strategy.
+
+    PostgREST doesn't support DISTINCT ON, so we issue one query per
+    active fleet member (matches the pattern in `_fetch_perf_snapshots`).
+    Returns name → float (0.0–1.0) or None if no row exists yet.
+    """
+    out: dict[str, float | None] = {}
+    for name in FLEET:
+        try:
+            res = (sb.table("eval_log").select("gate_values")
+                   .eq("strategy", name)
+                   .order("bar_ts", desc=True).limit(1).execute())
+            row = (res.data or [None])[0]
+            if row is None:
+                out[name] = None
+                continue
+            gv = row.get("gate_values") or {}
+            raw = gv.get("charge_pct")
+            out[name] = float(raw) if raw is not None else None
+        except Exception:
+            out[name] = None
+    return out
 
 
 def _fetch_kill_switch_state(sb) -> dict[str, Any]:
@@ -572,10 +641,60 @@ def _render_active_trade(heartbeats: dict) -> str:
 """
 
 
-def _render_strategy_cards(heartbeats: dict, strategies: dict, snaps: dict) -> str:
-    """3-card strategy grid. Background tint scales with each card's net
-    P&L vs the fleet max (per _card_bg). Top 3px accent bar is per-
-    strategy. Racing silk in the head is a small color-coded badge."""
+_BADGE_BG_BY_STATE: dict[str, str] = {
+    "LIVE":          "var(--green)",
+    "PILOT":         "var(--gold)",
+    "SHADOW":        "var(--surface2)",
+    "BENCH":         "var(--surface2)",
+    "RETIRED":       "var(--surface2)",
+    "BACKTEST":      "var(--surface2)",
+    "REPLAY":        "var(--surface2)",
+}
+
+
+def _badge_for(state: str | None, score: float) -> tuple[str, str]:
+    """Pick the (label, bg-color) for a strategy's lifecycle badge.
+
+    Primary source is the strategies-table `state` column — PILOT shows
+    PILOT, SHADOW shows SHADOW, LIVE shows LIVE, etc. Falls back to
+    score-derived display only when state is null / unknown (legacy
+    behaviour preserved as the fallback).
+    """
+    if state and state in _BADGE_BG_BY_STATE:
+        return state, _BADGE_BG_BY_STATE[state]
+    # Fallback: score-derived lifecycle estimate.
+    if score >= LIVE_THRESHOLD:
+        return "LIVE-ELIGIBLE", "var(--green)"
+    if score >= PILOT_THRESHOLD:
+        return "PILOT", "var(--gold)"
+    return "SHADOW", "var(--surface2)"
+
+
+def _charge_color(charge: float | None) -> str:
+    """Color for the charge-pct meter. Red < 30%, gold 30–70%, green > 70%."""
+    if charge is None:
+        return "var(--text3)"
+    if charge < 0.30:
+        return "var(--red2)"
+    if charge < 0.70:
+        return "var(--gold2)"
+    return "var(--green2)"
+
+
+def _render_strategy_cards(
+    heartbeats: dict, strategies: dict, snaps: dict,
+    charge_by_strategy: dict[str, float | None] | None = None,
+) -> str:
+    """Strategy grid (one card per FLEET member). Background tint scales
+    with each card's net P&L vs the fleet max (per _card_bg). Top 3px
+    accent bar is per-strategy. Racing silk in the head is a small
+    color-coded badge. A charge-pct meter sits between the stats rows
+    and the foot — eval_log's last-bar charge for this strategy.
+
+    `charge_by_strategy` is optional so callers (and tests) can pass an
+    empty dict to skip the meter.
+    """
+    charge_by_strategy = charge_by_strategy or {}
     metrics = {name: _strategy_metrics(name, strategies, snaps) for name in FLEET}
     all_nets = [metrics[name]["net_pnl"] for name in FLEET]
     cards = []
@@ -593,19 +712,21 @@ def _render_strategy_cards(heartbeats: dict, strategies: dict, snaps: dict) -> s
             dot_color = "var(--text3)"
             status = "FLAT"
 
-        # Lifecycle badge — score-derived rather than literal `state` because
-        # the score is the load-bearing field for the promotion ladder.
-        if m["score"] >= LIVE_THRESHOLD:
-            badge_label, badge_bg = "LIVE-ELIGIBLE", "var(--green)"
-        elif m["score"] >= PILOT_THRESHOLD:
-            badge_label, badge_bg = "PILOT", "var(--gold)"
-        else:
-            badge_label, badge_bg = "SHADOW", "var(--surface2)"
+        # Lifecycle badge: derived from strategies-table state when present,
+        # else score-derived (legacy fallback). PILOT in the DB now displays
+        # as PILOT — the score-only path no longer overrides.
+        db_state = (strategies.get(name) or {}).get("state")
+        badge_label, badge_bg = _badge_for(db_state, m["score"])
 
         pnl_color = ("var(--green2)" if m["net_pnl"] > 0
                      else "var(--red2)" if m["net_pnl"] < 0
                      else "var(--text2)")
         pf_str = f"{m['pf']:.2f}" if m["pf"] is not None else "—"
+
+        charge = charge_by_strategy.get(name)
+        charge_pct_display = f"{charge*100:.0f}%" if charge is not None else "—"
+        charge_fill_pct = min(100.0, max(0.0, (charge or 0) * 100))
+        ch_color = _charge_color(charge)
 
         cards.append(f"""
     <div class="strat-card" style="background:{bg};border-top-color:{meta['accent']};">
@@ -628,6 +749,12 @@ def _render_strategy_cards(heartbeats: dict, strategies: dict, snaps: dict) -> s
           <span class="ss-k">max DD</span><span class="ss-v">{_money(m['dd'])}</span>
           <span class="ss-k">avg</span><span class="ss-v">{_money(m['avg_pnl'])}</span>
         </span>
+      </div>
+      <div class="strat-charge">
+        <span class="ch-label">CHARGE</span>
+        <div class="ch-bar"><div class="ch-fill"
+             style="width:{charge_fill_pct:.1f}%;background:{ch_color};"></div></div>
+        <span class="ch-pct" style="color:{ch_color};">{charge_pct_display}</span>
       </div>
       <div class="strat-foot">
         <span class="live-dot" style="background:{dot_color};"></span>
@@ -770,6 +897,79 @@ def _render_recent_closes(closes: list[dict], heartbeats: dict, limit: int = 20)
         <tr>
           <th>TIME</th><th>STRATEGY</th><th>PRICE</th>
           <th>OUTCOME</th><th>HELD</th><th class="rc-pnl-col">NET P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody>{body}</tbody>
+    </table>
+  </section>
+"""
+
+
+_OUTCOME_CLASS: dict[str, str] = {
+    "PASS":  "ev-pass",
+    "NEAR":  "ev-near",
+    "ENTRY": "ev-entry",
+    "HOLD":  "ev-hold",
+}
+
+
+def _render_eval_activity(
+    counts: dict[str, int], rows: list[dict[str, Any]],
+) -> str:
+    """FLEET ACTIVITY panel — today's eval counts + activity feed of
+    the most recent eval_log rows (PASS, NEAR, ENTRY, HOLD).
+
+    Surfaces the invisible work: every bar each strategy evaluates is
+    represented here, not just the bars that fired trades. NEAR rows
+    are highlighted (★) — those are the "invisible saves."
+    """
+    evals_today = counts.get("evals_today", 0)
+    nears_today = counts.get("near_misses_today", 0)
+
+    body_rows: list[str] = []
+    for r in rows:
+        outcome = (r.get("outcome") or "PASS").upper()
+        oc_cls = _OUTCOME_CLASS.get(outcome, "ev-pass")
+        near = bool(r.get("near_miss"))
+        star = '<span class="ev-star">★</span>' if near else ""
+        strat = r.get("strategy") or "?"
+        meta = STRATEGY_META.get(strat, {})
+        accent = meta.get("accent", "var(--text2)")
+        label = meta.get("label", strat.upper())
+        side = (r.get("signal_side") or "—").upper()
+        reason = (r.get("reason") or "").replace("<", "&lt;").replace(">", "&gt;")
+        body_rows.append(f"""
+      <tr class="ev-row">
+        <td class="ev-time">{_ct_str(r.get('bar_ts'))}</td>
+        <td><span class="ev-tag" style="border-color:{accent};color:{accent};">
+          {label}</span></td>
+        <td><span class="ev-outcome {oc_cls}">{outcome}</span>{star}</td>
+        <td class="ev-side">{side}</td>
+        <td class="ev-reason">{reason}</td>
+      </tr>
+""")
+    if not body_rows:
+        body = ('<tr><td colspan="5" class="ev-empty">'
+                'waiting for first eval_log row…</td></tr>')
+    else:
+        body = "".join(body_rows)
+
+    return f"""
+  <section class="ev-section">
+    <div class="ev-head">
+      <span class="ev-title">FLEET ACTIVITY</span>
+      <span class="ev-counts">
+        <span class="ev-counts-k">evals today</span>
+        <span class="ev-counts-v">{evals_today:,}</span>
+        <span class="ev-sep">·</span>
+        <span class="ev-counts-k">near-misses today</span>
+        <span class="ev-counts-v ev-near-count">★ {nears_today}</span>
+      </span>
+    </div>
+    <table class="ev-table">
+      <thead>
+        <tr>
+          <th>TIME</th><th>STRATEGY</th><th>OUTCOME</th><th>DIR</th><th>REASON</th>
         </tr>
       </thead>
       <tbody>{body}</tbody>
@@ -1093,6 +1293,7 @@ body {
 }
 .silk-green { background: var(--green); }
 .silk-amber { background: var(--amber); }
+.silk-blue  { background: #5B7FB8; }
 .strat-name {
   font-family: 'Bebas Neue', sans-serif;
   font-size: 18px;
@@ -1287,6 +1488,123 @@ body {
   letter-spacing: 1.2px;
 }
 
+/* ── Strategy-card charge meter (eval_log per-strategy charge_pct) ── */
+.strat-charge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 2px;
+}
+.ch-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  min-width: 50px;
+}
+.ch-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.ch-fill {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.ch-pct {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 36px;
+  text-align: right;
+}
+
+/* ── FLEET ACTIVITY panel (eval_log feed) ─────────────────────────── */
+.ev-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+.ev-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.ev-title {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 14px;
+  letter-spacing: 2px;
+  color: var(--text);
+}
+.ev-counts {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text2);
+}
+.ev-counts-k { color: var(--text3); text-transform: uppercase; margin-right: 4px; }
+.ev-counts-v { color: var(--text); font-family: 'IBM Plex Mono', monospace; margin-right: 12px; }
+.ev-sep      { color: var(--text3); margin: 0 4px; }
+.ev-near-count { color: var(--gold2); }
+.ev-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.ev-table th {
+  text-align: left;
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+  color: var(--text3);
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.ev-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid rgba(74,71,64,0.4);
+  color: var(--text2);
+  vertical-align: middle;
+}
+.ev-time { color: var(--text3); white-space: nowrap; }
+.ev-tag {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1px;
+  padding: 1px 6px;
+  border: 1px solid;
+  border-radius: 2px;
+}
+.ev-outcome {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 10px;
+  letter-spacing: 1px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+.ev-pass  { background: var(--surface2); color: var(--text2); }
+.ev-near  { background: var(--gold);     color: var(--text);  }
+.ev-entry { background: var(--green);    color: var(--text);  }
+.ev-hold  { background: var(--bg3);      color: var(--text3); }
+.ev-star  { color: var(--gold2); margin-left: 4px; font-size: 12px; }
+.ev-side { text-align: center; color: var(--text3); }
+.ev-reason { color: var(--text2); }
+.ev-empty {
+  color: var(--text3);
+  font-style: italic;
+  text-align: center;
+  padding: 12px;
+}
+
 /* ── Footer ─────────────────────────────────────────────────────── */
 .footer {
   background: var(--bg3);
@@ -1331,6 +1649,9 @@ def render_overview(sb, *, token: str | None = None,
     snaps       = _fetch_perf_snapshots(sb)
     closes_all  = _fetch_recent_closes(sb)
     ks_state    = _fetch_kill_switch_state(sb)
+    eval_counts = _fetch_eval_log_counts(sb)
+    eval_rows   = _fetch_eval_log_activity(sb, limit=12)
+    charge_by   = _fetch_charge_pct_by_strategy(sb)
 
     body = (
         _render_topbar(heartbeats)
@@ -1338,7 +1659,8 @@ def render_overview(sb, *, token: str | None = None,
         + _render_ticker_bar(closes_all, heartbeats, ks_state, token)
         + _render_mll_tracker(closes_all)
         + _render_active_trade(heartbeats)
-        + _render_strategy_cards(heartbeats, strategies, snaps)
+        + _render_strategy_cards(heartbeats, strategies, snaps, charge_by)
+        + _render_eval_activity(eval_counts, eval_rows)
         + _render_hour_grid(closes_all)
         + _render_recent_closes(closes_all, heartbeats)
         + '</div>'
