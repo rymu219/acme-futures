@@ -54,6 +54,7 @@ from acme.conductor.dry_run import DryRunPosition, check_dry_run_exits  # noqa: 
 from acme.contracts import MES  # noqa: E402
 from acme.levels import compute_day_levels, trading_date_ct  # noqa: E402
 from acme.risk import TOPSTEP_50K, DailyState  # noqa: E402
+from acme.strategies.base import EvalResult  # noqa: E402
 from acme.strategies.boundary import BoundaryStrategy  # noqa: E402
 from acme.strategies.gap_fill import GapFillStrategy  # noqa: E402
 from acme.strategies.ignition import IgnitionStrategy  # noqa: E402
@@ -92,7 +93,8 @@ def _new_daily_state(td) -> DailyState:
 
 
 def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
-                     levels_by_date: dict | None = None) -> list[dict]:
+                     levels_by_date: dict | None = None,
+                     wyckoff_classifier=None) -> list[dict]:
     """Drive a strategy through every bar; track its phantom positions
     via the same machinery the conductor uses in dry-run.
 
@@ -107,7 +109,15 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
     thereafter (the bug discovered 2026-05-12: SESSION's 228 reported
     closes vs 11,436 actual entry signals). To replicate live
     SHADOW conditions, reset DailyState every CT trading-day and
-    compute today's-only P&L; cross-day MLL drift is suppressed."""
+    compute today's-only P&L; cross-day MLL drift is suppressed.
+
+    `wyckoff_classifier` (optional): an `acme.wyckoff.WyckoffClassifier`
+    instance. When supplied, the harness drives `classifier.on_bar(bar)`
+    immediately before each `strategy.on_bar(bar, ...)` call and stashes
+    the resulting `WyckoffSnapshot` on `strategy.wyckoff_state` so the
+    strategy can read it (Phase 2 Spring Strategy will use this). When
+    None — the default — behaviour is identical to the pre-Phase-1.5
+    harness, which is how every existing strategy backtest still runs."""
     closes: list[dict] = []
     open_positions: list[DryRunPosition] = []
     net_position = 0
@@ -210,6 +220,18 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
                 net_position += (-p.size if p.side == "buy" else p.size)
                 open_positions.remove(p)
 
+        # 1c. Drive the Wyckoff classifier (if supplied) BEFORE the
+        # strategy call, and inject the latest snapshot via a
+        # `wyckoff_state` attribute. This is duck-typed: strategies
+        # that don't consume it simply ignore the attribute. The order
+        # matters — `classifier.on_bar(bar)` advances the state machine
+        # using only data through bar T; the snapshot it returns is
+        # then read by `strategy.on_bar(bar, ...)` for the same bar.
+        # No lookahead: any Spring confirmed on bar T uses the recovery
+        # bar's timestamp, and the strategy enters on bar T+1.
+        if wyckoff_classifier is not None:
+            strategy.wyckoff_state = wyckoff_classifier.on_bar(bar)
+
         # 2. Call strategy on this bar.
         # Balance reflects today's P&L only (state was reset on day
         # rollover). Each backtest day is a fresh slate — matches live
@@ -221,7 +243,15 @@ def backtest_strategy(strategy, bars_2min: list[Bar], *, name: str,
             current_position=net_position,
             current_balance_unrealized=balance,
         )
-        if sig is None or sig.size == 0 or sig.bracket is None:
+        # Strategy contract widened in eval_log Phase 2 to Signal | EvalResult | None.
+        # The backtest harness only acts on Signal returns (real entry attempts);
+        # EvalResult and None both mean "no trade this bar." This keeps the
+        # harness compatible with the post-Phase-2 strategies (BOUNDARY,
+        # OVERNIGHT_DRIFT, GAP_FILL, GO_NO_GO_LEVELS) without trying to log
+        # EvalResults to Supabase here — that's the conductor's job in live.
+        if sig is None or isinstance(sig, EvalResult):
+            continue
+        if sig.size == 0 or sig.bracket is None:
             continue
 
         # 3. Open a phantom position. Convert bracket offsets to prices.
