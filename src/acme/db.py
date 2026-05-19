@@ -55,6 +55,40 @@ class Db:
         except Exception as e:
             log.error("db_log_event_failed", kind=kind, error=str(e))
 
+    def write_wyckoff_snapshot(self, row: dict[str, Any]) -> None:
+        """One row per bar to `wyckoff_state`. Fire-and-forget, same
+        pattern as log_event."""
+        try:
+            self.client.table("wyckoff_state").insert(row).execute()
+        except Exception as e:
+            log.error("db_wyckoff_snapshot_failed", error=str(e))
+
+    def write_wyckoff_event(self, row: dict[str, Any]) -> None:
+        """One row per confirmed Wyckoff event to `wyckoff_events`."""
+        try:
+            self.client.table("wyckoff_events").insert(row).execute()
+        except Exception as e:
+            log.error("db_wyckoff_event_failed",
+                      kind=row.get("event_kind"), error=str(e))
+
+    def fetch_recent_wyckoff_events(
+        self, *, contract: str = "MES", limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read the most recent N confirmed Wyckoff events in
+        chronological order (oldest first). Used by the classifier's
+        state-replay on conductor startup."""
+        try:
+            res = (self.client.table("wyckoff_events")
+                   .select("bar_ts,event_kind,bar_l,bar_h,bar_c,bar_v")
+                   .eq("contract", contract)
+                   .order("bar_ts", desc=True).limit(limit).execute())
+            rows = res.data or []
+            # Reverse so caller can replay in chronological order.
+            return list(reversed(rows))
+        except Exception as e:
+            log.error("db_fetch_wyckoff_events_failed", error=str(e))
+            return []
+
     def write_eval_log(
         self,
         *,
