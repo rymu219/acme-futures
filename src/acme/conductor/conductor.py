@@ -47,6 +47,8 @@ from acme.registry import RegisteredStrategy, StrategyRegistry
 from acme.risk import DailyState
 from acme.strategies.base import EvalResult, Signal
 from acme.telemetry import BarEventLogger
+from acme.wyckoff import EventKind as WyckoffEventKind
+from acme.wyckoff import WyckoffClassifier, WyckoffSnapshot
 
 log = structlog.get_logger(__name__)
 
@@ -65,6 +67,8 @@ class Conductor:
         telemetry: BarEventLogger | None = None,
         regime_engine: RegimeEngine | None = None,
         regime_timeframe_minutes: int = 5,
+        wyckoff_classifier: WyckoffClassifier | None = None,
+        wyckoff_timeframe_minutes: int = 2,
     ) -> None:
         self.broker = broker
         self.db = db
@@ -94,6 +98,16 @@ class Conductor:
         self._regime_engine = regime_engine
         self._regime_tf = regime_timeframe_minutes
         self._latest_regime: RegimeSnapshot | None = None
+        # Wyckoff classifier — feature-flagged off by default. When None,
+        # _process_bar skips the entire classifier path. When provided,
+        # the classifier runs on every bar at `wyckoff_timeframe_minutes`
+        # and writes snapshots + events to Supabase. Replay-on-startup is
+        # initiated here via fetch_recent_wyckoff_events + replay_event.
+        self._wyckoff: WyckoffClassifier | None = wyckoff_classifier
+        self._wyckoff_tf: int = wyckoff_timeframe_minutes
+        self._latest_wyckoff: WyckoffSnapshot | None = None
+        if self._wyckoff is not None and self.db is not None:
+            self._replay_wyckoff_from_db()
         # Kill-switch state — polled from operator_events on each bar.
         # `_kill_switch_active` reflects the latest event seen; flips
         # to True on a kill_switch_activated row and False on a
@@ -102,6 +116,40 @@ class Conductor:
         # rows newer than that (cheap incremental polling).
         self._kill_switch_active: bool = False
         self._kill_switch_last_id: int = 0
+
+    def _replay_wyckoff_from_db(self) -> None:
+        """Restore Wyckoff classifier state from the most recent persisted
+        events. The event log is the source of truth; in-memory state is
+        derived. Indicators warm naturally once live bars start flowing.
+        """
+        if self._wyckoff is None or self.db is None:
+            return
+        try:
+            rows = self.db.fetch_recent_wyckoff_events(
+                contract="MES", limit=20,
+            )
+        except Exception as e:
+            log.warning("wyckoff_replay_fetch_failed", error=str(e))
+            return
+        if not rows:
+            return
+        for row in rows:
+            try:
+                kind = WyckoffEventKind(row["event_kind"])
+                ts = datetime.fromisoformat(
+                    row["bar_ts"].replace("Z", "+00:00")
+                )
+                self._wyckoff.replay_event(
+                    kind=kind, ts=ts,
+                    bar_l=float(row.get("bar_l") or 0),
+                    bar_h=float(row.get("bar_h") or 0),
+                    bar_c=float(row.get("bar_c") or 0),
+                    bar_v=int(row.get("bar_v") or 0),
+                )
+            except Exception as e:
+                log.warning("wyckoff_replay_event_failed",
+                            kind=row.get("event_kind"), error=str(e))
+        log.info("wyckoff_state_restored", n_events=len(rows))
 
     # ---------- main entry ----------
 
@@ -349,6 +397,30 @@ class Conductor:
         ctx = self._context_by_tf.setdefault(tf, MarketContext())
         ctx.update(bar)
         ctx_features = ctx.features
+
+        # Wyckoff classifier — runs on bars at `_wyckoff_tf` (default 2m).
+        # Persists snapshot + any newly-confirmed events. Strategies that
+        # consult Wyckoff state will read it from `_latest_wyckoff` in
+        # a future phase; the classifier itself does no gating in v1.
+        if self._wyckoff is not None and tf == self._wyckoff_tf:
+            try:
+                self._latest_wyckoff = self._wyckoff.on_bar(bar)
+                if self.db is not None:
+                    try:
+                        self.db.write_wyckoff_snapshot(
+                            self._latest_wyckoff.to_db_row()
+                        )
+                    except Exception as e:
+                        log.warning("wyckoff_snapshot_persist_failed",
+                                    error=str(e))
+                    for evt in self._latest_wyckoff.new_events:
+                        try:
+                            self.db.write_wyckoff_event(evt.to_db_row())
+                        except Exception as e:
+                            log.warning("wyckoff_event_persist_failed",
+                                        kind=evt.kind.value, error=str(e))
+            except Exception as e:
+                log.error("wyckoff_on_bar_failed", error=str(e))
 
         # Update regime classifier on bars at the regime timeframe (default 5m).
         # All strategies share the same most-recent snapshot for habitat gating.
